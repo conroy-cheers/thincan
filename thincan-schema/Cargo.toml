@@ -1,0 +1,11 @@
+[package]
+name = "thincan-schema"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flatbuffers = "25.9.23"
+flatbuffers-owned = "0.3"
+
+[build-dependencies]
+flatc-rust = "0.2.0"
