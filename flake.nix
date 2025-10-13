@@ -28,6 +28,8 @@
             (rust-bin.stable.latest.default.override {
               extensions = [ "rust-src" ];
             })
+            capnproto
+            capnproto-rust
           ];
         };
       }
