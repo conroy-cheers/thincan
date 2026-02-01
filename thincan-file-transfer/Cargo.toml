@@ -1,0 +1,24 @@
+[package]
+name = "thincan-file-transfer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+capnp = { version = "0.25.0", default-features = false, features = [
+    "unaligned",
+] }
+thincan = { path = "../thincan", default-features = false, features = [
+    "std",
+    "capnp",
+] }
+
+[build-dependencies]
+capnpc = "0.25.0"
+
+[dev-dependencies]
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+embedded-can-mock = "0.1.0"
+can-iso-tp = { version = "0.1.0", default-features = false, features = ["std"] }
+
+[lib]
