@@ -308,6 +308,7 @@ struct InProgress<S: FileStore> {
     transfer_id: u32,
     total_len: u32,
     handle: S::WriteHandle,
+    received: Vec<(u32, u32)>,
 }
 
 /// Bundle state (store + in-progress transfer tracking).
@@ -352,12 +353,39 @@ pub fn handle_file_req<'a, S: FileStore>(
         .store
         .begin_write(transfer_id, total_len)
         .map_err(Error::Store)?;
-    state.in_progress = Some(InProgress {
-        transfer_id,
-        total_len,
-        handle,
-    });
+    if total_len == 0 {
+        state.store.commit(handle).map_err(Error::Store)?;
+        state.in_progress = None;
+    } else {
+        state.in_progress = Some(InProgress {
+            transfer_id,
+            total_len,
+            handle,
+            received: Vec::new(),
+        });
+    }
     Ok(())
+}
+
+fn insert_received_range(ranges: &mut Vec<(u32, u32)>, start: u32, end: u32) {
+    if start >= end {
+        return;
+    }
+
+    let mut i = 0usize;
+    while i < ranges.len() && ranges[i].1 < start {
+        i += 1;
+    }
+
+    let mut merged_start = start;
+    let mut merged_end = end;
+    while i < ranges.len() && ranges[i].0 <= merged_end {
+        merged_start = merged_start.min(ranges[i].0);
+        merged_end = merged_end.max(ranges[i].1);
+        ranges.remove(i);
+    }
+
+    ranges.insert(i, (merged_start, merged_end));
 }
 
 /// Handle an incoming `FileChunk` message.
@@ -389,7 +417,15 @@ pub fn handle_file_chunk<'a, S: FileStore>(
             .write_at(&mut in_progress.handle, offset, &data[..chunk_len])
             .map_err(Error::Store)?;
 
-        if offset + (chunk_len as u32) >= in_progress.total_len {
+        insert_received_range(
+            &mut in_progress.received,
+            offset,
+            offset + (chunk_len as u32),
+        );
+        if in_progress.received.len() == 1
+            && in_progress.received[0].0 == 0
+            && in_progress.received[0].1 >= in_progress.total_len
+        {
             let in_progress = state.in_progress.take().ok_or(Error::Protocol)?;
             state
                 .store

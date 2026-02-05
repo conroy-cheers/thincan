@@ -143,6 +143,28 @@ fn file_chunk_offset_past_end_is_noop() {
 }
 
 #[test]
+fn file_chunk_does_not_commit_until_all_ranges_received() {
+    let mut state = thincan_file_transfer::State::new(Store::default());
+    let r = encode_req(1, 8);
+    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&r[..]);
+    thincan_file_transfer::handle_file_req(&mut state, req).unwrap();
+
+    // Send the last chunk first: previously this would incorrectly trigger commit.
+    let c2 = encode_chunk(1, 4, b"EFGH");
+    let chunk2 =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c2[..]);
+    thincan_file_transfer::handle_file_chunk(&mut state, chunk2).unwrap();
+    assert_eq!(state.store.commit_calls, 0);
+
+    // Now send the first chunk to complete the full range.
+    let c1 = encode_chunk(1, 0, b"ABCD");
+    let chunk1 =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c1[..]);
+    thincan_file_transfer::handle_file_chunk(&mut state, chunk1).unwrap();
+    assert_eq!(state.store.commit_calls, 1);
+}
+
+#[test]
 fn encode_rejects_too_small_output_buffer() {
     let req = thincan_file_transfer::file_req::<DemoAtlas>(1, 10);
     let mut out = [0u8; 1];
