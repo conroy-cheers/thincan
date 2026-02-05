@@ -1,0 +1,19 @@
+[package]
+name = "embedded-can-unix-socket"
+version = "0.1.0"
+edition = "2024"
+description = "Unix-domain-socket CAN bus simulator implementing embedded-can-interface traits"
+readme = "README.md"
+
+[dependencies]
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "throughput"
+harness = false

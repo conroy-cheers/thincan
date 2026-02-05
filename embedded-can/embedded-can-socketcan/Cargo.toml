@@ -1,0 +1,17 @@
+[package]
+name = "embedded-can-socketcan"
+version = "0.1.0"
+edition = "2024"
+description = "Linux SocketCAN adapters implementing embedded-can-interface traits"
+readme = "README.md"
+
+[dependencies]
+embedded-can-interface = "0.1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+socketcan = { version = "3.5.0", default-features = false }
+
+[features]
+default = []
+tokio = ["socketcan/tokio"]

@@ -1,3 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["thincan", "thincan-file-transfer"]
+members = [
+  "iso-tp/can-isotp-interface",
+  "iso-tp/can-iso-tp",
+  "can-uds",
+  "embedded-can/embedded-can-socketcan",
+  "embedded-can/embedded-can-unix-socket",
+  "iso-tp/linux-socketcan-iso-tp",
+  "thincan",
+  "examples/thincan-example",
+  "thincan-file-transfer",
+]
+
+[patch.crates-io]
+can-iso-tp = { path = "./iso-tp/can-iso-tp" }

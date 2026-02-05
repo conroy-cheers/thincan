@@ -1,0 +1,19 @@
+[package]
+name = "can-uds"
+description = "Utilities for UDS (Unified Diagnostic Services) CAN identifier schemes"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+keywords = ["can", "uds", "isotp", "embedded"]
+documentation = "https://docs.rs/can-uds"
+repository = "https://github.com/conroy-cheers/can"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+

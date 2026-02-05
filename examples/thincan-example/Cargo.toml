@@ -1,0 +1,54 @@
+[package]
+name = "thincan-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4.5.23", features = ["derive"] }
+can-iso-tp = { path = "../../iso-tp/can-iso-tp", features = ["std", "uds"] }
+can-uds = { path = "../../can-uds" }
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+thincan = { path = "../../thincan", default-features = false, features = ["std", "capnp", "isotp-uds"] }
+thincan-file-transfer = { path = "../../thincan-file-transfer" }
+
+embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", optional = true }
+embedded-can-socketcan = { path = "../../embedded-can/embedded-can-socketcan", optional = true }
+linux-socketcan-iso-tp = { path = "../../iso-tp/linux-socketcan-iso-tp", optional = true }
+
+[features]
+default = ["uds"]
+uds = ["dep:embedded-can-unix-socket"]
+socketcan = ["dep:embedded-can-socketcan"]
+# Kernel ISO-TP benches still need a raw CAN backend for the `thincan-example` binary to build
+# under `cargo bench` (Cargo builds the package's binary targets too).
+socketcan-isotp = ["dep:linux-socketcan-iso-tp", "thincan/isotp-interface", "socketcan"]
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+socketcan = { version = "3.5.0", default-features = false }
+
+[[bin]]
+name = "uds-server"
+path = "src/bin/uds-server.rs"
+required-features = ["uds"]
+
+[[bench]]
+name = "uds_file_transfer"
+harness = false
+required-features = ["uds"]
+
+[[bench]]
+name = "socketcan_file_transfer"
+harness = false
+required-features = ["socketcan"]
+
+[[bench]]
+name = "socketcan_isotp_file_transfer"
+harness = false
+required-features = ["socketcan-isotp"]

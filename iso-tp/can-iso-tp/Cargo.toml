@@ -1,0 +1,36 @@
+[package]
+name = "can-iso-tp"
+description = "Generic implementation of the CAN ISO-TP protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+keywords = ["io", "can", "embedded"]
+documentation = "https://docs.rs/can-iso-tp"
+repository = "https://github.com/conroy-cheers/can-iso-tp"
+readme = "README.md"
+exclude = [".envrc", "*.nix", "flake.lock"]
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+uds = ["dep:can-uds"]
+isotp-interface = ["dep:can-isotp-interface"]
+
+[dependencies]
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+can-uds = { path = "../../can-uds", version = "0.1.0", optional = true }
+can-isotp-interface = { path = "../can-isotp-interface", version = "0.1.0", optional = true }
+
+[dev-dependencies]
+embedded-can-mock = "0.1.0"
+embedded-can-socketcan = { path = "../../embedded-can/embedded-can-socketcan" }
+can-isotp-interface = { path = "../can-isotp-interface" }
+linux-socketcan-iso-tp = { path = "../linux-socketcan-iso-tp" }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+] }
