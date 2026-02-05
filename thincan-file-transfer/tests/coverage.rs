@@ -270,15 +270,19 @@ fn bundle_dispatch_handles_ack_and_maps_errors() {
         fn send(&mut self, _payload: &[u8], _timeout: Duration) -> Result<(), thincan::Error> {
             Ok(())
         }
-        fn recv(
+        fn recv_one<F>(
             &mut self,
             _timeout: Duration,
-            _deliver: &mut dyn FnMut(&[u8]),
-        ) -> Result<(), thincan::Error> {
-            Err(thincan::Error::timeout())
+            _on_payload: F,
+        ) -> Result<thincan::RecvStatus, thincan::Error>
+        where
+            F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+        {
+            Ok(thincan::RecvStatus::TimedOut)
         }
     }
-    let mut iface = thincan::Interface::new(Sink, ());
+    let mut tx = [0u8; 512];
+    let mut iface = thincan::Interface::new(Sink, (), &mut tx);
     let v = thincan_file_transfer::file_req::<DemoAtlas>(1, 4);
     thincan_file_transfer::SendEncoded::send_encoded::<FileReq, _>(
         &mut iface,

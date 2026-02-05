@@ -52,11 +52,14 @@ impl thincan::Transport for PipeEnd {
         Ok(())
     }
 
-    fn recv(
+    fn recv_one<F>(
         &mut self,
         _timeout: Duration,
-        deliver: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), thincan::Error> {
+        mut on_payload: F,
+    ) -> Result<thincan::RecvStatus, thincan::Error>
+    where
+        F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+    {
         *self.recv_calls.lock().unwrap() += 1;
 
         let mut shared = self.shared.lock().unwrap();
@@ -66,14 +69,12 @@ impl thincan::Transport for PipeEnd {
         };
 
         if queue.is_empty() {
-            return Err(thincan::Error::timeout());
+            return Ok(thincan::RecvStatus::TimedOut);
         }
 
-        // Deliver everything available in one recv() call to exercise multi-RX handling.
-        while let Some(payload) = queue.pop_front() {
-            deliver(&payload);
-        }
-        Ok(())
+        let payload = queue.pop_front().unwrap();
+        let _ = on_payload(&payload)?;
+        Ok(thincan::RecvStatus::DeliveredOne)
     }
 }
 
@@ -128,7 +129,8 @@ impl<'a> maplet::Handlers<'a> for App {
 #[test]
 fn send_side_validation_rejects_wrong_len() {
     let (a, _b, _a_calls, _b_calls) = PipeEnd::pair();
-    let mut iface = thincan::Interface::new(a, maplet::Router::new());
+    let mut tx = [0u8; 64];
+    let mut iface = thincan::Interface::new(a, maplet::Router::new(), &mut tx);
 
     let err = iface
         .send_msg::<atlas::A>(&[0xAA, 0xBB], Duration::from_millis(1))
@@ -143,11 +145,13 @@ fn send_side_validation_rejects_wrong_len() {
 }
 
 #[test]
-fn recv_dispatch_handles_multiple_payloads_in_one_transport_recv() -> Result<(), thincan::Error> {
+fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(), thincan::Error> {
     let (a, b, a_calls, b_calls) = PipeEnd::pair();
 
-    let mut iface_a = thincan::Interface::new(a, maplet::Router::new());
-    let mut iface_b = thincan::Interface::new(b, maplet::Router::new());
+    let mut tx_a = [0u8; 64];
+    let mut tx_b = [0u8; 64];
+    let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
+    let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
 
     iface_a.send_msg::<atlas::A>(&[0xAA], Duration::from_millis(1))?;
     iface_a.send_msg::<atlas::B>(&[0xBB], Duration::from_millis(1))?;
@@ -158,12 +162,18 @@ fn recv_dispatch_handles_multiple_payloads_in_one_transport_recv() -> Result<(),
     };
 
     assert_eq!(
-        iface_b.recv_dispatch(&mut handlers, Duration::from_millis(1))?,
-        thincan::DispatchOutcome::Handled
+        iface_b.recv_one_dispatch(&mut handlers, Duration::from_millis(1))?,
+        thincan::RecvDispatch::Dispatched {
+            id: <atlas::A as thincan::Message>::ID,
+            kind: thincan::RecvDispatchKind::Handled
+        }
     );
     assert_eq!(
-        iface_b.recv_dispatch(&mut handlers, Duration::from_millis(1))?,
-        thincan::DispatchOutcome::Handled
+        iface_b.recv_one_dispatch(&mut handlers, Duration::from_millis(1))?,
+        thincan::RecvDispatch::Dispatched {
+            id: <atlas::B as thincan::Message>::ID,
+            kind: thincan::RecvDispatchKind::Handled
+        }
     );
 
     assert_eq!(
@@ -174,9 +184,9 @@ fn recv_dispatch_handles_multiple_payloads_in_one_transport_recv() -> Result<(),
         ]
     );
 
-    // Critical: two dispatched messages but only one `Transport::recv` on side B.
+    // Critical: without buffering, one dispatched message requires one `Transport::recv_one`.
     assert_eq!(*a_calls.lock().unwrap(), 0);
-    assert_eq!(*b_calls.lock().unwrap(), 1);
+    assert_eq!(*b_calls.lock().unwrap(), 2);
     Ok(())
 }
 
@@ -203,8 +213,10 @@ impl thincan::Encode<atlas::A> for AValue {
 fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
     let (a, b, _a_calls, _b_calls) = PipeEnd::pair();
 
-    let mut iface_a = thincan::Interface::new(a, maplet::Router::new());
-    let mut iface_b = thincan::Interface::new(b, maplet::Router::new());
+    let mut tx_a = [0u8; 64];
+    let mut tx_b = [0u8; 64];
+    let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
+    let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
 
     iface_a.send_encoded::<atlas::A, _>(&AValue(0xAA), Duration::from_millis(1))?;
 
@@ -213,7 +225,7 @@ fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
         none: none::DefaultHandlers,
     };
 
-    iface_b.recv_dispatch(&mut handlers, Duration::from_millis(1))?;
+    let _ = iface_b.recv_one_dispatch(&mut handlers, Duration::from_millis(1))?;
     assert_eq!(handlers.app.seen, vec![<atlas::A as thincan::Message>::ID]);
     Ok(())
 }

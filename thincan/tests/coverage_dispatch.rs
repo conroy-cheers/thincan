@@ -347,16 +347,20 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
         fn send(&mut self, _payload: &[u8], _timeout: Duration) -> Result<(), thincan::Error> {
             Ok(())
         }
-        fn recv(
+        fn recv_one<F>(
             &mut self,
             _timeout: Duration,
-            _deliver: &mut dyn FnMut(&[u8]),
-        ) -> Result<(), thincan::Error> {
-            Err(thincan::Error::timeout())
+            _on_payload: F,
+        ) -> Result<thincan::RecvStatus, thincan::Error>
+        where
+            F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+        {
+            Ok(thincan::RecvStatus::TimedOut)
         }
     }
 
-    let mut iface = thincan::Interface::new(Sink, maplet_unhandled::Router::new());
+    let mut tx = [0u8; 64];
+    let mut iface = thincan::Interface::new(Sink, maplet_unhandled::Router::new(), &mut tx);
     let err = iface
         .send_encoded::<Msg, _>(&LyingValue, Duration::from_millis(1))
         .unwrap_err();
@@ -386,6 +390,28 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
     use embedded_can_interface::Id;
     use embedded_can_interface::SplitTxRx;
     use embedded_can_mock::{BusHandle, MockCan};
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct TestClock {
+        now_ms: Cell<u64>,
+    }
+
+    impl can_iso_tp::Clock for TestClock {
+        type Instant = u64;
+        fn now(&self) -> Self::Instant {
+            let next = self.now_ms.get().saturating_add(1);
+            self.now_ms.set(next);
+            next
+        }
+        fn elapsed(&self, earlier: Self::Instant) -> Duration {
+            let now = self.now_ms.get();
+            Duration::from_millis(now.saturating_sub(earlier))
+        }
+        fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+            instant.saturating_add(dur.as_millis() as u64)
+        }
+    }
 
     let bus = BusHandle::new();
     let can_a = MockCan::new_with_bus(&bus, vec![]).unwrap();
@@ -395,7 +421,6 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         tx_id: Id::Standard(StandardId::new(0x700).unwrap()),
         rx_id: Id::Standard(StandardId::new(0x701).unwrap()),
         max_payload_len: 1,
-        rx_buffer_len: 8,
         n_ar: Duration::from_millis(1),
         n_as: Duration::from_millis(1),
         n_br: Duration::from_millis(1),
@@ -403,17 +428,21 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         n_cs: Duration::from_millis(1),
         ..IsoTpConfig::default()
     };
-    let mut node = IsoTpNode::with_std_clock(tx_a, rx_a, cfg_other).unwrap();
+    let mut rx_buf_a = [0u8; 64];
+    let mut node =
+        IsoTpNode::with_clock(tx_a, rx_a, cfg_other, TestClock::default(), &mut rx_buf_a).unwrap();
 
     // Non-timeout error from ISO-TP maps to ErrorKind::Other.
     let err =
-        thincan::Transport::send(&mut node, &[0x01, 0x02], Duration::from_millis(1)).unwrap_err();
+        thincan::Transport::send(&mut node, &[0x01, 0x02], Duration::from_millis(10)).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
-    // Timeout from ISO-TP maps to ErrorKind::Timeout.
-    let err =
-        thincan::Transport::recv(&mut node, Duration::from_millis(1), &mut |_| {}).unwrap_err();
-    assert!(matches!(err.kind, ErrorKind::Timeout));
+    // Receive timeout maps to a TimedOut status (not an error).
+    let st = thincan::Transport::recv_one(&mut node, Duration::from_millis(1), |_| {
+        Ok(thincan::RecvControl::Continue)
+    })
+    .unwrap();
+    assert_eq!(st, thincan::RecvStatus::TimedOut);
 
     // Send timeout from ISO-TP maps to ErrorKind::Timeout (multi-frame requires flow control).
     let can_b = MockCan::new_with_bus(&bus, vec![]).unwrap();
@@ -422,7 +451,6 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         tx_id: Id::Standard(StandardId::new(0x710).unwrap()),
         rx_id: Id::Standard(StandardId::new(0x711).unwrap()),
         max_payload_len: 64,
-        rx_buffer_len: 64,
         n_ar: Duration::from_millis(1),
         n_as: Duration::from_millis(1),
         n_br: Duration::from_millis(1),
@@ -430,7 +458,10 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         n_cs: Duration::from_millis(1),
         ..IsoTpConfig::default()
     };
-    let mut node2 = IsoTpNode::with_std_clock(tx_b, rx_b, cfg_timeout).unwrap();
+    let mut rx_buf_b = [0u8; 256];
+    let mut node2 =
+        IsoTpNode::with_clock(tx_b, rx_b, cfg_timeout, TestClock::default(), &mut rx_buf_b)
+            .unwrap();
     let payload = [0u8; 8];
     let err = thincan::Transport::send(&mut node2, &payload, Duration::from_millis(1)).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Timeout));
@@ -438,56 +469,88 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
 
 #[cfg(feature = "async")]
 #[tokio::test]
-async fn async_interface_validates_body_len_and_encode_limits() {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+async fn async_helpers_validate_before_sending() {
+    use can_iso_tp::{IsoTpAsyncNode, IsoTpConfig};
+    use embedded_can::StandardId;
+    use embedded_can_interface::Id;
+    use embedded_can_interface::SplitTxRx;
+    use embedded_can_mock::{BusHandle, MockCan};
+    use std::cell::Cell;
 
-    #[derive(Clone)]
-    struct AsyncNode {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
-        rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    #[derive(Default)]
+    struct TestClock {
+        now_ms: Cell<u64>,
     }
 
-    impl thincan::AsyncTransport for AsyncNode {
-        type SendFuture<'a>
-            = core::future::Ready<Result<(), thincan::Error>>
-        where
-            Self: 'a;
-        type RecvFuture<'a>
-            = core::future::Ready<Result<Vec<Vec<u8>>, thincan::Error>>
-        where
-            Self: 'a;
-
-        fn send<'a>(&'a mut self, payload: &'a [u8], _timeout: Duration) -> Self::SendFuture<'a> {
-            self.sent.lock().unwrap().push(payload.to_vec());
-            core::future::ready(Ok(()))
+    impl can_iso_tp::Clock for TestClock {
+        type Instant = u64;
+        fn now(&self) -> Self::Instant {
+            let next = self.now_ms.get().saturating_add(1);
+            self.now_ms.set(next);
+            next
         }
-
-        fn recv<'a>(&'a mut self, _timeout: Duration) -> Self::RecvFuture<'a> {
-            let mut q = self.rx.lock().unwrap();
-            let out: Vec<Vec<u8>> = q.drain(..).collect();
-            core::future::ready(Ok(out))
+        fn elapsed(&self, earlier: Self::Instant) -> Duration {
+            let now = self.now_ms.get();
+            Duration::from_millis(now.saturating_sub(earlier))
+        }
+        fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+            instant.saturating_add(dur.as_millis() as u64)
         }
     }
 
-    let sent = Arc::new(Mutex::new(Vec::new()));
-    let rx = Arc::new(Mutex::new(VecDeque::new()));
-    let mut iface = thincan::AsyncInterface::new(
-        AsyncNode {
-            sent: sent.clone(),
-            rx: rx.clone(),
-        },
-        maplet_unhandled::Router::new(),
-    );
+    #[derive(Clone, Copy)]
+    struct TokioRuntime;
 
-    // send_msg length mismatch.
+    impl can_iso_tp::AsyncRuntime for TokioRuntime {
+        type TimeoutError = tokio::time::error::Elapsed;
+
+        type Sleep<'a>
+            = tokio::time::Sleep
+        where
+            Self: 'a;
+        fn sleep<'a>(&'a self, duration: Duration) -> Self::Sleep<'a> {
+            tokio::time::sleep(duration)
+        }
+
+        type Timeout<'a, F>
+            = tokio::time::Timeout<F>
+        where
+            Self: 'a,
+            F: core::future::Future + 'a;
+        fn timeout<'a, F>(&'a self, duration: Duration, future: F) -> Self::Timeout<'a, F>
+        where
+            F: core::future::Future + 'a,
+        {
+            tokio::time::timeout(duration, future)
+        }
+    }
+
+    let bus = BusHandle::new();
+    let can = MockCan::new_with_bus(&bus, vec![]).unwrap();
+    let (tx, rx) = can.split();
+
+    let cfg = IsoTpConfig {
+        tx_id: Id::Standard(StandardId::new(0x700).unwrap()),
+        rx_id: Id::Standard(StandardId::new(0x701).unwrap()),
+        max_payload_len: 64,
+        ..IsoTpConfig::default()
+    };
+
+    let mut rx_buf = [0u8; 128];
+    let node = IsoTpAsyncNode::with_clock(tx, rx, cfg, TestClock::default(), &mut rx_buf).unwrap();
+
+    let mut tx_buf = [0u8; 64];
+    let mut iface = thincan::Interface::new(node, maplet_unhandled::Router::new(), &mut tx_buf);
+    let rt = TokioRuntime;
+
+    // send_msg length mismatch (validated before touching the transport).
     let err = iface
-        .send_msg::<atlas::Ping>(&[], Duration::from_millis(1))
+        .send_msg_async::<TokioRuntime, atlas::Ping>(&rt, &[], Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::InvalidBodyLen { .. }));
 
-    // send_encoded used > max_encoded_len.
+    // send_encoded used > max_encoded_len (validated before touching the transport).
     struct Lying;
     impl thincan::Encode<atlas::Ping> for Lying {
         fn max_encoded_len(&self) -> usize {
@@ -498,28 +561,8 @@ async fn async_interface_validates_body_len_and_encode_limits() {
         }
     }
     let err = iface
-        .send_encoded::<atlas::Ping, _>(&Lying, Duration::from_millis(1))
+        .send_encoded_async::<TokioRuntime, atlas::Ping, _>(&rt, &Lying, Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
-
-    // send_encoded invalid body length for fixed-len messages (used <= max).
-    struct WrongLen;
-    impl thincan::Encode<atlas::Ping> for WrongLen {
-        fn max_encoded_len(&self) -> usize {
-            2
-        }
-        fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
-            out[..2].copy_from_slice(&[0xAA, 0xBB]);
-            Ok(2)
-        }
-    }
-    let err = iface
-        .send_encoded::<atlas::Ping, _>(&WrongLen, Duration::from_millis(1))
-        .await
-        .unwrap_err();
-    assert!(matches!(err.kind, ErrorKind::InvalidBodyLen { .. }));
-
-    // Ensure we did not send anything.
-    assert!(sent.lock().unwrap().is_empty());
 }

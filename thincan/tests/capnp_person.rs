@@ -53,11 +53,14 @@ impl thincan::Transport for PipeEnd {
         Ok(())
     }
 
-    fn recv(
+    fn recv_one<F>(
         &mut self,
         _timeout: Duration,
-        deliver: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), thincan::Error> {
+        mut on_payload: F,
+    ) -> Result<thincan::RecvStatus, thincan::Error>
+    where
+        F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+    {
         let mut shared = self.shared.lock().unwrap();
         let queue = match self.dir {
             Direction::A => &mut shared.b_to_a,
@@ -65,12 +68,11 @@ impl thincan::Transport for PipeEnd {
         };
 
         if queue.is_empty() {
-            return Err(thincan::Error::timeout());
+            return Ok(thincan::RecvStatus::TimedOut);
         }
-        while let Some(payload) = queue.pop_front() {
-            deliver(&payload);
-        }
-        Ok(())
+        let payload = queue.pop_front().unwrap();
+        let _ = on_payload(&payload)?;
+        Ok(thincan::RecvStatus::DeliveredOne)
     }
 }
 
@@ -167,8 +169,10 @@ impl thincan::Encode<atlas::Person> for PersonValue {
 fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::Error> {
     let (a, b) = PipeEnd::pair();
 
-    let mut iface_a = thincan::Interface::new(a, maplet::Router::new());
-    let mut iface_b = thincan::Interface::new(b, maplet::Router::new());
+    let mut tx_a = [0u8; 2048];
+    let mut tx_b = [0u8; 2048];
+    let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
+    let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
 
     iface_a.send_encoded::<atlas::Person, _>(
         &PersonValue {
@@ -184,10 +188,7 @@ fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::Error> 
         none: none::DefaultHandlers,
     };
 
-    assert_eq!(
-        iface_b.recv_dispatch(&mut handlers, Duration::from_millis(1))?,
-        thincan::DispatchOutcome::Handled
-    );
+    let _ = iface_b.recv_one_dispatch(&mut handlers, Duration::from_millis(1))?;
 
     assert_eq!(
         *seen.lock().unwrap(),

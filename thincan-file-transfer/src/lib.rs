@@ -115,10 +115,29 @@
 
 use capnp::message::ReaderOptions;
 use core::marker::PhantomData;
+use std::cell::RefCell;
 use std::time::Duration;
 
 capnp::generated_code!(pub mod file_transfer_capnp);
 pub use file_transfer_capnp as schema;
+
+thread_local! {
+    static CAPNP_SCRATCH: RefCell<Vec<capnp::Word>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let min_words = (min_len + 7) / 8;
+    CAPNP_SCRATCH.with(|cell| {
+        let mut words = cell.borrow_mut();
+        if words.len() < min_words {
+            words.resize(min_words, capnp::word(0, 0, 0, 0, 0, 0, 0, 0));
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8)
+        };
+        f(&mut bytes[..min_len])
+    })
+}
 
 /// Default chunk size (bytes) used by [`Sender`].
 pub const DEFAULT_CHUNK_SIZE: usize = 64;
@@ -346,40 +365,40 @@ pub fn handle_file_chunk<'a, S: FileStore>(
     state: &mut State<S>,
     msg: thincan::CapnpTyped<'a, schema::file_chunk::Owned>,
 ) -> Result<(), Error<S::Error>> {
-    let (transfer_id, offset, data) = msg
-        .with_root(ReaderOptions::default(), |root| {
-            (
-                root.get_transfer_id(),
-                root.get_offset(),
-                root.get_data().unwrap().to_vec(),
-            )
-        })
-        .map_err(Error::Capnp)?;
+    msg.0.with_reader(ReaderOptions::default(), |reader| {
+        let typed = capnp::message::TypedReader::<_, schema::file_chunk::Owned>::new(reader);
+        let root = typed.get().map_err(Error::Capnp)?;
 
-    let in_progress = state.in_progress.as_mut().ok_or(Error::Protocol)?;
-    if in_progress.transfer_id != transfer_id {
-        return Err(Error::Protocol);
-    }
+        let transfer_id = root.get_transfer_id();
+        let offset = root.get_offset();
+        let data = root.get_data().unwrap_or(&[]);
 
-    let remaining = in_progress.total_len.saturating_sub(offset);
-    if remaining == 0 {
-        return Ok(());
-    }
+        let in_progress = state.in_progress.as_mut().ok_or(Error::Protocol)?;
+        if in_progress.transfer_id != transfer_id {
+            return Err(Error::Protocol);
+        }
 
-    let chunk_len = (data.len() as u32).min(remaining) as usize;
-    state
-        .store
-        .write_at(&mut in_progress.handle, offset, &data[..chunk_len])
-        .map_err(Error::Store)?;
+        let remaining = in_progress.total_len.saturating_sub(offset);
+        if remaining == 0 {
+            return Ok(());
+        }
 
-    if offset + (chunk_len as u32) >= in_progress.total_len {
-        let in_progress = state.in_progress.take().ok_or(Error::Protocol)?;
+        let chunk_len = (data.len() as u32).min(remaining) as usize;
         state
             .store
-            .commit(in_progress.handle)
+            .write_at(&mut in_progress.handle, offset, &data[..chunk_len])
             .map_err(Error::Store)?;
-    }
-    Ok(())
+
+        if offset + (chunk_len as u32) >= in_progress.total_len {
+            let in_progress = state.in_progress.take().ok_or(Error::Protocol)?;
+            state
+                .store
+                .commit(in_progress.handle)
+                .map_err(Error::Store)?;
+        }
+
+        Ok(())
+    })
 }
 
 /// Handle an incoming `FileAck` message.
@@ -449,9 +468,10 @@ pub trait SendEncoded {
     ) -> Result<(), thincan::Error>;
 }
 
-impl<Node, Router> SendEncoded for thincan::Interface<Node, Router>
+impl<Node, Router, TxBuf> SendEncoded for thincan::Interface<Node, Router, TxBuf>
 where
     Node: thincan::Transport,
+    TxBuf: AsMut<[u8]>,
 {
     fn send_encoded<M: thincan::Message, V: thincan::Encode<M>>(
         &mut self,
@@ -459,6 +479,31 @@ where
         timeout: Duration,
     ) -> Result<(), thincan::Error> {
         thincan::Interface::send_encoded(self, value, timeout)
+    }
+}
+
+/// Transport abstraction for sending encoded messages to a specific transport address.
+pub trait SendEncodedTo<A> {
+    fn send_encoded_to<M: thincan::Message, V: thincan::Encode<M>>(
+        &mut self,
+        to: A,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), thincan::Error>;
+}
+
+impl<Node, Router, TxBuf> SendEncodedTo<Node::ReplyTo> for thincan::Interface<Node, Router, TxBuf>
+where
+    Node: thincan::TransportMeta,
+    TxBuf: AsMut<[u8]>,
+{
+    fn send_encoded_to<M: thincan::Message, V: thincan::Encode<M>>(
+        &mut self,
+        to: Node::ReplyTo,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), thincan::Error> {
+        thincan::Interface::send_encoded_to(self, to, value, timeout)
     }
 }
 
@@ -587,6 +632,82 @@ impl<A> Sender<A> {
             chunks,
         })
     }
+
+    /// Send a full file to a specific transport address using an auto-assigned transfer id.
+    pub fn send_file_to<T, Addr>(
+        &mut self,
+        tx: &mut T,
+        to: Addr,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<SendResult, thincan::Error>
+    where
+        A: Atlas,
+        T: SendEncodedTo<Addr>,
+        Addr: Copy,
+    {
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        self.send_file_with_id_to(tx, to, transfer_id, bytes, timeout)
+    }
+
+    /// Send a full file to a specific transport address using an explicit transfer id.
+    pub fn send_file_with_id_to<T, Addr>(
+        &mut self,
+        tx: &mut T,
+        to: Addr,
+        transfer_id: u32,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<SendResult, thincan::Error>
+    where
+        A: Atlas,
+        T: SendEncodedTo<Addr>,
+        Addr: Copy,
+    {
+        if transfer_id >= self.next_transfer_id {
+            self.next_transfer_id = transfer_id.wrapping_add(1);
+        }
+        if self.chunk_size == 0 {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+
+        let total_len = bytes.len();
+        let total_len_u32 = u32::try_from(total_len).map_err(|_| thincan::Error {
+            kind: thincan::ErrorKind::Other,
+        })?;
+
+        tx.send_encoded_to::<A::FileReq, _>(
+            to,
+            &file_req::<A>(transfer_id, total_len_u32),
+            timeout,
+        )?;
+
+        let mut chunks = 0usize;
+        for (index, chunk) in bytes.chunks(self.chunk_size).enumerate() {
+            let offset = index.checked_mul(self.chunk_size).ok_or(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            })?;
+            let offset_u32 = u32::try_from(offset).map_err(|_| thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            })?;
+            tx.send_encoded_to::<A::FileChunk, _>(
+                to,
+                &file_chunk::<A>(transfer_id, offset_u32, chunk),
+                timeout,
+            )?;
+            chunks += 1;
+        }
+
+        Ok(SendResult {
+            transfer_id,
+            total_len,
+            chunk_size: self.chunk_size,
+            chunks,
+        })
+    }
 }
 
 impl<A> thincan::BundleMeta<A> for Bundle
@@ -656,32 +777,41 @@ where
     A: Atlas,
 {
     fn max_encoded_len(&self) -> usize {
-        256
+        // Single-segment Cap'n Proto message (no framing) containing:
+        // - 1 word: root pointer
+        // - 1 word: struct data (2x u32)
+        16
     }
 
     fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
-        let mut builder_buf = [0u8; 256];
-        let mut message = capnp::message::Builder::new(
-            capnp::message::SingleSegmentAllocator::new(&mut builder_buf),
-        );
-        let mut root: schema::file_req::Builder = message.init_root();
-        root.set_transfer_id(self.transfer_id);
-        root.set_total_len(self.total_len);
+        let max_len = self.max_encoded_len();
+        if out.len() < max_len {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+        with_capnp_scratch_bytes(max_len, |scratch| {
+            let mut message =
+                capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(scratch));
+            let mut root: schema::file_req::Builder = message.init_root();
+            root.set_transfer_id(self.transfer_id);
+            root.set_total_len(self.total_len);
 
-        let segments = message.get_segments_for_output();
-        if segments.len() != 1 {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::Other,
-            });
-        }
-        let bytes = segments[0];
-        if out.len() < bytes.len() {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::Other,
-            });
-        }
-        out[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+            let segments = message.get_segments_for_output();
+            if segments.len() != 1 {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            let bytes = segments[0];
+            if bytes.len() > max_len {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        })
     }
 }
 
@@ -690,32 +820,42 @@ where
     A: Atlas,
 {
     fn max_encoded_len(&self) -> usize {
-        256
+        // Single-segment Cap'n Proto message (no framing) containing:
+        // - 1 word: root pointer
+        // - 3 words: struct (data=2x u32, pointers=1x pointer) + alignment slack
+        // - N bytes: the Data payload, padded to a word boundary
+        32 + ((self.data.len() + 7) & !7)
     }
 
     fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
-        let mut builder_buf = [0u8; 256];
-        let mut message = capnp::message::Builder::new(
-            capnp::message::SingleSegmentAllocator::new(&mut builder_buf),
-        );
-        let mut root: schema::file_chunk::Builder = message.init_root();
-        root.set_transfer_id(self.transfer_id);
-        root.set_offset(self.offset);
-        root.set_data(self.data);
+        let max_len = self.max_encoded_len();
+        if out.len() < max_len {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+        with_capnp_scratch_bytes(max_len, |scratch| {
+            let mut message =
+                capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(scratch));
+            let mut root: schema::file_chunk::Builder = message.init_root();
+            root.set_transfer_id(self.transfer_id);
+            root.set_offset(self.offset);
+            root.set_data(self.data);
 
-        let segments = message.get_segments_for_output();
-        if segments.len() != 1 {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::Other,
-            });
-        }
-        let bytes = segments[0];
-        if out.len() < bytes.len() {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::Other,
-            });
-        }
-        out[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+            let segments = message.get_segments_for_output();
+            if segments.len() != 1 {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            let bytes = segments[0];
+            if bytes.len() > max_len {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        })
     }
 }

@@ -194,7 +194,6 @@ fn cfg(tx: u16, rx: u16) -> IsoTpConfig {
         rx_id: Id::Standard(StandardId::new(rx).unwrap()),
         block_size: 0,
         max_payload_len: 256,
-        rx_buffer_len: 256,
         ..IsoTpConfig::default()
     }
 }
@@ -207,9 +206,6 @@ fn end_to_end_file_to_logs_capnp() -> Result<(), thincan::Error> {
 
     let (tx_a, rx_a) = can_a.split();
     let (tx_b, rx_b) = can_b.split();
-
-    let node_displayer = IsoTpNode::with_std_clock(tx_a, rx_a, cfg(0x700, 0x701)).unwrap();
-    let node_sender = IsoTpNode::with_std_clock(tx_b, rx_b, cfg(0x701, 0x700)).unwrap();
 
     let file = b"one\ntwoooooooo\nthree\n".to_vec();
     let transfer_id = 42u32;
@@ -225,7 +221,30 @@ fn end_to_end_file_to_logs_capnp() -> Result<(), thincan::Error> {
     let expected_logs_for_sender = expected_logs.clone();
 
     let sender_thread = thread::spawn(move || -> Result<(), thincan::Error> {
-        let mut iface = thincan::Interface::new(node_sender, log_sender_bus::Router::new());
+        #[derive(Clone, Copy, Debug, Default)]
+        struct StdInstantClock;
+
+        impl can_iso_tp::Clock for StdInstantClock {
+            type Instant = Instant;
+            fn now(&self) -> Self::Instant {
+                Instant::now()
+            }
+            fn elapsed(&self, earlier: Self::Instant) -> Duration {
+                earlier.elapsed()
+            }
+            fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+                instant.checked_add(dur).unwrap_or(instant)
+            }
+        }
+
+        let mut rx_buf = [0u8; 256];
+        let node_sender =
+            IsoTpNode::with_clock(tx_b, rx_b, cfg(0x701, 0x700), StdInstantClock, &mut rx_buf)
+                .unwrap();
+
+        let mut tx_buf = [0u8; 512];
+        let mut iface =
+            thincan::Interface::new(node_sender, log_sender_bus::Router::new(), &mut tx_buf);
         let mut handlers = log_sender_bus::HandlersImpl {
             app: NoApp,
             file_transfer: thincan_file_transfer::State::new(MemoryFileStore::default()),
@@ -241,12 +260,14 @@ fn end_to_end_file_to_logs_capnp() -> Result<(), thincan::Error> {
                     kind: thincan::ErrorKind::Timeout,
                 });
             }
-            match iface.recv_dispatch(&mut handlers, Duration::from_millis(50)) {
-                Ok(_) => {}
-                Err(thincan::Error {
-                    kind: thincan::ErrorKind::Timeout,
-                }) => continue,
-                Err(e) => return Err(e),
+            match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
+                thincan::RecvDispatch::TimedOut => continue,
+                thincan::RecvDispatch::MalformedPayload => {
+                    return Err(thincan::Error {
+                        kind: thincan::ErrorKind::Other,
+                    });
+                }
+                thincan::RecvDispatch::Dispatched { .. } => {}
             }
             if let Some(bytes) = handlers.file_transfer.store.committed.pop() {
                 break bytes;
@@ -271,7 +292,33 @@ fn end_to_end_file_to_logs_capnp() -> Result<(), thincan::Error> {
     });
 
     let displayer_thread = thread::spawn(move || -> Result<Vec<Vec<u8>>, thincan::Error> {
-        let mut iface = thincan::Interface::new(node_displayer, log_displayer_bus::Router::new());
+        #[derive(Clone, Copy, Debug, Default)]
+        struct StdInstantClock;
+
+        impl can_iso_tp::Clock for StdInstantClock {
+            type Instant = Instant;
+            fn now(&self) -> Self::Instant {
+                Instant::now()
+            }
+            fn elapsed(&self, earlier: Self::Instant) -> Duration {
+                earlier.elapsed()
+            }
+            fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+                instant.checked_add(dur).unwrap_or(instant)
+            }
+        }
+
+        let mut rx_buf = [0u8; 256];
+        let node_displayer =
+            IsoTpNode::with_clock(tx_a, rx_a, cfg(0x700, 0x701), StdInstantClock, &mut rx_buf)
+                .unwrap();
+
+        let mut tx_buf = [0u8; 512];
+        let mut iface = thincan::Interface::new(
+            node_displayer,
+            log_displayer_bus::Router::new(),
+            &mut tx_buf,
+        );
         let mut handlers = log_displayer_bus::HandlersImpl {
             app: NoApp,
             file_transfer: thincan_file_transfer::State::new(MemoryFileStore::default()),
@@ -304,12 +351,14 @@ fn end_to_end_file_to_logs_capnp() -> Result<(), thincan::Error> {
                     kind: thincan::ErrorKind::Timeout,
                 });
             }
-            match iface.recv_dispatch(&mut handlers, Duration::from_millis(50)) {
-                Ok(_) => {}
-                Err(thincan::Error {
-                    kind: thincan::ErrorKind::Timeout,
-                }) => continue,
-                Err(e) => return Err(e),
+            match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
+                thincan::RecvDispatch::TimedOut => continue,
+                thincan::RecvDispatch::MalformedPayload => {
+                    return Err(thincan::Error {
+                        kind: thincan::ErrorKind::Other,
+                    });
+                }
+                thincan::RecvDispatch::Dispatched { .. } => {}
             }
         }
 

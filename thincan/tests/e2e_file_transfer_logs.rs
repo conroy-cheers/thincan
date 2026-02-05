@@ -452,7 +452,6 @@ fn cfg(tx: u16, rx: u16) -> IsoTpConfig {
         rx_id: Id::Standard(StandardId::new(rx).unwrap()),
         block_size: 0,
         max_payload_len: 256,
-        rx_buffer_len: 256,
         ..IsoTpConfig::default()
     }
 }
@@ -490,15 +489,18 @@ where
         self.inner.send(payload, timeout)
     }
 
-    fn recv(
+    fn recv_one<F>(
         &mut self,
         timeout: Duration,
-        deliver: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), thincan::Error> {
+        mut on_payload: F,
+    ) -> Result<thincan::RecvStatus, thincan::Error>
+    where
+        F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+    {
         let received = self.received.clone();
-        self.inner.recv(timeout, &mut |payload| {
+        self.inner.recv_one(timeout, |payload| {
             received.lock().unwrap().push(payload.to_vec());
-            deliver(payload);
+            on_payload(payload)
         })
     }
 }
@@ -549,24 +551,41 @@ fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
     let sender_sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let sender_received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
 
-    let node_displayer = LoggingTransport::new(
-        IsoTpNode::with_std_clock(tx_a, rx_a, cfg(0x700, 0x701)).unwrap(),
-        displayer_sent.clone(),
-        displayer_received.clone(),
-    );
-    let node_sender = LoggingTransport::new(
-        IsoTpNode::with_std_clock(tx_b, rx_b, cfg(0x701, 0x700)).unwrap(),
-        sender_sent.clone(),
-        sender_received.clone(),
-    );
+    #[derive(Clone, Copy, Debug, Default)]
+    struct StdInstantClock;
+
+    impl can_iso_tp::Clock for StdInstantClock {
+        type Instant = Instant;
+        fn now(&self) -> Self::Instant {
+            Instant::now()
+        }
+        fn elapsed(&self, earlier: Self::Instant) -> Duration {
+            earlier.elapsed()
+        }
+        fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+            instant.checked_add(dur).unwrap_or(instant)
+        }
+    }
 
     let file_for_sender = file.clone();
     let file_for_displayer = file.clone();
     let expected_logs_for_sender = expected_logs.clone();
 
+    let sender_sent_t = sender_sent.clone();
+    let sender_received_t = sender_received.clone();
     let sender_thread = thread::spawn(
         move || -> Result<(CommittedTransfer, DispatchCounts), thincan::Error> {
-            let mut iface = thincan::Interface::new(node_sender, log_sender_bus::Router::new());
+            let mut rx_buf = [0u8; 256];
+            let node_sender = LoggingTransport::new(
+                IsoTpNode::with_clock(tx_b, rx_b, cfg(0x701, 0x700), StdInstantClock, &mut rx_buf)
+                    .unwrap(),
+                sender_sent_t,
+                sender_received_t,
+            );
+
+            let mut tx_buf = [0u8; 512];
+            let mut iface =
+                thincan::Interface::new(node_sender, log_sender_bus::Router::new(), &mut tx_buf);
             let mut handlers = log_sender_bus::HandlersImpl {
                 app: NoApp,
                 file_transfer: file_transfer::State::new(RecordingFileStore::default()),
@@ -581,28 +600,22 @@ fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                         kind: thincan::ErrorKind::Timeout,
                     });
                 }
-                match iface.recv_dispatch(&mut handlers, Duration::from_millis(50)) {
-                    Ok(outcome) => match outcome {
-                        thincan::DispatchOutcome::Handled => dispatch.handled += 1,
-                        thincan::DispatchOutcome::Unhandled(msg) => {
-                            panic!(
-                                "sender received unhandled message id=0x{:04x} len={}",
-                                msg.id,
-                                msg.body.len()
-                            );
+                match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
+                    thincan::RecvDispatch::TimedOut => continue,
+                    thincan::RecvDispatch::MalformedPayload => {
+                        return Err(thincan::Error {
+                            kind: thincan::ErrorKind::Other,
+                        });
+                    }
+                    thincan::RecvDispatch::Dispatched { id, kind } => match kind {
+                        thincan::RecvDispatchKind::Handled => dispatch.handled += 1,
+                        thincan::RecvDispatchKind::Unhandled => {
+                            panic!("sender received unhandled message id=0x{:04x}", id);
                         }
-                        thincan::DispatchOutcome::Unknown { id, body } => {
-                            panic!(
-                                "sender received unknown message id=0x{:04x} len={}",
-                                id,
-                                body.len()
-                            );
+                        thincan::RecvDispatchKind::Unknown => {
+                            panic!("sender received unknown message id=0x{:04x}", id);
                         }
                     },
-                    Err(thincan::Error {
-                        kind: thincan::ErrorKind::Timeout,
-                    }) => continue,
-                    Err(e) => return Err(e),
                 }
                 if let Some(transfer) = handlers.file_transfer.store.take_latest() {
                     break transfer;
@@ -678,10 +691,24 @@ fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
     );
 
     let expected_log_count = expected_logs.len();
+    let displayer_sent_t = displayer_sent.clone();
+    let displayer_received_t = displayer_received.clone();
     let displayer_thread = thread::spawn(
         move || -> Result<(Vec<Vec<u8>>, DispatchCounts, RecordingFileStore), thincan::Error> {
-            let mut iface =
-                thincan::Interface::new(node_displayer, log_displayer_bus::Router::new());
+            let mut rx_buf = [0u8; 256];
+            let node_displayer = LoggingTransport::new(
+                IsoTpNode::with_clock(tx_a, rx_a, cfg(0x700, 0x701), StdInstantClock, &mut rx_buf)
+                    .unwrap(),
+                displayer_sent_t,
+                displayer_received_t,
+            );
+
+            let mut tx_buf = [0u8; 512];
+            let mut iface = thincan::Interface::new(
+                node_displayer,
+                log_displayer_bus::Router::new(),
+                &mut tx_buf,
+            );
             let displayer_store = RecordingFileStore::default();
             let mut handlers = log_displayer_bus::HandlersImpl {
                 app: NoApp,
@@ -712,48 +739,34 @@ fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                         kind: thincan::ErrorKind::Timeout,
                     });
                 }
-                match iface.recv_dispatch(&mut handlers, Duration::from_millis(50)) {
-                    Ok(outcome) => match outcome {
-                        thincan::DispatchOutcome::Handled => {
+                match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
+                    thincan::RecvDispatch::TimedOut => continue,
+                    thincan::RecvDispatch::MalformedPayload => {
+                        return Err(thincan::Error {
+                            kind: thincan::ErrorKind::Other,
+                        });
+                    }
+                    thincan::RecvDispatch::Dispatched { kind, .. } => match kind {
+                        thincan::RecvDispatchKind::Handled => {
                             dispatch.handled += 1;
                             assert!(
                                 handlers.log_display.sink.lines.len() <= expected_log_count,
                                 "displayer received more logs than expected"
                             );
                         }
-                        thincan::DispatchOutcome::Unhandled(msg) => {
-                            panic!(
-                                "displayer received unhandled message id=0x{:04x} len={}",
-                                msg.id,
-                                msg.body.len()
-                            );
+                        thincan::RecvDispatchKind::Unhandled => {
+                            panic!("displayer received unhandled message")
                         }
-                        thincan::DispatchOutcome::Unknown { id, body } => {
-                            panic!(
-                                "displayer received unknown message id=0x{:04x} len={}",
-                                id,
-                                body.len()
-                            );
+                        thincan::RecvDispatchKind::Unknown => {
+                            panic!("displayer received unknown message")
                         }
                     },
-                    Err(thincan::Error {
-                        kind: thincan::ErrorKind::Timeout,
-                    }) => continue,
-                    Err(e) => return Err(e),
                 }
             }
 
             for _ in 0..3 {
-                match iface.recv_dispatch(&mut handlers, Duration::from_millis(50)) {
-                    Err(thincan::Error {
-                        kind: thincan::ErrorKind::Timeout,
-                    }) => {}
-                    Ok(outcome) => panic!(
-                        "unexpected extra message after logs complete: {:?}",
-                        outcome
-                    ),
-                    Err(e) => return Err(e),
-                }
+                let r = iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))?;
+                assert_eq!(r, thincan::RecvDispatch::TimedOut);
             }
 
             let store = handlers.file_transfer.store;
