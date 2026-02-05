@@ -7,7 +7,11 @@ use std::path::PathBuf;
 use std::thread;
 
 #[derive(Parser)]
-#[command(author, version, about = "embedded-can-unix-socket server for thincan-example")]
+#[command(
+    author,
+    version,
+    about = "embedded-can-unix-socket server for thincan-example"
+)]
 struct Args {
     /// Socket path to bind.
     #[arg(long, default_value = "/tmp/embedded-can-unix-socket.sock")]

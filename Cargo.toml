@@ -4,6 +4,7 @@ members = [
   "iso-tp/can-isotp-interface",
   "iso-tp/can-iso-tp",
   "can-uds",
+  "embedded-can/embedded-can-embassy-stm32",
   "embedded-can/embedded-can-socketcan",
   "embedded-can/embedded-can-unix-socket",
   "iso-tp/linux-socketcan-iso-tp",

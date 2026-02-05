@@ -1,0 +1,19 @@
+[package]
+name = "embedded-can-embassy-stm32"
+version = "0.1.0"
+edition = "2024"
+description = "embassy-stm32 CAN adapters implementing embedded-can-interface traits"
+readme = "README.md"
+
+[dependencies]
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.0"
+
+embassy-stm32 = { version = "0.5.0", optional = true, default-features = false }
+
+[features]
+default = []
+# Enable the embassy-stm32 integration.
+embassy-stm32 = ["dep:embassy-stm32"]
+bxcan = ["embassy-stm32"]
+fdcan = ["embassy-stm32"]
