@@ -21,6 +21,7 @@ linux-socketcan-iso-tp = { path = "../../iso-tp/linux-socketcan-iso-tp", optiona
 [features]
 default = ["uds"]
 uds = ["dep:embedded-can-unix-socket"]
+unix-socket = ["uds"]
 socketcan = ["dep:embedded-can-socketcan"]
 # Kernel ISO-TP benches still need a raw CAN backend for the `thincan-example` binary to build
 # under `cargo bench` (Cargo builds the package's binary targets too).

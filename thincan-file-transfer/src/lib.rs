@@ -142,6 +142,22 @@ fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -
 /// Default chunk size (bytes) used by [`Sender`].
 pub const DEFAULT_CHUNK_SIZE: usize = 64;
 
+/// Receiver-side configuration (used by [`State`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverConfig {
+    /// Maximum accepted `FileChunk.data` length (bytes).
+    ///
+    /// - `0` means "no limit / accept any size" (back-compat default).
+    /// - Non-zero values cause oversize chunks to be rejected as a protocol error.
+    pub max_chunk_size: u32,
+}
+
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self { max_chunk_size: 0 }
+    }
+}
+
 /// Generic bundle spec (used by `bus_maplet!`).
 ///
 /// Compose this bundle by writing (see the examples directory for a complete, compilable version):
@@ -307,15 +323,28 @@ pub enum Error<E> {
 struct InProgress<S: FileStore> {
     transfer_id: u32,
     total_len: u32,
+    max_chunk_size: u32,
+    file_metadata: Vec<u8>,
     handle: S::WriteHandle,
     received: Vec<(u32, u32)>,
 }
 
+/// Ack message that the receiver side would like to emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingAck {
+    pub transfer_id: u32,
+    pub kind: schema::FileAckKind,
+    pub next_offset: u32,
+    pub chunk_size: u32,
+    pub error: schema::FileAckError,
+}
+
 /// Bundle state (store + in-progress transfer tracking).
-#[derive(Default)]
 pub struct State<S: FileStore> {
     pub store: S,
     in_progress: Option<InProgress<S>>,
+    config: ReceiverConfig,
+    pending_ack: Option<PendingAck>,
 }
 
 impl<S: FileStore> State<S> {
@@ -324,7 +353,31 @@ impl<S: FileStore> State<S> {
         Self {
             store,
             in_progress: None,
+            config: ReceiverConfig::default(),
+            pending_ack: None,
         }
+    }
+
+    /// Set receiver-side protocol configuration.
+    pub fn set_config(&mut self, config: ReceiverConfig) {
+        self.config = config;
+    }
+
+    /// Current receiver-side configuration.
+    pub fn config(&self) -> ReceiverConfig {
+        self.config
+    }
+
+    /// Take (and clear) any pending ack the receiver wants to send.
+    pub fn take_pending_ack(&mut self) -> Option<PendingAck> {
+        self.pending_ack.take()
+    }
+
+    /// Access metadata bytes for the currently in-progress transfer (if any).
+    pub fn in_progress_metadata(&self) -> Option<&[u8]> {
+        self.in_progress
+            .as_ref()
+            .map(|ip| ip.file_metadata.as_slice())
     }
 }
 
@@ -340,15 +393,28 @@ pub fn handle_file_req<'a, S: FileStore>(
     state: &mut State<S>,
     msg: thincan::CapnpTyped<'a, schema::file_req::Owned>,
 ) -> Result<(), Error<S::Error>> {
-    let (transfer_id, total_len) = msg
+    let (transfer_id, total_len, file_metadata, sender_max_chunk_size) = msg
         .with_root(ReaderOptions::default(), |root| {
-            (root.get_transfer_id(), root.get_total_len())
+            (
+                root.get_transfer_id(),
+                root.get_total_len(),
+                root.get_file_metadata().unwrap_or(&[]).to_vec(),
+                root.get_sender_max_chunk_size(),
+            )
         })
         .map_err(Error::Capnp)?;
 
     if let Some(in_progress) = state.in_progress.take() {
         state.store.abort(in_progress.handle);
     }
+
+    let negotiated_chunk_size = match (state.config.max_chunk_size, sender_max_chunk_size) {
+        (0, 0) => 0,
+        (0, s) => s,
+        (r, 0) => r,
+        (r, s) => r.min(s),
+    };
+
     let handle = state
         .store
         .begin_write(transfer_id, total_len)
@@ -360,10 +426,20 @@ pub fn handle_file_req<'a, S: FileStore>(
         state.in_progress = Some(InProgress {
             transfer_id,
             total_len,
+            max_chunk_size: negotiated_chunk_size,
+            file_metadata,
             handle,
             received: Vec::new(),
         });
     }
+
+    state.pending_ack = Some(PendingAck {
+        transfer_id,
+        kind: schema::FileAckKind::Accept,
+        next_offset: 0,
+        chunk_size: negotiated_chunk_size,
+        error: schema::FileAckError::None,
+    });
     Ok(())
 }
 
@@ -406,6 +482,10 @@ pub fn handle_file_chunk<'a, S: FileStore>(
             return Err(Error::Protocol);
         }
 
+        if in_progress.max_chunk_size != 0 && data.len() > (in_progress.max_chunk_size as usize) {
+            return Err(Error::Protocol);
+        }
+
         let remaining = in_progress.total_len.saturating_sub(offset);
         if remaining == 0 {
             return Ok(());
@@ -422,6 +502,20 @@ pub fn handle_file_chunk<'a, S: FileStore>(
             offset,
             offset + (chunk_len as u32),
         );
+
+        let mut next_offset = 0u32;
+        if in_progress.received.first().is_some_and(|r| r.0 == 0) {
+            next_offset = in_progress.received[0].1.min(in_progress.total_len);
+        }
+
+        state.pending_ack = Some(PendingAck {
+            transfer_id,
+            kind: schema::FileAckKind::Ack,
+            next_offset,
+            chunk_size: 0,
+            error: schema::FileAckError::None,
+        });
+
         if in_progress.received.len() == 1
             && in_progress.received[0].0 == 0
             && in_progress.received[0].1 >= in_progress.total_len
@@ -431,6 +525,14 @@ pub fn handle_file_chunk<'a, S: FileStore>(
                 .store
                 .commit(in_progress.handle)
                 .map_err(Error::Store)?;
+
+            state.pending_ack = Some(PendingAck {
+                transfer_id,
+                kind: schema::FileAckKind::Complete,
+                next_offset: in_progress.total_len,
+                chunk_size: 0,
+                error: schema::FileAckError::None,
+            });
         }
 
         Ok(())
@@ -450,6 +552,16 @@ pub fn handle_file_ack<'a, S: FileStore>(
 pub struct FileReqValue<A> {
     pub transfer_id: u32,
     pub total_len: u32,
+    _atlas: PhantomData<A>,
+}
+
+/// Value type used to encode a `FileReq` message including metadata and chunk negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOfferValue<'a, A> {
+    pub transfer_id: u32,
+    pub total_len: u32,
+    pub file_metadata: &'a [u8],
+    pub sender_max_chunk_size: u32,
     _atlas: PhantomData<A>,
 }
 
@@ -478,6 +590,34 @@ pub fn file_req<A>(transfer_id: u32, total_len: u32) -> FileReqValue<A> {
     FileReqValue::new(transfer_id, total_len)
 }
 
+impl<'a, A> FileOfferValue<'a, A> {
+    /// Construct a `FileReq` offer value.
+    pub fn new(
+        transfer_id: u32,
+        total_len: u32,
+        sender_max_chunk_size: u32,
+        file_metadata: &'a [u8],
+    ) -> Self {
+        Self {
+            transfer_id,
+            total_len,
+            file_metadata,
+            sender_max_chunk_size,
+            _atlas: PhantomData,
+        }
+    }
+}
+
+/// Convenience constructor for [`FileOfferValue`].
+pub fn file_offer<'a, A>(
+    transfer_id: u32,
+    total_len: u32,
+    sender_max_chunk_size: u32,
+    file_metadata: &'a [u8],
+) -> FileOfferValue<'a, A> {
+    FileOfferValue::new(transfer_id, total_len, sender_max_chunk_size, file_metadata)
+}
+
 impl<'a, A> FileChunkValue<'a, A> {
     /// Construct a `FileChunk` value.
     pub fn new(transfer_id: u32, offset: u32, data: &'a [u8]) -> Self {
@@ -493,6 +633,60 @@ impl<'a, A> FileChunkValue<'a, A> {
 /// Convenience constructor for [`FileChunkValue`].
 pub fn file_chunk<'a, A>(transfer_id: u32, offset: u32, data: &'a [u8]) -> FileChunkValue<'a, A> {
     FileChunkValue::new(transfer_id, offset, data)
+}
+
+/// Value type used to encode a `FileAck` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileAckValue<A> {
+    pub transfer_id: u32,
+    pub kind: schema::FileAckKind,
+    pub next_offset: u32,
+    pub chunk_size: u32,
+    pub error: schema::FileAckError,
+    _atlas: PhantomData<A>,
+}
+
+impl<A> FileAckValue<A> {
+    pub fn new(
+        transfer_id: u32,
+        kind: schema::FileAckKind,
+        next_offset: u32,
+        chunk_size: u32,
+        error: schema::FileAckError,
+    ) -> Self {
+        Self {
+            transfer_id,
+            kind,
+            next_offset,
+            chunk_size,
+            error,
+            _atlas: PhantomData,
+        }
+    }
+}
+
+pub fn file_ack_accept<A>(transfer_id: u32, chunk_size: u32) -> FileAckValue<A> {
+    FileAckValue::new(
+        transfer_id,
+        schema::FileAckKind::Accept,
+        0,
+        chunk_size,
+        schema::FileAckError::None,
+    )
+}
+
+pub fn file_ack_progress<A>(transfer_id: u32, next_offset: u32) -> FileAckValue<A> {
+    FileAckValue::new(
+        transfer_id,
+        schema::FileAckKind::Ack,
+        next_offset,
+        0,
+        schema::FileAckError::None,
+    )
+}
+
+pub fn file_ack_reject<A>(transfer_id: u32, error: schema::FileAckError) -> FileAckValue<A> {
+    FileAckValue::new(transfer_id, schema::FileAckKind::Reject, 0, 0, error)
 }
 
 /// Transport abstraction for sending encoded messages.
@@ -644,7 +838,13 @@ impl<A> Sender<A> {
             kind: thincan::ErrorKind::Other,
         })?;
 
-        tx.send_encoded::<A::FileReq, _>(&file_req::<A>(transfer_id, total_len_u32), timeout)?;
+        let sender_max_chunk_size = u32::try_from(self.chunk_size).map_err(|_| thincan::Error {
+            kind: thincan::ErrorKind::Other,
+        })?;
+        tx.send_encoded::<A::FileReq, _>(
+            &file_offer::<A>(transfer_id, total_len_u32, sender_max_chunk_size, &[]),
+            timeout,
+        )?;
 
         let mut chunks = 0usize;
         for (index, chunk) in bytes.chunks(self.chunk_size).enumerate() {
@@ -715,9 +915,12 @@ impl<A> Sender<A> {
             kind: thincan::ErrorKind::Other,
         })?;
 
+        let sender_max_chunk_size = u32::try_from(self.chunk_size).map_err(|_| thincan::Error {
+            kind: thincan::ErrorKind::Other,
+        })?;
         tx.send_encoded_to::<A::FileReq, _>(
             to,
-            &file_req::<A>(transfer_id, total_len_u32),
+            &file_offer::<A>(transfer_id, total_len_u32, sender_max_chunk_size, &[]),
             timeout,
         )?;
 
@@ -815,8 +1018,8 @@ where
     fn max_encoded_len(&self) -> usize {
         // Single-segment Cap'n Proto message (no framing) containing:
         // - 1 word: root pointer
-        // - 1 word: struct data (2x u32)
-        16
+        // - 3 words: struct (data=3x u32, pointers=1x pointer) + alignment slack
+        32
     }
 
     fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
@@ -832,6 +1035,48 @@ where
             let mut root: schema::file_req::Builder = message.init_root();
             root.set_transfer_id(self.transfer_id);
             root.set_total_len(self.total_len);
+
+            let segments = message.get_segments_for_output();
+            if segments.len() != 1 {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            let bytes = segments[0];
+            if bytes.len() > max_len {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        })
+    }
+}
+
+impl<'a, A> thincan::Encode<<A as Atlas>::FileReq> for FileOfferValue<'a, A>
+where
+    A: Atlas,
+{
+    fn max_encoded_len(&self) -> usize {
+        32 + ((self.file_metadata.len() + 7) & !7)
+    }
+
+    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
+        let max_len = self.max_encoded_len();
+        if out.len() < max_len {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+        with_capnp_scratch_bytes(max_len, |scratch| {
+            let mut message =
+                capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(scratch));
+            let mut root: schema::file_req::Builder = message.init_root();
+            root.set_transfer_id(self.transfer_id);
+            root.set_total_len(self.total_len);
+            root.set_file_metadata(self.file_metadata);
+            root.set_sender_max_chunk_size(self.sender_max_chunk_size);
 
             let segments = message.get_segments_for_output();
             if segments.len() != 1 {
@@ -877,6 +1122,52 @@ where
             root.set_transfer_id(self.transfer_id);
             root.set_offset(self.offset);
             root.set_data(self.data);
+
+            let segments = message.get_segments_for_output();
+            if segments.len() != 1 {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            let bytes = segments[0];
+            if bytes.len() > max_len {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Other,
+                });
+            }
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        })
+    }
+}
+
+impl<A> thincan::Encode<<A as Atlas>::FileAck> for FileAckValue<A>
+where
+    A: Atlas,
+{
+    fn max_encoded_len(&self) -> usize {
+        // Single-segment Cap'n Proto message (no framing) containing:
+        // - 1 word: root pointer
+        // - 2 words: struct data (u32 + enums + u32s)
+        24
+    }
+
+    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
+        let max_len = self.max_encoded_len();
+        if out.len() < max_len {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+        with_capnp_scratch_bytes(max_len, |scratch| {
+            let mut message =
+                capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(scratch));
+            let mut root: schema::file_ack::Builder = message.init_root();
+            root.set_transfer_id(self.transfer_id);
+            root.set_kind(self.kind);
+            root.set_next_offset(self.next_offset);
+            root.set_chunk_size(self.chunk_size);
+            root.set_error(self.error);
 
             let segments = message.get_segments_for_output();
             if segments.len() != 1 {

@@ -3,7 +3,7 @@
 #[cfg(all(feature = "uds", feature = "socketcan"))]
 compile_error!(
     "Enable only one of the 'uds' or 'socketcan' features at a time. \
-Note: 'uds' is enabled by default; to build SocketCAN use `--no-default-features --features socketcan`."
+Note: 'uds' (aka 'unix-socket') is enabled by default; to build SocketCAN use `--no-default-features --features socketcan`."
 );
 
 #[cfg(not(any(feature = "uds", feature = "socketcan")))]

@@ -79,6 +79,24 @@ fn encode_req(transfer_id: u32, total_len: u32) -> Vec<u8> {
     buf
 }
 
+fn encode_offer(
+    transfer_id: u32,
+    total_len: u32,
+    sender_max_chunk_size: u32,
+    metadata: &[u8],
+) -> Vec<u8> {
+    let v = thincan_file_transfer::file_offer::<DemoAtlas>(
+        transfer_id,
+        total_len,
+        sender_max_chunk_size,
+        metadata,
+    );
+    let mut buf = vec![0u8; v.max_encoded_len()];
+    let n = v.encode(&mut buf).unwrap();
+    buf.truncate(n);
+    buf
+}
+
 fn encode_chunk(transfer_id: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
     let v = thincan_file_transfer::file_chunk::<DemoAtlas>(transfer_id, offset, bytes);
     let mut buf = vec![0u8; v.max_encoded_len()];
@@ -162,6 +180,62 @@ fn file_chunk_does_not_commit_until_all_ranges_received() {
         thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c1[..]);
     thincan_file_transfer::handle_file_chunk(&mut state, chunk1).unwrap();
     assert_eq!(state.store.commit_calls, 1);
+}
+
+#[test]
+fn receiver_emits_accept_and_cumulative_ack() {
+    let mut state = thincan_file_transfer::State::new(Store::default());
+    state.set_config(thincan_file_transfer::ReceiverConfig {
+        max_chunk_size: 8,
+    });
+
+    let metadata = b"opaque-metadata";
+    let r = encode_offer(7, 8, 64, metadata);
+    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&r[..]);
+    thincan_file_transfer::handle_file_req(&mut state, req).unwrap();
+
+    let accept = state.take_pending_ack().expect("expected accept ack");
+    assert_eq!(accept.transfer_id, 7);
+    assert_eq!(accept.kind, thincan_file_transfer::schema::FileAckKind::Accept);
+    assert_eq!(accept.chunk_size, 8);
+    assert_eq!(state.in_progress_metadata().unwrap(), metadata);
+
+    // Out-of-order chunk: ack should remain at 0.
+    let c2 = encode_chunk(7, 4, b"EFGH");
+    let chunk2 =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c2[..]);
+    thincan_file_transfer::handle_file_chunk(&mut state, chunk2).unwrap();
+    let ack0 = state.take_pending_ack().expect("expected progress ack");
+    assert_eq!(ack0.kind, thincan_file_transfer::schema::FileAckKind::Ack);
+    assert_eq!(ack0.next_offset, 0);
+
+    // Now the first chunk: cumulative ack should advance to 8 and commit triggers complete.
+    let c1 = encode_chunk(7, 0, b"ABCD");
+    let chunk1 =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c1[..]);
+    thincan_file_transfer::handle_file_chunk(&mut state, chunk1).unwrap();
+
+    // `handle_file_chunk` emits an Ack and then a Complete; we should see the latest (Complete).
+    let done = state.take_pending_ack().expect("expected complete ack");
+    assert_eq!(done.kind, thincan_file_transfer::schema::FileAckKind::Complete);
+    assert_eq!(done.next_offset, 8);
+}
+
+#[test]
+fn receiver_rejects_oversize_chunks_when_configured() {
+    let mut state = thincan_file_transfer::State::new(Store::default());
+    state.set_config(thincan_file_transfer::ReceiverConfig {
+        max_chunk_size: 4,
+    });
+
+    let r = encode_offer(1, 8, 64, &[]);
+    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&r[..]);
+    thincan_file_transfer::handle_file_req(&mut state, req).unwrap();
+
+    let c = encode_chunk(1, 0, b"TOO-LONG");
+    let chunk = thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c);
+    let err = thincan_file_transfer::handle_file_chunk(&mut state, chunk).unwrap_err();
+    assert!(matches!(err, thincan_file_transfer::Error::Protocol));
 }
 
 #[test]
