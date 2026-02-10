@@ -15,5 +15,4 @@ std = []
 
 [dependencies]
 embedded-can = "0.4.1"
-embedded-can-interface = "0.1.0"
-
+embedded-can-interface = "0.1.1"

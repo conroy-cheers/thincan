@@ -9,7 +9,7 @@ capnp = { version = "0.25.0", default-features = false, features = [
 ], optional = true }
 capnpc = { version = "0.25.0", optional = true }
 embedded-can = "0.4.1"
-embedded-can-interface = "0.1.0"
+embedded-can-interface = "0.1.1"
 phf = { version = "0.13.1", default-features = false, features = ["macros"] }
 can-iso-tp = { version = "0.1.0", default-features = false }
 can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0", optional = true }

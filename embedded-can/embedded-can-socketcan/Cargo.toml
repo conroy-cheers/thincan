@@ -6,7 +6,7 @@ description = "Linux SocketCAN adapters implementing embedded-can-interface trai
 readme = "README.md"
 
 [dependencies]
-embedded-can-interface = "0.1.0"
+embedded-can-interface = "0.1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

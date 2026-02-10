@@ -10,8 +10,12 @@ clap = { version = "4.5.23", features = ["derive"] }
 can-iso-tp = { path = "../../iso-tp/can-iso-tp", features = ["std", "uds"] }
 can-uds = { path = "../../can-uds" }
 embedded-can = "0.4.1"
-embedded-can-interface = "0.1.0"
-thincan = { path = "../../thincan", default-features = false, features = ["std", "capnp", "isotp-uds"] }
+embedded-can-interface = "0.1.1"
+thincan = { path = "../../thincan", default-features = false, features = [
+    "std",
+    "capnp",
+    "isotp-uds",
+] }
 thincan-file-transfer = { path = "../../thincan-file-transfer" }
 
 embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", optional = true }
@@ -25,7 +29,11 @@ unix-socket = ["uds"]
 socketcan = ["dep:embedded-can-socketcan"]
 # Kernel ISO-TP benches still need a raw CAN backend for the `thincan-example` binary to build
 # under `cargo bench` (Cargo builds the package's binary targets too).
-socketcan-isotp = ["dep:linux-socketcan-iso-tp", "thincan/isotp-interface", "socketcan"]
+socketcan-isotp = [
+    "dep:linux-socketcan-iso-tp",
+    "thincan/isotp-interface",
+    "socketcan",
+]
 
 [dev-dependencies]
 criterion = "0.5"

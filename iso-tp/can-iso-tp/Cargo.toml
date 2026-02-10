@@ -19,7 +19,7 @@ isotp-interface = ["dep:can-isotp-interface"]
 
 [dependencies]
 embedded-can = "0.4.1"
-embedded-can-interface = "0.1.0"
+embedded-can-interface = "0.1.1"
 can-uds = { path = "../../can-uds", version = "0.1.0", optional = true }
 can-isotp-interface = { path = "../can-isotp-interface", version = "0.1.0", optional = true }
 
