@@ -3,12 +3,18 @@ name = "thincan-file-transfer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc", "thincan/std"]
+heapless = ["dep:heapless"]
+
 [dependencies]
 capnp = { version = "0.25.0", default-features = false, features = [
     "unaligned",
 ] }
+heapless = { version = "0.8.0", default-features = false, optional = true }
 thincan = { path = "../thincan", default-features = false, features = [
-    "std",
     "capnp",
 ] }
 
@@ -22,3 +28,13 @@ embedded-can-mock = "0.1.0"
 can-iso-tp = { version = "0.1.0", default-features = false, features = ["std"] }
 
 [lib]
+
+[[example]]
+name = "router_only"
+path = "examples/router_only.rs"
+required-features = ["alloc"]
+
+[[example]]
+name = "interface_two_threads"
+path = "examples/interface_two_threads.rs"
+required-features = ["alloc"]

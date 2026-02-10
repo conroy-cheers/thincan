@@ -1,3 +1,5 @@
+#![cfg(feature = "alloc")]
+
 use capnp::message::ReaderOptions;
 use std::time::Duration;
 use thincan::Message;

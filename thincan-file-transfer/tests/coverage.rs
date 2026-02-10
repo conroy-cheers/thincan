@@ -1,3 +1,5 @@
+#![cfg(feature = "alloc")]
+
 use std::time::Duration;
 
 use thincan::Encode as _;

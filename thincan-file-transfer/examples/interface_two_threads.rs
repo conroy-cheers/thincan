@@ -1,3 +1,5 @@
+#![cfg(feature = "alloc")]
+
 use can_iso_tp::{IsoTpConfig, IsoTpNode};
 use embedded_can::StandardId;
 use embedded_can_interface::{Id, SplitTxRx};

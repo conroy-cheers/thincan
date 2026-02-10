@@ -1539,6 +1539,7 @@ dependencies = [
  "embedded-can",
  "embedded-can-interface",
  "embedded-can-mock",
+ "heapless 0.8.0",
  "thincan",
 ]
 
