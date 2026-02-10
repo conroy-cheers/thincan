@@ -4,7 +4,7 @@
 //! use either a userspace ISO-TP implementation or the Linux kernel ISO-TP
 //! sockets without changing higher-level code.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
 use core::time::Duration;
 
@@ -100,6 +100,9 @@ pub trait IsoTpEndpointMeta {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::vec::Vec;
+
     use super::*;
 
     #[derive(Debug, Default)]

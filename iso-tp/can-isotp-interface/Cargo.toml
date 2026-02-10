@@ -6,11 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "ISO-TP transport traits shared across user-space and kernel backends"
 repository = "https://github.com/conroy-cheers/thincan"
 
-[features]
-std = []
-
-default = ["std"]
-
 [dependencies]
 
 [dev-dependencies]
