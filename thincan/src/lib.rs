@@ -1207,16 +1207,14 @@ where
     where
         Rt: can_iso_tp::AsyncRuntime,
     {
-        let payload = self.encode_msg_into::<M>(body)?;
-        self.node
-            .send(rt, payload, timeout)
-            .await
-            .map_err(|e| Error {
-                kind: match e {
-                    can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                    _ => ErrorKind::Other,
-                },
-            })
+        let (node, tx) = (&mut self.node, &mut self.tx);
+        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
+        node.send(rt, payload, timeout).await.map_err(|e| Error {
+            kind: match e {
+                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
+                _ => ErrorKind::Other,
+            },
+        })
     }
 
     /// Async send-encoded helper for ISO-TP async nodes.
@@ -1229,16 +1227,14 @@ where
     where
         Rt: can_iso_tp::AsyncRuntime,
     {
-        let payload = self.encode_value_into::<M, V>(value)?;
-        self.node
-            .send(rt, payload, timeout)
-            .await
-            .map_err(|e| Error {
-                kind: match e {
-                    can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                    _ => ErrorKind::Other,
-                },
-            })
+        let (node, tx) = (&mut self.node, &mut self.tx);
+        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
+        node.send(rt, payload, timeout).await.map_err(|e| Error {
+            kind: match e {
+                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
+                _ => ErrorKind::Other,
+            },
+        })
     }
 
     /// Async send helper with transport metadata (destination address).
@@ -1464,9 +1460,9 @@ where
     where
         Rt: can_iso_tp::AsyncRuntime,
     {
-        let payload = self.encode_msg_into::<M>(body)?;
-        self.node
-            .send_to(rt, to, payload, timeout)
+        let (node, tx) = (&mut self.node, &mut self.tx);
+        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
+        node.send_to(rt, to, payload, timeout)
             .await
             .map_err(|e| Error {
                 kind: match e {
@@ -1487,9 +1483,9 @@ where
     where
         Rt: can_iso_tp::AsyncRuntime,
     {
-        let payload = self.encode_value_into::<M, V>(value)?;
-        self.node
-            .send_to(rt, to, payload, timeout)
+        let (node, tx) = (&mut self.node, &mut self.tx);
+        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
+        node.send_to(rt, to, payload, timeout)
             .await
             .map_err(|e| Error {
                 kind: match e {

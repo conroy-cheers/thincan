@@ -1,10 +1,8 @@
 #![cfg_attr(all(feature = "uds", feature = "socketcan"), allow(dead_code))]
 
-#[cfg(all(feature = "uds", feature = "socketcan"))]
-compile_error!(
-    "Enable only one of the 'uds' or 'socketcan' features at a time. \
-Note: 'uds' (aka 'unix-socket') is enabled by default; to build SocketCAN use `--no-default-features --features socketcan`."
-);
+// If both backends are enabled (e.g. via `cargo test --all-features`), prefer UDS by default so
+// the binary remains buildable. To force SocketCAN, disable default features and enable only
+// `socketcan`.
 
 #[cfg(not(any(feature = "uds", feature = "socketcan")))]
 compile_error!("Enable either the 'uds' or 'socketcan' feature.");
@@ -339,7 +337,7 @@ fn open_can(cli: &Cli) -> Result<embedded_can_unix_socket::UnixCan> {
     embedded_can_unix_socket::UnixCan::connect(&cli.uds_socket).context("connect to uds server")
 }
 
-#[cfg(feature = "socketcan")]
+#[cfg(all(feature = "socketcan", not(feature = "uds")))]
 fn open_can(cli: &Cli) -> Result<embedded_can_socketcan::SocketCan> {
     embedded_can_socketcan::SocketCan::open(&cli.iface).context("open socketcan interface")
 }

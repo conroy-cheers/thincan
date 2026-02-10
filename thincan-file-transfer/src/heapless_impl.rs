@@ -4,11 +4,15 @@ use core::time::Duration;
 use heapless::Vec;
 
 use crate::{
+    Atlas, Bundle, DEFAULT_CHUNK_SIZE, Error, FileStore, PendingAck, ReceiverConfig, SendResult,
     capnp_scratch_words_for_bytes, file_chunk_max_encoded_len, file_offer_max_encoded_len, schema,
-    Atlas, Bundle, Error, FileStore, PendingAck, ReceiverConfig, SendResult, DEFAULT_CHUNK_SIZE,
 };
 
-fn set_pending_reject(state: &mut impl PendingAckSink, transfer_id: u32, err: schema::FileAckError) {
+fn set_pending_reject(
+    state: &mut impl PendingAckSink,
+    transfer_id: u32,
+    err: schema::FileAckError,
+) {
     state.set_pending_ack(PendingAck {
         transfer_id,
         kind: schema::FileAckKind::Reject,
@@ -116,17 +120,24 @@ fn insert_received_range<const N: usize>(
     if ranges.len() == N {
         return Err(());
     }
-    ranges.insert(i, (merged_start, merged_end)).map_err(|_| ())?;
+    ranges
+        .insert(i, (merged_start, merged_end))
+        .map_err(|_| ())?;
     Ok(())
 }
 
 /// Handle an incoming `FileReq` message (no-alloc).
-pub fn handle_file_req_no_alloc<'a, S: FileStore, const MAX_METADATA: usize, const MAX_RANGES: usize>(
+pub fn handle_file_req_no_alloc<
+    'a,
+    S: FileStore,
+    const MAX_METADATA: usize,
+    const MAX_RANGES: usize,
+>(
     state: &mut StateNoAlloc<S, MAX_METADATA, MAX_RANGES>,
     msg: thincan::CapnpTyped<'a, schema::file_req::Owned>,
 ) -> Result<(), Error<S::Error>> {
-    let (transfer_id, total_len, file_metadata, sender_max_chunk_size) =
-        msg.with_root(ReaderOptions::default(), |root| {
+    let (transfer_id, total_len, file_metadata, sender_max_chunk_size) = msg
+        .with_root(ReaderOptions::default(), |root| {
             let transfer_id = root.get_transfer_id();
             let total_len = root.get_total_len();
             let sender_max_chunk_size = root.get_sender_max_chunk_size();
@@ -274,14 +285,18 @@ pub fn handle_file_chunk_no_alloc<
 }
 
 /// Handle an incoming `FileAck` message (no-alloc).
-pub fn handle_file_ack_no_alloc<'a, S: FileStore, const MAX_METADATA: usize, const MAX_RANGES: usize>(
+pub fn handle_file_ack_no_alloc<
+    'a,
+    S: FileStore,
+    const MAX_METADATA: usize,
+    const MAX_RANGES: usize,
+>(
     _state: &mut StateNoAlloc<S, MAX_METADATA, MAX_RANGES>,
     _msg: thincan::CapnpTyped<'a, schema::file_ack::Owned>,
 ) -> Result<(), Error<S::Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "alloc"))]
 impl<A, S, const MAX_METADATA: usize, const MAX_RANGES: usize>
     thincan::BundleDispatch<A, StateNoAlloc<S, MAX_METADATA, MAX_RANGES>> for Bundle
 where
@@ -329,8 +344,11 @@ where
 
 /// Transport abstraction for sending raw message bodies (no-alloc).
 pub trait SendMsg {
-    fn send_msg<M: thincan::Message>(&mut self, body: &[u8], timeout: Duration)
-        -> Result<(), thincan::Error>;
+    fn send_msg<M: thincan::Message>(
+        &mut self,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<(), thincan::Error>;
 }
 
 impl<Node, Router, TxBuf> SendMsg for thincan::Interface<Node, Router, TxBuf>
@@ -388,7 +406,11 @@ impl<const WORDS: usize> CapnpScratch<WORDS> {
         Self { words: Vec::new() }
     }
 
-    fn with_bytes<R>(&mut self, min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, thincan::Error> {
+    fn with_bytes<R>(
+        &mut self,
+        min_len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, thincan::Error> {
         let min_words = capnp_scratch_words_for_bytes(min_len);
         if min_words > WORDS {
             return Err(thincan::Error {
@@ -403,7 +425,10 @@ impl<const WORDS: usize> CapnpScratch<WORDS> {
                 })?;
         }
         let bytes = unsafe {
-            core::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.words.len() * 8)
+            core::slice::from_raw_parts_mut(
+                self.words.as_mut_ptr() as *mut u8,
+                self.words.len() * 8,
+            )
         };
         Ok(f(&mut bytes[..min_len]))
     }
@@ -424,9 +449,9 @@ fn encode_file_offer_into<A: Atlas, const WORDS: usize>(
         });
     }
     scratch.with_bytes(max_len, |scratch_bytes| {
-        let mut message = capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(
-            scratch_bytes,
-        ));
+        let mut message = capnp::message::Builder::new(
+            capnp::message::SingleSegmentAllocator::new(scratch_bytes),
+        );
         let mut root: schema::file_req::Builder = message.init_root();
         root.set_transfer_id(transfer_id);
         root.set_total_len(total_len);
@@ -459,9 +484,9 @@ fn encode_file_chunk_into<const WORDS: usize>(
         });
     }
     scratch.with_bytes(max_len, |scratch_bytes| {
-        let mut message = capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(
-            scratch_bytes,
-        ));
+        let mut message = capnp::message::Builder::new(
+            capnp::message::SingleSegmentAllocator::new(scratch_bytes),
+        );
         let mut root: schema::file_chunk::Builder = message.init_root();
         root.set_transfer_id(transfer_id);
         root.set_offset(offset);
@@ -498,7 +523,9 @@ impl<A, const MAX_BODY: usize, const SCRATCH_WORDS: usize> Default
     }
 }
 
-impl<A, const MAX_BODY: usize, const SCRATCH_WORDS: usize> SenderNoAlloc<A, MAX_BODY, SCRATCH_WORDS> {
+impl<A, const MAX_BODY: usize, const SCRATCH_WORDS: usize>
+    SenderNoAlloc<A, MAX_BODY, SCRATCH_WORDS>
+{
     pub fn new() -> Self {
         Self {
             next_transfer_id: 1,
