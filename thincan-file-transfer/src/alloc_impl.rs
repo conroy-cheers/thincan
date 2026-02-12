@@ -4,9 +4,9 @@ use core::marker::PhantomData;
 use core::time::Duration;
 
 use crate::{
-    file_chunk, file_offer, schema, Atlas, Bundle, Error, FileAckValue, FileChunkValue,
-    FileOfferValue, FileReqValue, FileStore, PendingAck, ReceiverConfig, SendResult,
-    DEFAULT_CHUNK_SIZE,
+    Atlas, Bundle, DEFAULT_CHUNK_SIZE, Error, FileAckValue, FileChunkValue, FileOfferValue,
+    FileReqValue, FileStore, PendingAck, ReceiverConfig, SendResult, file_chunk, file_offer,
+    schema,
 };
 
 #[cfg(feature = "std")]
@@ -38,8 +38,9 @@ fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -
     {
         let mut words: Vec<capnp::Word> = Vec::new();
         words.resize(min_words, capnp::word(0, 0, 0, 0, 0, 0, 0, 0));
-        let bytes =
-            unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8)
+        };
         f(&mut bytes[..min_len])
     }
 }
@@ -280,7 +281,7 @@ pub trait SendEncoded {
 
 impl<Node, Router, TxBuf> SendEncoded for thincan::Interface<Node, Router, TxBuf>
 where
-    Node: thincan::Transport,
+    Node: can_isotp_interface::IsoTpEndpoint,
     TxBuf: AsMut<[u8]>,
 {
     fn send_encoded<M: thincan::Message, V: thincan::Encode<M>>(
@@ -304,7 +305,7 @@ pub trait SendEncodedTo<A> {
 
 impl<Node, Router, TxBuf> SendEncodedTo<Node::ReplyTo> for thincan::Interface<Node, Router, TxBuf>
 where
-    Node: thincan::TransportMeta,
+    Node: can_isotp_interface::IsoTpEndpointMeta,
     TxBuf: AsMut<[u8]>,
 {
     fn send_encoded_to<M: thincan::Message, V: thincan::Encode<M>>(
@@ -425,7 +426,10 @@ impl<A> Sender<A> {
             let offset_u32 = u32::try_from(offset).map_err(|_| thincan::Error {
                 kind: thincan::ErrorKind::Other,
             })?;
-            tx.send_encoded::<A::FileChunk, _>(&file_chunk::<A>(transfer_id, offset_u32, chunk), timeout)?;
+            tx.send_encoded::<A::FileChunk, _>(
+                &file_chunk::<A>(transfer_id, offset_u32, chunk),
+                timeout,
+            )?;
             chunks += 1;
         }
 
@@ -725,4 +729,3 @@ where
         })
     }
 }
-

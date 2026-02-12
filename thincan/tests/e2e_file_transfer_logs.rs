@@ -1,6 +1,7 @@
 #![cfg(feature = "std")]
 
 use can_iso_tp::{IsoTpConfig, IsoTpNode};
+use can_isotp_interface::{IsoTpEndpoint, RecvControl, RecvError, RecvStatus, SendError};
 use embedded_can::StandardId;
 use embedded_can_interface::{Id, SplitTxRx};
 use embedded_can_mock::{BusHandle, MockCan};
@@ -480,11 +481,13 @@ impl<T> LoggingTransport<T> {
     }
 }
 
-impl<T> thincan::Transport for LoggingTransport<T>
+impl<T> IsoTpEndpoint for LoggingTransport<T>
 where
-    T: thincan::Transport,
+    T: IsoTpEndpoint,
 {
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), thincan::Error> {
+    type Error = T::Error;
+
+    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>> {
         self.sent.lock().unwrap().push(payload.to_vec());
         self.inner.send(payload, timeout)
     }
@@ -493,9 +496,9 @@ where
         &mut self,
         timeout: Duration,
         mut on_payload: F,
-    ) -> Result<thincan::RecvStatus, thincan::Error>
+    ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+        F: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
     {
         let received = self.received.clone();
         self.inner.recv_one(timeout, |payload| {

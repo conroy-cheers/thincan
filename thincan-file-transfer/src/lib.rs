@@ -301,15 +301,21 @@ where
 mod alloc_impl;
 #[cfg(feature = "alloc")]
 pub use alloc_impl::{
-    handle_file_ack, handle_file_chunk, handle_file_req, Deps, SendEncoded, SendEncodedTo, Sender,
-    State,
+    Deps, SendEncoded, SendEncodedTo, Sender, State, handle_file_ack, handle_file_chunk,
+    handle_file_req,
 };
 
 #[cfg(feature = "heapless")]
 mod heapless_impl;
 #[cfg(feature = "heapless")]
 pub use heapless_impl::{
-    handle_file_ack_no_alloc, handle_file_chunk_no_alloc, handle_file_req_no_alloc, CapnpScratch,
-    SendMsg, SendMsgTo, SenderNoAlloc, StateNoAlloc,
+    CapnpScratch, SendMsg, SendMsgTo, SenderNoAlloc, StateNoAlloc, handle_file_ack_no_alloc,
+    handle_file_chunk_no_alloc, handle_file_req_no_alloc,
 };
 
+#[cfg(feature = "tokio")]
+mod tokio_impl;
+#[cfg(feature = "tokio")]
+pub use tokio_impl::{
+    Ack, AckInbox, AckStream, AsyncSendResult, AsyncSender, ack_channel, decode_file_ack,
+};

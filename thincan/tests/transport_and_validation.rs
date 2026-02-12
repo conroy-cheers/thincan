@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use can_isotp_interface::{IsoTpEndpoint, RecvControl, RecvError, RecvStatus, SendError};
+
 #[derive(Default)]
 struct SharedPipe {
     a_to_b: VecDeque<Vec<u8>>,
@@ -42,8 +44,10 @@ impl PipeEnd {
     }
 }
 
-impl thincan::Transport for PipeEnd {
-    fn send(&mut self, payload: &[u8], _timeout: Duration) -> Result<(), thincan::Error> {
+impl IsoTpEndpoint for PipeEnd {
+    type Error = thincan::Error;
+
+    fn send(&mut self, payload: &[u8], _timeout: Duration) -> Result<(), SendError<Self::Error>> {
         let mut shared = self.shared.lock().unwrap();
         match self.dir {
             Direction::A => shared.a_to_b.push_back(payload.to_vec()),
@@ -56,9 +60,9 @@ impl thincan::Transport for PipeEnd {
         &mut self,
         _timeout: Duration,
         mut on_payload: F,
-    ) -> Result<thincan::RecvStatus, thincan::Error>
+    ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+        F: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
     {
         *self.recv_calls.lock().unwrap() += 1;
 
@@ -69,12 +73,12 @@ impl thincan::Transport for PipeEnd {
         };
 
         if queue.is_empty() {
-            return Ok(thincan::RecvStatus::TimedOut);
+            return Ok(RecvStatus::TimedOut);
         }
 
         let payload = queue.pop_front().unwrap();
-        let _ = on_payload(&payload)?;
-        Ok(thincan::RecvStatus::DeliveredOne)
+        let _ = on_payload(&payload).map_err(RecvError::Backend)?;
+        Ok(RecvStatus::DeliveredOne)
     }
 }
 
@@ -184,7 +188,7 @@ fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(), thi
         ]
     );
 
-    // Critical: without buffering, one dispatched message requires one `Transport::recv_one`.
+    // Critical: without buffering, one dispatched message requires one endpoint `recv_one`.
     assert_eq!(*a_calls.lock().unwrap(), 0);
     assert_eq!(*b_calls.lock().unwrap(), 2);
     Ok(())

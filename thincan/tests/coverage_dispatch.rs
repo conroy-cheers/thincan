@@ -343,19 +343,25 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
     }
 
     struct Sink;
-    impl thincan::Transport for Sink {
-        fn send(&mut self, _payload: &[u8], _timeout: Duration) -> Result<(), thincan::Error> {
+    impl can_isotp_interface::IsoTpEndpoint for Sink {
+        type Error = thincan::Error;
+
+        fn send(
+            &mut self,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
             Ok(())
         }
         fn recv_one<F>(
             &mut self,
             _timeout: Duration,
             _on_payload: F,
-        ) -> Result<thincan::RecvStatus, thincan::Error>
+        ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
         where
-            F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+            F: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
         {
-            Ok(thincan::RecvStatus::TimedOut)
+            Ok(can_isotp_interface::RecvStatus::TimedOut)
         }
     }
 
@@ -429,20 +435,26 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         ..IsoTpConfig::default()
     };
     let mut rx_buf_a = [0u8; 64];
-    let mut node =
+    let node =
         IsoTpNode::with_clock(tx_a, rx_a, cfg_other, TestClock::default(), &mut rx_buf_a).unwrap();
 
-    // Non-timeout error from ISO-TP maps to ErrorKind::Other.
-    let err =
-        thincan::Transport::send(&mut node, &[0x01, 0x02], Duration::from_millis(10)).unwrap_err();
+    // Non-timeout error from ISO-TP maps through the interface layer as ErrorKind::Other.
+    let mut tx_buf = [0u8; 64];
+    let mut iface = thincan::Interface::new(node, maplet_unhandled::Router::new(), &mut tx_buf);
+    let err = iface
+        .send_msg::<atlas::Ping>(&[0x01], Duration::from_millis(10))
+        .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
-    // Receive timeout maps to a TimedOut status (not an error).
-    let st = thincan::Transport::recv_one(&mut node, Duration::from_millis(1), |_| {
-        Ok(thincan::RecvControl::Continue)
-    })
-    .unwrap();
-    assert_eq!(st, thincan::RecvStatus::TimedOut);
+    // Receive timeout maps to a TimedOut dispatch result (not an error).
+    let mut handlers = maplet_unhandled::HandlersImpl {
+        app: AppHandlers::default(),
+        demo_bundle: BundleHandlers::default(),
+    };
+    let st = iface
+        .recv_one_dispatch(&mut handlers, Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(st, thincan::RecvDispatch::TimedOut);
 
     // Send timeout from ISO-TP maps to ErrorKind::Timeout (multi-frame requires flow control).
     let can_b = MockCan::new_with_bus(&bus, vec![]).unwrap();
@@ -459,11 +471,21 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         ..IsoTpConfig::default()
     };
     let mut rx_buf_b = [0u8; 256];
-    let mut node2 =
-        IsoTpNode::with_clock(tx_b, rx_b, cfg_timeout, TestClock::default(), &mut rx_buf_b)
-            .unwrap();
-    let payload = [0u8; 8];
-    let err = thincan::Transport::send(&mut node2, &payload, Duration::from_millis(1)).unwrap_err();
+    let node2 = IsoTpNode::with_clock(tx_b, rx_b, cfg_timeout, TestClock::default(), &mut rx_buf_b)
+        .unwrap();
+
+    #[derive(Clone, Copy)]
+    struct Big;
+    impl Message for Big {
+        const ID: u16 = 0x9998;
+        const BODY_LEN: Option<usize> = Some(6);
+    }
+
+    let mut tx_buf2 = [0u8; 64];
+    let mut iface2 = thincan::Interface::new(node2, maplet_unhandled::Router::new(), &mut tx_buf2);
+    let err = iface2
+        .send_msg::<Big>(&[0u8; 6], Duration::from_millis(1))
+        .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Timeout));
 }
 
@@ -539,13 +561,15 @@ async fn async_helpers_validate_before_sending() {
     let mut rx_buf = [0u8; 128];
     let node = IsoTpAsyncNode::with_clock(tx, rx, cfg, TestClock::default(), &mut rx_buf).unwrap();
 
+    let rt = TokioRuntime;
+    let node = can_iso_tp::AsyncWithRt::new(&rt, node);
+
     let mut tx_buf = [0u8; 64];
     let mut iface = thincan::Interface::new(node, maplet_unhandled::Router::new(), &mut tx_buf);
-    let rt = TokioRuntime;
 
     // send_msg length mismatch (validated before touching the transport).
     let err = iface
-        .send_msg_async::<TokioRuntime, atlas::Ping>(&rt, &[], Duration::from_millis(1))
+        .send_msg_async::<atlas::Ping>(&[], Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::InvalidBodyLen { .. }));
@@ -561,7 +585,7 @@ async fn async_helpers_validate_before_sending() {
         }
     }
     let err = iface
-        .send_encoded_async::<TokioRuntime, atlas::Ping, _>(&rt, &Lying, Duration::from_millis(1))
+        .send_encoded_async::<atlas::Ping, _>(&Lying, Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));

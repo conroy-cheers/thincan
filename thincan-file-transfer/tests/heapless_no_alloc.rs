@@ -152,13 +152,17 @@ fn heapless_receiver_rejects_oversize_metadata_without_allocating() {
 
     let metadata = b"12345"; // > MAX_METADATA
     let req_bytes = encode_req_with_metadata(1, 8, 64, metadata);
-    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
+    let req =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
     thincan_file_transfer::handle_file_req_no_alloc(&mut state, req).unwrap();
 
     let ack = state.take_pending_ack().expect("expected reject");
     assert_eq!(ack.transfer_id, 1);
     assert_eq!(ack.kind, thincan_file_transfer::schema::FileAckKind::Reject);
-    assert_eq!(ack.error, thincan_file_transfer::schema::FileAckError::InvalidRequest);
+    assert_eq!(
+        ack.error,
+        thincan_file_transfer::schema::FileAckError::InvalidRequest
+    );
     assert_eq!(state.store.begin_calls, 0);
 }
 
@@ -169,11 +173,15 @@ fn heapless_receiver_tracks_out_of_order_with_bounded_ranges() {
     state.set_config(thincan_file_transfer::ReceiverConfig { max_chunk_size: 4 });
 
     let req_bytes = encode_req_with_metadata(7, 8, 64, b"meta");
-    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
+    let req =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
     thincan_file_transfer::handle_file_req_no_alloc(&mut state, req).unwrap();
 
     let accept = state.take_pending_ack().expect("expected accept");
-    assert_eq!(accept.kind, thincan_file_transfer::schema::FileAckKind::Accept);
+    assert_eq!(
+        accept.kind,
+        thincan_file_transfer::schema::FileAckKind::Accept
+    );
     assert_eq!(accept.chunk_size, 4);
     assert_eq!(state.in_progress_metadata().unwrap(), b"meta");
 
@@ -190,7 +198,10 @@ fn heapless_receiver_tracks_out_of_order_with_bounded_ranges() {
         thincan::CapnpTyped::<thincan_file_transfer::schema::file_chunk::Owned>::new(&c1[..]);
     thincan_file_transfer::handle_file_chunk_no_alloc(&mut state, chunk1).unwrap();
     let done = state.take_pending_ack().expect("expected complete");
-    assert_eq!(done.kind, thincan_file_transfer::schema::FileAckKind::Complete);
+    assert_eq!(
+        done.kind,
+        thincan_file_transfer::schema::FileAckKind::Complete
+    );
     assert_eq!(done.next_offset, 8);
     assert!(state.store.committed);
     assert_eq!(state.store.as_bytes(), b"ABCDEFGH");
@@ -202,7 +213,8 @@ fn heapless_receiver_aborts_when_range_capacity_exceeded() {
     let mut state = State::new(FixedStore::default());
 
     let req_bytes = encode_req_with_metadata(1, 8, 64, b"");
-    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
+    let req =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
     thincan_file_transfer::handle_file_req_no_alloc(&mut state, req).unwrap();
     state.take_pending_ack().unwrap();
 
@@ -220,8 +232,14 @@ fn heapless_receiver_aborts_when_range_capacity_exceeded() {
     thincan_file_transfer::handle_file_chunk_no_alloc(&mut state, chunk2).unwrap();
 
     let abort = state.take_pending_ack().expect("expected abort");
-    assert_eq!(abort.kind, thincan_file_transfer::schema::FileAckKind::Abort);
-    assert_eq!(abort.error, thincan_file_transfer::schema::FileAckError::Internal);
+    assert_eq!(
+        abort.kind,
+        thincan_file_transfer::schema::FileAckKind::Abort
+    );
+    assert_eq!(
+        abort.error,
+        thincan_file_transfer::schema::FileAckError::Internal
+    );
     assert_eq!(state.store.abort_calls, 1);
 }
 
@@ -247,7 +265,8 @@ fn heapless_sender_no_alloc_round_trips_through_router() {
             body: &[u8],
             _timeout: core::time::Duration,
         ) -> Result<(), thincan::Error> {
-            self.router.dispatch(self.handlers, thincan::RawMessage { id: M::ID, body })?;
+            self.router
+                .dispatch(self.handlers, thincan::RawMessage { id: M::ID, body })?;
             Ok(())
         }
     }
@@ -288,7 +307,8 @@ fn heapless_receiver_enforces_max_chunk_size() {
     state.set_config(thincan_file_transfer::ReceiverConfig { max_chunk_size: 4 });
 
     let req_bytes = encode_req_with_metadata(1, 8, 64, b"");
-    let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
+    let req =
+        thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&req_bytes);
     thincan_file_transfer::handle_file_req_no_alloc(&mut state, req).unwrap();
     state.take_pending_ack().unwrap();
 

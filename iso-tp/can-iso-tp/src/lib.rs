@@ -105,11 +105,35 @@ pub use config::IsoTpConfig;
 #[cfg(feature = "uds")]
 pub use demux::{IsoTpDemux, rx_storages_from_buffers};
 pub use errors::{IsoTpError, TimeoutKind};
+#[cfg(feature = "isotp-interface")]
+pub use interface_impl::AsyncWithRt;
 pub use rx::RxStorage;
 pub use timer::Clock;
 #[cfg(feature = "std")]
 pub use timer::StdClock;
 pub use tx::Progress;
+
+/// Receive-side ISO-TP flow-control parameters (BS/STmin).
+///
+/// These values are advertised to the remote sender in FlowControl (FC) frames. Updating them at
+/// runtime allows shaping the sender's rate based on backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxFlowControl {
+    /// Block size (0 = unlimited).
+    pub block_size: u8,
+    /// Minimum separation time between consecutive frames.
+    pub st_min: Duration,
+}
+
+impl RxFlowControl {
+    /// Build flow-control parameters from a node's static configuration.
+    pub fn from_config(cfg: &IsoTpConfig) -> Self {
+        Self {
+            block_size: cfg.block_size,
+            st_min: cfg.st_min,
+        }
+    }
+}
 
 use core::mem;
 use core::time::Duration;
@@ -138,6 +162,7 @@ where
     tx: Tx,
     rx: Rx,
     cfg: IsoTpConfig,
+    rx_flow_control: RxFlowControl,
     clock: C,
     tx_state: TxState<C::Instant>,
     rx_machine: RxMachine<'a>,
@@ -181,6 +206,18 @@ where
             .rx_storage(rx_storage)
             .build()?;
         Ok(node)
+    }
+
+    /// Get the current receive-side FlowControl parameters (BS/STmin).
+    pub fn rx_flow_control(&self) -> RxFlowControl {
+        self.rx_flow_control
+    }
+
+    /// Update receive-side FlowControl parameters (BS/STmin).
+    ///
+    /// This affects FlowControl frames emitted in response to segmented transfers.
+    pub fn set_rx_flow_control(&mut self, fc: RxFlowControl) {
+        self.rx_flow_control = fc;
     }
 
     /// Advance transmission once; caller supplies current time.
@@ -274,7 +311,10 @@ where
             if matches!(pdu, Pdu::FlowControl { .. }) {
                 continue;
             }
-            let outcome = match self.rx_machine.on_pdu(&self.cfg, pdu) {
+            let outcome = match self
+                .rx_machine
+                .on_pdu(&self.cfg, &self.rx_flow_control, pdu)
+            {
                 Ok(o) => o,
                 Err(IsoTpError::Overflow) => {
                     let _ = self.send_overflow_fc();
@@ -646,10 +686,12 @@ where
         if self.rx_storage.capacity() < self.cfg.max_payload_len {
             return Err(IsoTpError::InvalidConfig);
         }
+        let rx_flow_control = RxFlowControl::from_config(&self.cfg);
         Ok(IsoTpNode {
             tx: self.tx,
             rx: self.rx,
             cfg: self.cfg,
+            rx_flow_control,
             clock: self.clock,
             tx_state: TxState::Idle,
             rx_machine: RxMachine::new(self.rx_storage),

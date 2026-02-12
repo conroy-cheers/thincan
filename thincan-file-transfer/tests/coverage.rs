@@ -187,9 +187,7 @@ fn file_chunk_does_not_commit_until_all_ranges_received() {
 #[test]
 fn receiver_emits_accept_and_cumulative_ack() {
     let mut state = thincan_file_transfer::State::new(Store::default());
-    state.set_config(thincan_file_transfer::ReceiverConfig {
-        max_chunk_size: 8,
-    });
+    state.set_config(thincan_file_transfer::ReceiverConfig { max_chunk_size: 8 });
 
     let metadata = b"opaque-metadata";
     let r = encode_offer(7, 8, 64, metadata);
@@ -198,7 +196,10 @@ fn receiver_emits_accept_and_cumulative_ack() {
 
     let accept = state.take_pending_ack().expect("expected accept ack");
     assert_eq!(accept.transfer_id, 7);
-    assert_eq!(accept.kind, thincan_file_transfer::schema::FileAckKind::Accept);
+    assert_eq!(
+        accept.kind,
+        thincan_file_transfer::schema::FileAckKind::Accept
+    );
     assert_eq!(accept.chunk_size, 8);
     assert_eq!(state.in_progress_metadata().unwrap(), metadata);
 
@@ -219,16 +220,17 @@ fn receiver_emits_accept_and_cumulative_ack() {
 
     // `handle_file_chunk` emits an Ack and then a Complete; we should see the latest (Complete).
     let done = state.take_pending_ack().expect("expected complete ack");
-    assert_eq!(done.kind, thincan_file_transfer::schema::FileAckKind::Complete);
+    assert_eq!(
+        done.kind,
+        thincan_file_transfer::schema::FileAckKind::Complete
+    );
     assert_eq!(done.next_offset, 8);
 }
 
 #[test]
 fn receiver_rejects_oversize_chunks_when_configured() {
     let mut state = thincan_file_transfer::State::new(Store::default());
-    state.set_config(thincan_file_transfer::ReceiverConfig {
-        max_chunk_size: 4,
-    });
+    state.set_config(thincan_file_transfer::ReceiverConfig { max_chunk_size: 4 });
 
     let r = encode_offer(1, 8, 64, &[]);
     let req = thincan::CapnpTyped::<thincan_file_transfer::schema::file_req::Owned>::new(&r[..]);
@@ -364,19 +366,25 @@ fn bundle_dispatch_handles_ack_and_maps_errors() {
 
     // Cover SendEncoded impl for thincan::Interface.
     struct Sink;
-    impl thincan::Transport for Sink {
-        fn send(&mut self, _payload: &[u8], _timeout: Duration) -> Result<(), thincan::Error> {
+    impl can_isotp_interface::IsoTpEndpoint for Sink {
+        type Error = thincan::Error;
+
+        fn send(
+            &mut self,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
             Ok(())
         }
         fn recv_one<F>(
             &mut self,
             _timeout: Duration,
             _on_payload: F,
-        ) -> Result<thincan::RecvStatus, thincan::Error>
+        ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
         where
-            F: FnMut(&[u8]) -> Result<thincan::RecvControl, thincan::Error>,
+            F: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
         {
-            Ok(thincan::RecvStatus::TimedOut)
+            Ok(can_isotp_interface::RecvStatus::TimedOut)
         }
     }
     let mut tx = [0u8; 512];

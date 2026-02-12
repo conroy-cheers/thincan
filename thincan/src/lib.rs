@@ -472,19 +472,6 @@ where
     },
 }
 
-/// Blocking transport for ISO-TP payloads.
-pub trait Transport {
-    /// Send a payload within a timeout.
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), Error>;
-    /// Receive at most one payload within a timeout.
-    ///
-    /// When a payload arrives, `on_payload` is invoked with a slice that remains valid until the
-    /// next receive operation mutates the underlying reassembly buffer.
-    fn recv_one<F>(&mut self, timeout: Duration, on_payload: F) -> Result<RecvStatus, Error>
-    where
-        F: FnMut(&[u8]) -> Result<RecvControl, Error>;
-}
-
 /// Receive metadata provided by transports that can identify the sender.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvMeta<A> {
@@ -492,94 +479,7 @@ pub struct RecvMeta<A> {
     pub reply_to: A,
 }
 
-/// Blocking transport that provides sender metadata ("reply-to").
-///
-/// This is primarily useful for transport/addressing schemes where multiple senders can target a
-/// single receiver (e.g. 29-bit UDS-style addressing), requiring the receiver to learn a sender
-/// address from the transport context.
-pub trait TransportMeta {
-    /// Transport-provided reply-to address type.
-    type ReplyTo: Copy;
-
-    /// Send a payload to a specific transport address.
-    fn send_to(
-        &mut self,
-        to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error>;
-
-    /// Receive at most one payload within a timeout, yielding sender metadata.
-    fn recv_one_meta<F>(&mut self, timeout: Duration, on_payload: F) -> Result<RecvStatus, Error>
-    where
-        F: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Error>;
-}
-
-#[cfg(feature = "isotp-interface")]
-/// Adapter that exposes a `can-isotp-interface` endpoint as a `thincan` transport.
-pub struct IsoTpEndpointTransport<T> {
-    inner: T,
-}
-
-#[cfg(feature = "isotp-interface")]
-impl<T> IsoTpEndpointTransport<T> {
-    /// Wrap a `can-isotp-interface` endpoint.
-    pub fn new(inner: T) -> Self {
-        Self { inner }
-    }
-
-    /// Return the wrapped endpoint.
-    pub fn into_inner(self) -> T {
-        self.inner
-    }
-
-    /// Borrow the wrapped endpoint.
-    pub fn as_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
-}
-
-#[cfg(feature = "isotp-interface")]
-impl<T> From<T> for IsoTpEndpointTransport<T> {
-    fn from(inner: T) -> Self {
-        Self::new(inner)
-    }
-}
-
-#[cfg(feature = "isotp-interface")]
-/// Adapter that exposes a `can-isotp-interface` endpoint with reply metadata as a `thincan`
-/// transport.
-pub struct IsoTpEndpointMetaTransport<T> {
-    inner: T,
-}
-
-#[cfg(feature = "isotp-interface")]
-impl<T> IsoTpEndpointMetaTransport<T> {
-    /// Wrap a `can-isotp-interface` meta endpoint.
-    pub fn new(inner: T) -> Self {
-        Self { inner }
-    }
-
-    /// Return the wrapped endpoint.
-    pub fn into_inner(self) -> T {
-        self.inner
-    }
-
-    /// Borrow the wrapped endpoint.
-    pub fn as_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
-}
-
-#[cfg(feature = "isotp-interface")]
-impl<T> From<T> for IsoTpEndpointMetaTransport<T> {
-    fn from(inner: T) -> Self {
-        Self::new(inner)
-    }
-}
-
-#[cfg(feature = "isotp-interface")]
-fn map_iface_send_error<E>(err: can_isotp_interface::SendError<E>) -> Error {
+fn map_isotp_send_error<E>(err: can_isotp_interface::SendError<E>) -> Error {
     Error {
         kind: match err {
             can_isotp_interface::SendError::Timeout => ErrorKind::Timeout,
@@ -588,267 +488,34 @@ fn map_iface_send_error<E>(err: can_isotp_interface::SendError<E>) -> Error {
     }
 }
 
-#[cfg(feature = "isotp-interface")]
-fn map_iface_recv_error<E>(_: can_isotp_interface::RecvError<E>) -> Error {
+fn map_isotp_recv_error<E>(_: can_isotp_interface::RecvError<E>) -> Error {
     Error {
         kind: ErrorKind::Other,
     }
 }
 
-#[cfg(feature = "isotp-interface")]
-fn map_iface_status(status: can_isotp_interface::RecvStatus) -> RecvStatus {
-    match status {
-        can_isotp_interface::RecvStatus::DeliveredOne => RecvStatus::DeliveredOne,
-        can_isotp_interface::RecvStatus::TimedOut => RecvStatus::TimedOut,
-    }
-}
-
-#[cfg(feature = "isotp-interface")]
-fn map_iface_control(control: RecvControl) -> can_isotp_interface::RecvControl {
+fn map_isotp_control(control: RecvControl) -> can_isotp_interface::RecvControl {
     match control {
         RecvControl::Continue => can_isotp_interface::RecvControl::Continue,
         RecvControl::Stop => can_isotp_interface::RecvControl::Stop,
     }
 }
 
-#[cfg(feature = "isotp-interface")]
-impl<T> Transport for IsoTpEndpointTransport<T>
-where
-    T: can_isotp_interface::IsoTpEndpoint,
-{
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), Error> {
-        self.inner
-            .send(payload, timeout)
-            .map_err(map_iface_send_error)
-    }
-
-    fn recv_one<F>(&mut self, timeout: Duration, mut on_payload: F) -> Result<RecvStatus, Error>
-    where
-        F: FnMut(&[u8]) -> Result<RecvControl, Error>,
-    {
-        let mut cb_err: Option<Error> = None;
-        let status = self
-            .inner
-            .recv_one(timeout, |payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
-                match on_payload(payload) {
-                    Ok(control) => Ok(map_iface_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
-                    }
-                }
-            })
-            .map_err(map_iface_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
-        }
-
-        Ok(map_iface_status(status))
-    }
+/// Optional extension trait: configure ISO-TP receive-side FlowControl (BS/STmin) for backpressure.
+pub trait RxFlowControlConfig {
+    fn set_rx_flow_control(&mut self, fc: can_isotp_interface::RxFlowControl) -> Result<(), Error>;
 }
 
-#[cfg(feature = "isotp-interface")]
-impl<T> TransportMeta for IsoTpEndpointMetaTransport<T>
+impl<T> RxFlowControlConfig for T
 where
-    T: can_isotp_interface::IsoTpEndpointMeta,
+    T: can_isotp_interface::IsoTpRxFlowControlConfig,
 {
-    type ReplyTo = T::ReplyTo;
-
-    fn send_to(
-        &mut self,
-        to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        self.inner
-            .send_to(to, payload, timeout)
-            .map_err(map_iface_send_error)
-    }
-
-    fn recv_one_meta<F>(
-        &mut self,
-        timeout: Duration,
-        mut on_payload: F,
-    ) -> Result<RecvStatus, Error>
-    where
-        F: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Error>,
-    {
-        let mut cb_err: Option<Error> = None;
-        let status = self
-            .inner
-            .recv_one_meta(timeout, |meta, payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
-                let meta = RecvMeta {
-                    reply_to: meta.reply_to,
-                };
-                match on_payload(meta, payload) {
-                    Ok(control) => Ok(map_iface_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
-                    }
-                }
-            })
-            .map_err(map_iface_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
-        }
-
-        Ok(map_iface_status(status))
-    }
-}
-
-impl<'a, Tx, Rx, F, C> Transport for can_iso_tp::IsoTpNode<'a, Tx, Rx, F, C>
-where
-    Tx: embedded_can_interface::TxFrameIo<Frame = F>,
-    Rx: embedded_can_interface::RxFrameIo<Frame = F, Error = Tx::Error>,
-    F: embedded_can::Frame,
-    C: can_iso_tp::Clock,
-{
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), Error> {
-        can_iso_tp::IsoTpNode::send(self, payload, timeout).map_err(|e| Error {
-            kind: match e {
-                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                _ => ErrorKind::Other,
-            },
-        })
-    }
-
-    fn recv_one<Cb>(&mut self, timeout: Duration, mut on_payload: Cb) -> Result<RecvStatus, Error>
-    where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Error>,
-    {
-        let mut delivered = false;
-        let mut cb_err: Option<Error> = None;
-
-        let res = can_iso_tp::IsoTpNode::recv(self, timeout, &mut |payload| {
-            delivered = true;
-            // Ignore stop/continue here; this transport API delivers at most one payload anyway.
-            if cb_err.is_none() {
-                match on_payload(payload) {
-                    Ok(_) => {}
-                    Err(e) => cb_err = Some(e),
-                }
-            }
-        });
-
-        if let Some(e) = cb_err {
-            return Err(e);
-        }
-
-        match res {
-            Ok(()) => Ok(if delivered {
-                RecvStatus::DeliveredOne
-            } else {
-                RecvStatus::TimedOut
-            }),
-            Err(can_iso_tp::IsoTpError::Timeout(_)) => Ok(RecvStatus::TimedOut),
-            Err(_) => Err(Error {
+    fn set_rx_flow_control(&mut self, fc: can_isotp_interface::RxFlowControl) -> Result<(), Error> {
+        can_isotp_interface::IsoTpRxFlowControlConfig::set_rx_flow_control(self, fc).map_err(|_| {
+            Error {
                 kind: ErrorKind::Other,
-            }),
-        }
-    }
-}
-
-impl<'a, Tx, Rx, F, C> TransportMeta for can_iso_tp::IsoTpNode<'a, Tx, Rx, F, C>
-where
-    Tx: embedded_can_interface::TxFrameIo<Frame = F>,
-    Rx: embedded_can_interface::RxFrameIo<Frame = F, Error = Tx::Error>,
-    F: embedded_can::Frame,
-    C: can_iso_tp::Clock,
-{
-    type ReplyTo = ();
-
-    fn send_to(
-        &mut self,
-        _to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        <Self as Transport>::send(self, payload, timeout)
-    }
-
-    fn recv_one_meta<Cb>(
-        &mut self,
-        timeout: Duration,
-        mut on_payload: Cb,
-    ) -> Result<RecvStatus, Error>
-    where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Error>,
-    {
-        <Self as Transport>::recv_one(self, timeout, |payload| {
-            on_payload(RecvMeta { reply_to: () }, payload)
-        })
-    }
-}
-
-#[cfg(feature = "isotp-uds")]
-impl<'a, Tx, Rx, F, C, const MAX_PEERS: usize> TransportMeta
-    for can_iso_tp::IsoTpDemux<'a, Tx, Rx, F, C, MAX_PEERS>
-where
-    Tx: embedded_can_interface::TxFrameIo<Frame = F>,
-    Rx: embedded_can_interface::RxFrameIo<Frame = F, Error = Tx::Error>,
-    F: embedded_can::Frame,
-    C: can_iso_tp::Clock,
-{
-    type ReplyTo = u8;
-
-    fn send_to(
-        &mut self,
-        to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        can_iso_tp::IsoTpDemux::send_to(self, to, payload, timeout).map_err(|e| Error {
-            kind: match e {
-                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                _ => ErrorKind::Other,
-            },
-        })
-    }
-
-    fn recv_one_meta<Cb>(
-        &mut self,
-        timeout: Duration,
-        mut on_payload: Cb,
-    ) -> Result<RecvStatus, Error>
-    where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Error>,
-    {
-        let mut delivered = false;
-        let mut cb_err: Option<Error> = None;
-
-        let res = can_iso_tp::IsoTpDemux::recv(self, timeout, &mut |reply_to, payload| {
-            delivered = true;
-            if cb_err.is_none() {
-                if let Err(e) = on_payload(RecvMeta { reply_to }, payload) {
-                    cb_err = Some(e);
-                }
             }
-        });
-
-        if let Some(e) = cb_err {
-            return Err(e);
-        }
-
-        match res {
-            Ok(()) => Ok(if delivered {
-                RecvStatus::DeliveredOne
-            } else {
-                RecvStatus::TimedOut
-            }),
-            Err(can_iso_tp::IsoTpError::Timeout(_)) => Ok(RecvStatus::TimedOut),
-            Err(_) => Err(Error {
-                kind: ErrorKind::Other,
-            }),
-        }
+        })
     }
 }
 
@@ -1026,11 +693,11 @@ where
     /// Send a raw body for message `M` (validates `BODY_LEN` if present).
     pub fn send_msg<M: Message>(&mut self, body: &[u8], timeout: Duration) -> Result<(), Error>
     where
-        Node: Transport,
+        Node: can_isotp_interface::IsoTpEndpoint,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send(payload, timeout)
+        node.send(payload, timeout).map_err(map_isotp_send_error)
     }
 
     /// Encode and send a typed value for message `M`.
@@ -1040,11 +707,11 @@ where
         timeout: Duration,
     ) -> Result<(), Error>
     where
-        Node: Transport,
+        Node: can_isotp_interface::IsoTpEndpoint,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send(payload, timeout)
+        node.send(payload, timeout).map_err(map_isotp_send_error)
     }
 
     /// Send a raw body for message `M` to a specific transport address.
@@ -1055,11 +722,12 @@ where
         timeout: Duration,
     ) -> Result<(), Error>
     where
-        Node: TransportMeta,
+        Node: can_isotp_interface::IsoTpEndpointMeta,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
         node.send_to(to, payload, timeout)
+            .map_err(map_isotp_send_error)
     }
 
     /// Encode and send a typed value for message `M` to a specific transport address.
@@ -1070,11 +738,12 @@ where
         timeout: Duration,
     ) -> Result<(), Error>
     where
-        Node: TransportMeta,
+        Node: can_isotp_interface::IsoTpEndpointMeta,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
         node.send_to(to, payload, timeout)
+            .map_err(map_isotp_send_error)
     }
 
     /// Receive at most one payload and dispatch it through the router.
@@ -1087,7 +756,7 @@ where
         timeout: Duration,
     ) -> Result<RecvDispatch, Error>
     where
-        Node: Transport,
+        Node: can_isotp_interface::IsoTpEndpoint,
         Router: RouterDispatch<Handlers>,
     {
         self.recv_one_dispatch_with(handlers, timeout, |_| Ok(RecvControl::Continue))
@@ -1101,35 +770,56 @@ where
         mut on_event: F,
     ) -> Result<RecvDispatch, Error>
     where
-        Node: Transport,
+        Node: can_isotp_interface::IsoTpEndpoint,
         Router: RouterDispatch<Handlers>,
         F: for<'a> FnMut(DispatchEvent<'a>) -> Result<RecvControl, Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
         let mut summary = RecvDispatch::TimedOut;
-        let status = node.recv_one(timeout, |payload| match decode_wire(payload) {
-            Ok(raw) => {
-                let outcome = router.dispatch(handlers, raw)?;
-                summary = RecvDispatch::Dispatched {
-                    id: raw.id,
-                    kind: match outcome {
-                        DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                        DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                        DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+        let mut cb_err: Option<Error> = None;
+        let status = node
+            .recv_one(timeout, |payload| {
+                if cb_err.is_some() {
+                    return Ok(can_isotp_interface::RecvControl::Stop);
+                }
+                let res: Result<RecvControl, Error> = match decode_wire(payload) {
+                    Ok(raw) => match router.dispatch(handlers, raw) {
+                        Ok(outcome) => {
+                            summary = RecvDispatch::Dispatched {
+                                id: raw.id,
+                                kind: match outcome {
+                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                                },
+                            };
+                            on_event(DispatchEvent::Dispatched { raw, outcome })
+                        }
+                        Err(err) => Err(err),
                     },
+                    Err(_) => {
+                        summary = RecvDispatch::MalformedPayload;
+                        on_event(DispatchEvent::MalformedPayload { payload })
+                    }
                 };
-                on_event(DispatchEvent::Dispatched { raw, outcome })
-            }
-            Err(_) => {
-                summary = RecvDispatch::MalformedPayload;
-                on_event(DispatchEvent::MalformedPayload { payload })
-            }
-        })?;
+                match res {
+                    Ok(control) => Ok(map_isotp_control(control)),
+                    Err(err) => {
+                        cb_err = Some(err);
+                        Ok(can_isotp_interface::RecvControl::Stop)
+                    }
+                }
+            })
+            .map_err(map_isotp_recv_error)?;
+
+        if let Some(err) = cb_err {
+            return Err(err);
+        }
 
         Ok(match status {
-            RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            RecvStatus::DeliveredOne => summary,
+            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
+            can_isotp_interface::RecvStatus::DeliveredOne => summary,
         })
     }
 
@@ -1140,7 +830,7 @@ where
         timeout: Duration,
     ) -> Result<RecvDispatch, Error>
     where
-        Node: TransportMeta,
+        Node: can_isotp_interface::IsoTpEndpointMeta,
         Router: RouterDispatch<Handlers>,
     {
         self.recv_one_dispatch_with_meta(handlers, timeout, |_| Ok(RecvControl::Continue))
@@ -1154,146 +844,116 @@ where
         mut on_event: F,
     ) -> Result<RecvDispatch, Error>
     where
-        Node: TransportMeta,
+        Node: can_isotp_interface::IsoTpEndpointMeta,
         Router: RouterDispatch<Handlers>,
         F: for<'a> FnMut(DispatchEventMeta<'a, Node::ReplyTo>) -> Result<RecvControl, Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
         let mut summary = RecvDispatch::TimedOut;
-        let status = node.recv_one_meta(timeout, |meta, payload| match decode_wire(payload) {
-            Ok(raw) => {
-                let outcome = router.dispatch(handlers, raw)?;
-                summary = RecvDispatch::Dispatched {
-                    id: raw.id,
-                    kind: match outcome {
-                        DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                        DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                        DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                    },
+        let mut cb_err: Option<Error> = None;
+        let status = node
+            .recv_one_meta(timeout, |meta, payload| {
+                if cb_err.is_some() {
+                    return Ok(can_isotp_interface::RecvControl::Stop);
+                }
+                let meta = RecvMeta {
+                    reply_to: meta.reply_to,
                 };
-                on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
-            }
-            Err(_) => {
-                summary = RecvDispatch::MalformedPayload;
-                on_event(DispatchEventMeta::MalformedPayload { meta, payload })
-            }
-        })?;
+                let res: Result<RecvControl, Error> = match decode_wire(payload) {
+                    Ok(raw) => match router.dispatch(handlers, raw) {
+                        Ok(outcome) => {
+                            summary = RecvDispatch::Dispatched {
+                                id: raw.id,
+                                kind: match outcome {
+                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                                },
+                            };
+                            on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
+                        }
+                        Err(err) => Err(err),
+                    },
+                    Err(_) => {
+                        summary = RecvDispatch::MalformedPayload;
+                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })
+                    }
+                };
+                match res {
+                    Ok(control) => Ok(map_isotp_control(control)),
+                    Err(err) => {
+                        cb_err = Some(err);
+                        Ok(can_isotp_interface::RecvControl::Stop)
+                    }
+                }
+            })
+            .map_err(map_isotp_recv_error)?;
+
+        if let Some(err) = cb_err {
+            return Err(err);
+        }
 
         Ok(match status {
-            RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            RecvStatus::DeliveredOne => summary,
+            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
+            can_isotp_interface::RecvStatus::DeliveredOne => summary,
         })
     }
 }
 
 #[cfg(feature = "async")]
-impl<'buf, Tx, Rx, F, C, Router, TxBuf>
-    Interface<can_iso_tp::IsoTpAsyncNode<'buf, Tx, Rx, F, C>, Router, TxBuf>
+impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
-    Tx: embedded_can_interface::AsyncTxFrameIo<Frame = F>,
-    Rx: embedded_can_interface::AsyncRxFrameIo<Frame = F, Error = Tx::Error>,
-    F: embedded_can::Frame,
-    C: can_iso_tp::Clock,
+    Node: can_isotp_interface::IsoTpAsyncEndpoint,
     TxBuf: AsMut<[u8]>,
 {
     /// Async send helper for ISO-TP async nodes.
-    pub async fn send_msg_async<Rt, M: Message>(
+    pub async fn send_msg_async<M: Message>(
         &mut self,
-        rt: &Rt,
         body: &[u8],
         timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
+    ) -> Result<(), Error> {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send(rt, payload, timeout).await.map_err(|e| Error {
-            kind: match e {
-                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                _ => ErrorKind::Other,
-            },
-        })
+        node.send(payload, timeout)
+            .await
+            .map_err(map_isotp_send_error)
     }
 
     /// Async send-encoded helper for ISO-TP async nodes.
-    pub async fn send_encoded_async<Rt, M: Message, V: Encode<M>>(
+    pub async fn send_encoded_async<M: Message, V: Encode<M>>(
         &mut self,
-        rt: &Rt,
         value: &V,
         timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
+    ) -> Result<(), Error> {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send(rt, payload, timeout).await.map_err(|e| Error {
-            kind: match e {
-                can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                _ => ErrorKind::Other,
-            },
-        })
-    }
-
-    /// Async send helper with transport metadata (destination address).
-    ///
-    /// For a plain `IsoTpAsyncNode` the address type is `()`, since the remote is implied by the
-    /// node's configuration.
-    pub async fn send_msg_to_async<Rt, M: Message>(
-        &mut self,
-        rt: &Rt,
-        _to: (),
-        body: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
-        self.send_msg_async::<Rt, M>(rt, body, timeout).await
-    }
-
-    /// Async send-encoded helper with transport metadata (destination address).
-    pub async fn send_encoded_to_async<Rt, M: Message, V: Encode<M>>(
-        &mut self,
-        rt: &Rt,
-        _to: (),
-        value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
-        self.send_encoded_async::<Rt, M, V>(rt, value, timeout)
+        node.send(payload, timeout)
             .await
+            .map_err(map_isotp_send_error)
     }
 
-    /// Async receive+dispatch helper for ISO-TP async nodes.
-    pub async fn recv_one_dispatch_async<Rt, Handlers>(
+    /// Async receive+dispatch helper for ISO-TP async endpoints.
+    pub async fn recv_one_dispatch_async<Handlers>(
         &mut self,
-        rt: &Rt,
         handlers: &mut Handlers,
         timeout: Duration,
     ) -> Result<RecvDispatch, Error>
     where
-        Rt: can_iso_tp::AsyncRuntime,
         Router: RouterDispatch<Handlers>,
     {
-        self.recv_one_dispatch_with_async(rt, handlers, timeout, |_| Ok(RecvControl::Continue))
+        self.recv_one_dispatch_with_async(handlers, timeout, |_| Ok(RecvControl::Continue))
             .await
     }
 
-    /// Async receive+dispatch helper with event callback for ISO-TP async nodes.
-    pub async fn recv_one_dispatch_with_async<Rt, Handlers, Ev>(
+    /// Async receive+dispatch helper with event callback for ISO-TP async endpoints.
+    pub async fn recv_one_dispatch_with_async<Handlers, Ev>(
         &mut self,
-        rt: &Rt,
         handlers: &mut Handlers,
         timeout: Duration,
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Rt: can_iso_tp::AsyncRuntime,
         Router: RouterDispatch<Handlers>,
         Ev: for<'a> FnMut(DispatchEvent<'a>) -> Result<RecvControl, Error>,
     {
@@ -1302,283 +962,166 @@ where
         let mut summary = RecvDispatch::TimedOut;
         let mut cb_err: Option<Error> = None;
 
-        let res = node
-            .recv(rt, timeout, &mut |payload| {
+        let status = node
+            .recv_one(timeout, |payload| {
                 if cb_err.is_some() {
-                    return;
+                    return Ok(can_isotp_interface::RecvControl::Stop);
                 }
-                match decode_wire(payload) {
-                    Ok(raw) => {
-                        let outcome = match router.dispatch(handlers, raw) {
-                            Ok(o) => o,
-                            Err(e) => {
-                                cb_err = Some(e);
-                                return;
-                            }
-                        };
-                        summary = RecvDispatch::Dispatched {
-                            id: raw.id,
-                            kind: match outcome {
-                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                            },
-                        };
-                        if let Err(e) = on_event(DispatchEvent::Dispatched { raw, outcome }) {
-                            cb_err = Some(e);
+
+                let res: Result<RecvControl, Error> = match decode_wire(payload) {
+                    Ok(raw) => match router.dispatch(handlers, raw) {
+                        Ok(outcome) => {
+                            summary = RecvDispatch::Dispatched {
+                                id: raw.id,
+                                kind: match outcome {
+                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                                },
+                            };
+                            on_event(DispatchEvent::Dispatched { raw, outcome })
                         }
-                    }
+                        Err(err) => Err(err),
+                    },
                     Err(_) => {
                         summary = RecvDispatch::MalformedPayload;
-                        if let Err(e) = on_event(DispatchEvent::MalformedPayload { payload }) {
-                            cb_err = Some(e);
-                        }
+                        on_event(DispatchEvent::MalformedPayload { payload })
+                    }
+                };
+
+                match res {
+                    Ok(control) => Ok(map_isotp_control(control)),
+                    Err(err) => {
+                        cb_err = Some(err);
+                        Ok(can_isotp_interface::RecvControl::Stop)
                     }
                 }
             })
-            .await;
-
-        if let Some(e) = cb_err {
-            return Err(e);
-        }
-
-        match res {
-            Ok(()) => Ok(summary),
-            Err(can_iso_tp::IsoTpError::Timeout(_)) => Ok(RecvDispatch::TimedOut),
-            Err(_) => Err(Error {
-                kind: ErrorKind::Other,
-            }),
-        }
-    }
-
-    /// Async receive+dispatch helper with reply-to metadata.
-    pub async fn recv_one_dispatch_with_meta_async<Rt, Handlers, Ev>(
-        &mut self,
-        rt: &Rt,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        mut on_event: Ev,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-        Router: RouterDispatch<Handlers>,
-        Ev: for<'a> FnMut(DispatchEventMeta<'a, ()>) -> Result<RecvControl, Error>,
-    {
-        let (node, router) = (&mut self.node, &mut self.router);
-
-        let mut summary = RecvDispatch::TimedOut;
-        let mut cb_err: Option<Error> = None;
-
-        let res = node
-            .recv(rt, timeout, &mut |payload| {
-                if cb_err.is_some() {
-                    return;
-                }
-                let meta = RecvMeta { reply_to: () };
-                match decode_wire(payload) {
-                    Ok(raw) => {
-                        let outcome = match router.dispatch(handlers, raw) {
-                            Ok(o) => o,
-                            Err(e) => {
-                                cb_err = Some(e);
-                                return;
-                            }
-                        };
-                        summary = RecvDispatch::Dispatched {
-                            id: raw.id,
-                            kind: match outcome {
-                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                            },
-                        };
-                        if let Err(e) =
-                            on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
-                        {
-                            cb_err = Some(e);
-                        }
-                    }
-                    Err(_) => {
-                        summary = RecvDispatch::MalformedPayload;
-                        if let Err(e) =
-                            on_event(DispatchEventMeta::MalformedPayload { meta, payload })
-                        {
-                            cb_err = Some(e);
-                        }
-                    }
-                }
-            })
-            .await;
-
-        if let Some(e) = cb_err {
-            return Err(e);
-        }
-
-        match res {
-            Ok(()) => Ok(summary),
-            Err(can_iso_tp::IsoTpError::Timeout(_)) => Ok(RecvDispatch::TimedOut),
-            Err(_) => Err(Error {
-                kind: ErrorKind::Other,
-            }),
-        }
-    }
-
-    /// Async receive+dispatch helper with reply-to metadata.
-    pub async fn recv_one_dispatch_meta_async<Rt, Handlers>(
-        &mut self,
-        rt: &Rt,
-        handlers: &mut Handlers,
-        timeout: Duration,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-        Router: RouterDispatch<Handlers>,
-    {
-        self.recv_one_dispatch_with_meta_async(rt, handlers, timeout, |_| Ok(RecvControl::Continue))
             .await
+            .map_err(map_isotp_recv_error)?;
+
+        if let Some(err) = cb_err {
+            return Err(err);
+        }
+
+        Ok(match status {
+            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
+            can_isotp_interface::RecvStatus::DeliveredOne => summary,
+        })
     }
 }
 
 #[cfg(all(feature = "async", feature = "isotp-uds"))]
-impl<'buf, Tx, Rx, F, C, Router, TxBuf, const MAX_PEERS: usize>
-    Interface<can_iso_tp::IsoTpAsyncDemux<'buf, Tx, Rx, F, C, MAX_PEERS>, Router, TxBuf>
+impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
-    Tx: embedded_can_interface::AsyncTxFrameIo<Frame = F>,
-    Rx: embedded_can_interface::AsyncRxFrameIo<Frame = F, Error = Tx::Error>,
-    F: embedded_can::Frame,
-    C: can_iso_tp::Clock,
+    Node: can_isotp_interface::IsoTpAsyncEndpointMeta,
     TxBuf: AsMut<[u8]>,
 {
     /// Async send helper for ISO-TP async demux nodes (addressed send).
-    pub async fn send_msg_to_async<Rt, M: Message>(
+    pub async fn send_msg_to_async<M: Message>(
         &mut self,
-        rt: &Rt,
-        to: u8,
+        to: Node::ReplyTo,
         body: &[u8],
         timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
+    ) -> Result<(), Error> {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send_to(rt, to, payload, timeout)
+        node.send_to(to, payload, timeout)
             .await
-            .map_err(|e| Error {
-                kind: match e {
-                    can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                    _ => ErrorKind::Other,
-                },
-            })
+            .map_err(map_isotp_send_error)
     }
 
     /// Async send-encoded helper for ISO-TP async demux nodes (addressed send).
-    pub async fn send_encoded_to_async<Rt, M: Message, V: Encode<M>>(
+    pub async fn send_encoded_to_async<M: Message, V: Encode<M>>(
         &mut self,
-        rt: &Rt,
-        to: u8,
+        to: Node::ReplyTo,
         value: &V,
         timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Rt: can_iso_tp::AsyncRuntime,
-    {
+    ) -> Result<(), Error> {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_to(rt, to, payload, timeout)
+        node.send_to(to, payload, timeout)
             .await
-            .map_err(|e| Error {
-                kind: match e {
-                    can_iso_tp::IsoTpError::Timeout(_) => ErrorKind::Timeout,
-                    _ => ErrorKind::Other,
-                },
-            })
+            .map_err(map_isotp_send_error)
     }
 
     /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
-    pub async fn recv_one_dispatch_with_meta_async<Rt, Handlers, Ev>(
+    pub async fn recv_one_dispatch_with_meta_async<Handlers, Ev>(
         &mut self,
-        rt: &Rt,
         handlers: &mut Handlers,
         timeout: Duration,
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Rt: can_iso_tp::AsyncRuntime,
         Router: RouterDispatch<Handlers>,
-        Ev: for<'a> FnMut(DispatchEventMeta<'a, u8>) -> Result<RecvControl, Error>,
+        Ev: for<'a> FnMut(DispatchEventMeta<'a, Node::ReplyTo>) -> Result<RecvControl, Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
         let mut summary = RecvDispatch::TimedOut;
         let mut cb_err: Option<Error> = None;
 
-        let res = node
-            .recv(rt, timeout, &mut |reply_to, payload| {
+        let status = node
+            .recv_one_meta(timeout, |meta, payload| {
                 if cb_err.is_some() {
-                    return;
+                    return Ok(can_isotp_interface::RecvControl::Stop);
                 }
-                let meta = RecvMeta { reply_to };
-                match decode_wire(payload) {
-                    Ok(raw) => {
-                        let outcome = match router.dispatch(handlers, raw) {
-                            Ok(o) => o,
-                            Err(e) => {
-                                cb_err = Some(e);
-                                return;
-                            }
-                        };
-                        summary = RecvDispatch::Dispatched {
-                            id: raw.id,
-                            kind: match outcome {
-                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                            },
-                        };
-                        if let Err(e) =
+                let meta = RecvMeta {
+                    reply_to: meta.reply_to,
+                };
+
+                let res: Result<RecvControl, Error> = match decode_wire(payload) {
+                    Ok(raw) => match router.dispatch(handlers, raw) {
+                        Ok(outcome) => {
+                            summary = RecvDispatch::Dispatched {
+                                id: raw.id,
+                                kind: match outcome {
+                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                                },
+                            };
                             on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
-                        {
-                            cb_err = Some(e);
                         }
-                    }
+                        Err(err) => Err(err),
+                    },
                     Err(_) => {
                         summary = RecvDispatch::MalformedPayload;
-                        if let Err(e) =
-                            on_event(DispatchEventMeta::MalformedPayload { meta, payload })
-                        {
-                            cb_err = Some(e);
-                        }
+                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })
+                    }
+                };
+
+                match res {
+                    Ok(control) => Ok(map_isotp_control(control)),
+                    Err(err) => {
+                        cb_err = Some(err);
+                        Ok(can_isotp_interface::RecvControl::Stop)
                     }
                 }
             })
-            .await;
+            .await
+            .map_err(map_isotp_recv_error)?;
 
-        if let Some(e) = cb_err {
-            return Err(e);
+        if let Some(err) = cb_err {
+            return Err(err);
         }
 
-        match res {
-            Ok(()) => Ok(summary),
-            Err(can_iso_tp::IsoTpError::Timeout(_)) => Ok(RecvDispatch::TimedOut),
-            Err(_) => Err(Error {
-                kind: ErrorKind::Other,
-            }),
-        }
+        Ok(match status {
+            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
+            can_isotp_interface::RecvStatus::DeliveredOne => summary,
+        })
     }
 
     /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
-    pub async fn recv_one_dispatch_meta_async<Rt, Handlers>(
+    pub async fn recv_one_dispatch_meta_async<Handlers>(
         &mut self,
-        rt: &Rt,
         handlers: &mut Handlers,
         timeout: Duration,
     ) -> Result<RecvDispatch, Error>
     where
-        Rt: can_iso_tp::AsyncRuntime,
         Router: RouterDispatch<Handlers>,
     {
-        self.recv_one_dispatch_with_meta_async(rt, handlers, timeout, |_| Ok(RecvControl::Continue))
+        self.recv_one_dispatch_with_meta_async(handlers, timeout, |_| Ok(RecvControl::Continue))
             .await
     }
 }

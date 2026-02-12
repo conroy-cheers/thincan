@@ -353,7 +353,7 @@ pub trait SendMsg {
 
 impl<Node, Router, TxBuf> SendMsg for thincan::Interface<Node, Router, TxBuf>
 where
-    Node: thincan::Transport,
+    Node: can_isotp_interface::IsoTpEndpoint,
     TxBuf: AsMut<[u8]>,
 {
     fn send_msg<M: thincan::Message>(
@@ -377,7 +377,7 @@ pub trait SendMsgTo<A> {
 
 impl<Node, Router, TxBuf> SendMsgTo<Node::ReplyTo> for thincan::Interface<Node, Router, TxBuf>
 where
-    Node: thincan::TransportMeta,
+    Node: can_isotp_interface::IsoTpEndpointMeta,
     TxBuf: AsMut<[u8]>,
 {
     fn send_msg_to<M: thincan::Message>(

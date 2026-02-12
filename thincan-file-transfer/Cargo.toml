@@ -8,15 +8,18 @@ default = ["std"]
 alloc = []
 std = ["alloc", "thincan/std"]
 heapless = ["dep:heapless"]
+tokio = ["std", "dep:tokio", "thincan/async"]
 
 [dependencies]
 capnp = { version = "0.25.0", default-features = false, features = [
     "unaligned",
 ] }
+can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0" }
 heapless = { version = "0.8.0", default-features = false, optional = true }
 thincan = { path = "../thincan", default-features = false, features = [
     "capnp",
 ] }
+tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time", "test-util"] }
 
 [build-dependencies]
 capnpc = "0.25.0"

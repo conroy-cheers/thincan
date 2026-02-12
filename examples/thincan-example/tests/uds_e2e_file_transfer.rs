@@ -5,10 +5,7 @@ use can_iso_tp::IsoTpConfig;
 use embedded_can_interface::{FilterConfig, RxFrameIo, TxFrameIo};
 use embedded_can_unix_socket::{BusServer, UnixCan};
 use std::path::PathBuf;
-use std::sync::{
-    Arc, Mutex,
-    mpsc,
-};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -167,7 +164,11 @@ fn cfg(frame_len: usize) -> IsoTpConfig {
 #[test]
 fn uds_simulated_can_bus_transfers_file_end_to_end() -> Result<()> {
     // Use a short, predictable socket path: UDS path limits are small.
-    let params = format!("{}:{}", std::process::id(), Instant::now().elapsed().as_nanos());
+    let params = format!(
+        "{}:{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
     let h = blake3::hash(params.as_bytes()).to_hex();
     let socket_path = PathBuf::from("/tmp").join(format!("thincan_e2e_{}.sock", &h.as_str()[..8]));
     let _ = std::fs::remove_file(&socket_path);
@@ -225,9 +226,8 @@ fn uds_simulated_can_bus_transfers_file_end_to_end() -> Result<()> {
     let (tx, rx) = split_shared(can);
     let storages: [can_iso_tp::RxStorage<'static>; 4] =
         std::array::from_fn(|_| can_iso_tp::RxStorage::Owned(vec![0u8; 4095]));
-    let node =
-        can_iso_tp::IsoTpDemux::new(tx, rx, cfg(8), can_iso_tp::StdClock, from, storages)
-            .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
+    let node = can_iso_tp::IsoTpDemux::new(tx, rx, cfg(8), can_iso_tp::StdClock, from, storages)
+        .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
     let mut iface = thincan::Interface::new(node, maplet::Router::new(), tx_buf.as_mut_slice());
@@ -244,4 +244,3 @@ fn uds_simulated_can_bus_transfers_file_end_to_end() -> Result<()> {
     drop(cleanup);
     Ok(())
 }
-

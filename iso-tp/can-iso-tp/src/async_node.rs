@@ -13,7 +13,7 @@ use crate::pdu::{
 };
 use crate::rx::{RxMachine, RxOutcome, RxStorage};
 use crate::timer::Clock;
-use crate::{IsoTpConfig, id_matches};
+use crate::{IsoTpConfig, RxFlowControl, id_matches};
 
 /// Async ISO-TP endpoint backed by async transmit/receive halves and a clock.
 pub struct IsoTpAsyncNode<'a, Tx, Rx, F, C>
@@ -25,6 +25,7 @@ where
     tx: Tx,
     rx: Rx,
     cfg: IsoTpConfig,
+    rx_flow_control: RxFlowControl,
     clock: C,
     rx_machine: RxMachine<'a>,
 }
@@ -64,6 +65,16 @@ where
             .rx_storage(rx_storage)
             .build()?;
         Ok(node)
+    }
+
+    /// Get the current receive-side FlowControl parameters (BS/STmin).
+    pub fn rx_flow_control(&self) -> RxFlowControl {
+        self.rx_flow_control
+    }
+
+    /// Update receive-side FlowControl parameters (BS/STmin).
+    pub fn set_rx_flow_control(&mut self, fc: RxFlowControl) {
+        self.rx_flow_control = fc;
     }
 
     /// Blocking-by-await send until completion or timeout.
@@ -213,7 +224,10 @@ where
                 continue;
             }
 
-            let outcome = match self.rx_machine.on_pdu(&self.cfg, pdu) {
+            let outcome = match self
+                .rx_machine
+                .on_pdu(&self.cfg, &self.rx_flow_control, pdu)
+            {
                 Ok(o) => o,
                 Err(IsoTpError::Overflow) => {
                     let _ = self.send_overflow_fc(rt, start, timeout).await;
@@ -489,10 +503,12 @@ where
         if self.rx_storage.capacity() < self.cfg.max_payload_len {
             return Err(IsoTpError::InvalidConfig);
         }
+        let rx_flow_control = RxFlowControl::from_config(&self.cfg);
         Ok(IsoTpAsyncNode {
             tx: self.tx,
             rx: self.rx,
             cfg: self.cfg,
+            rx_flow_control,
             clock: self.clock,
             rx_machine: RxMachine::new(self.rx_storage),
         })

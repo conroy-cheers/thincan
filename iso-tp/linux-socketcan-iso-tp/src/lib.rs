@@ -15,4 +15,3 @@ pub use linux::*;
 mod non_linux;
 #[cfg(not(target_os = "linux"))]
 pub use non_linux::*;
-

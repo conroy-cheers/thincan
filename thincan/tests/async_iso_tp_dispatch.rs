@@ -128,17 +128,20 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
         IsoTpAsyncNode::with_clock(tx_b, rx_b, cfg(0x701, 0x700), TokioClock, &mut rx_buf_b)
             .unwrap();
 
+    let rt = TokioRuntime;
+    let node_a = can_iso_tp::AsyncWithRt::new(&rt, node_a);
+    let node_b = can_iso_tp::AsyncWithRt::new(&rt, node_b);
+
     let mut tx_buf_a = [0u8; 64];
     let mut tx_buf_b = [0u8; 64];
     let mut iface_a = thincan::Interface::new(node_a, maplet::Router::new(), &mut tx_buf_a);
     let mut iface_b = thincan::Interface::new(node_b, maplet::Router::new(), &mut tx_buf_b);
 
-    let rt = TokioRuntime;
     iface_a
-        .send_msg_async::<TokioRuntime, atlas::A>(&rt, &[0xAA], Duration::from_millis(50))
+        .send_msg_async::<atlas::A>(&[0xAA], Duration::from_millis(50))
         .await?;
     iface_a
-        .send_msg_async::<TokioRuntime, atlas::B>(&rt, &[0xBB], Duration::from_millis(50))
+        .send_msg_async::<atlas::B>(&[0xBB], Duration::from_millis(50))
         .await?;
 
     let mut handlers = maplet::HandlersImpl {
@@ -148,11 +151,7 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
 
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async::<TokioRuntime, _>(
-                &rt,
-                &mut handlers,
-                Duration::from_millis(50)
-            )
+            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50))
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::A as thincan::Message>::ID,
@@ -161,11 +160,7 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
     );
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async::<TokioRuntime, _>(
-                &rt,
-                &mut handlers,
-                Duration::from_millis(50)
-            )
+            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50))
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::B as thincan::Message>::ID,

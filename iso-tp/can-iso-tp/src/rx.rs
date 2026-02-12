@@ -2,6 +2,7 @@
 
 use core::cmp::min;
 
+use crate::RxFlowControl;
 use crate::config::IsoTpConfig;
 use crate::errors::IsoTpError;
 use crate::pdu::{FlowStatus, Pdu, duration_to_st_min};
@@ -130,11 +131,16 @@ impl<'a> RxMachine<'a> {
     /// The caller is responsible for:
     /// - feeding PDUs in-order for a given session, and
     /// - sending flow-control frames when [`RxOutcome::SendFlowControl`] is returned.
-    pub fn on_pdu(&mut self, cfg: &IsoTpConfig, pdu: Pdu<'_>) -> Result<RxOutcome, IsoTpError<()>> {
+    pub fn on_pdu(
+        &mut self,
+        cfg: &IsoTpConfig,
+        rx_fc: &RxFlowControl,
+        pdu: Pdu<'_>,
+    ) -> Result<RxOutcome, IsoTpError<()>> {
         match pdu {
             Pdu::SingleFrame { len, data } => self.handle_single(cfg, len, data),
-            Pdu::FirstFrame { len, data } => self.handle_first(cfg, len, data),
-            Pdu::ConsecutiveFrame { sn, data } => self.handle_consecutive(cfg, sn, data),
+            Pdu::FirstFrame { len, data } => self.handle_first(cfg, rx_fc, len, data),
+            Pdu::ConsecutiveFrame { sn, data } => self.handle_consecutive(cfg, rx_fc, sn, data),
             Pdu::FlowControl { .. } => Err(IsoTpError::UnexpectedPdu),
         }
     }
@@ -160,6 +166,7 @@ impl<'a> RxMachine<'a> {
     fn handle_first(
         &mut self,
         cfg: &IsoTpConfig,
+        rx_fc: &RxFlowControl,
         len: u16,
         data: &[u8],
     ) -> Result<RxOutcome, IsoTpError<()>> {
@@ -175,19 +182,20 @@ impl<'a> RxMachine<'a> {
         self.written = copy_len;
         self.expected_len = len;
         self.next_sn = 1;
-        self.block_size = cfg.block_size;
-        self.block_remaining = cfg.block_size;
+        self.block_size = rx_fc.block_size;
+        self.block_remaining = rx_fc.block_size;
         self.state = RxState::Receiving;
         Ok(RxOutcome::SendFlowControl {
             status: FlowStatus::ClearToSend,
-            block_size: cfg.block_size,
-            st_min: duration_to_st_min(cfg.st_min),
+            block_size: rx_fc.block_size,
+            st_min: duration_to_st_min(rx_fc.st_min),
         })
     }
 
     fn handle_consecutive(
         &mut self,
-        cfg: &IsoTpConfig,
+        _cfg: &IsoTpConfig,
+        rx_fc: &RxFlowControl,
         sn: u8,
         data: &[u8],
     ) -> Result<RxOutcome, IsoTpError<()>> {
@@ -218,11 +226,13 @@ impl<'a> RxMachine<'a> {
         if self.block_size > 0 {
             self.block_remaining = self.block_remaining.saturating_sub(1);
             if self.block_remaining == 0 {
+                // Allow runtime backpressure updates to take effect at FC boundaries.
+                self.block_size = rx_fc.block_size;
                 self.block_remaining = self.block_size;
                 return Ok(RxOutcome::SendFlowControl {
                     status: FlowStatus::ClearToSend,
                     block_size: self.block_size,
-                    st_min: duration_to_st_min(cfg.st_min),
+                    st_min: duration_to_st_min(rx_fc.st_min),
                 });
             }
         }

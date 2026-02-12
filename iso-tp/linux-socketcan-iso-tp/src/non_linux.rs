@@ -4,7 +4,8 @@
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
 use can_isotp_interface::{
-    IsoTpEndpoint, IsoTpEndpointMeta, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
+    IsoTpAsyncEndpoint, IsoTpEndpoint, IsoTpEndpointMeta, IsoTpRxFlowControlConfig, RecvControl,
+    RecvError, RecvMeta, RecvStatus, RxFlowControl, SendError,
 };
 use core::time::Duration;
 use embedded_can::Id;
@@ -15,7 +16,10 @@ pub struct Error;
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "linux-socketcan-iso-tp is only supported on Linux targets")
+        write!(
+            f,
+            "linux-socketcan-iso-tp is only supported on Linux targets"
+        )
     }
 }
 
@@ -110,7 +114,12 @@ impl Default for IsoTpKernelOptions {
 pub struct SocketCanIsoTp;
 
 impl SocketCanIsoTp {
-    pub fn open(_iface: &str, _rx_id: Id, _tx_id: Id, _options: &IsoTpKernelOptions) -> Result<Self, Error> {
+    pub fn open(
+        _iface: &str,
+        _rx_id: Id,
+        _tx_id: Id,
+        _options: &IsoTpKernelOptions,
+    ) -> Result<Self, Error> {
         Err(Error)
     }
 }
@@ -131,6 +140,64 @@ impl IsoTpEndpoint for SocketCanIsoTp {
         Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
     {
         Err(RecvError::Backend(Error))
+    }
+}
+
+impl IsoTpRxFlowControlConfig for SocketCanIsoTp {
+    type Error = Error;
+
+    fn set_rx_flow_control(&mut self, _fc: RxFlowControl) -> Result<(), Self::Error> {
+        Err(Error)
+    }
+}
+
+/// Tokio-native async wrapper around [`SocketCanIsoTp`] (non-Linux stub).
+#[cfg(feature = "tokio")]
+#[derive(Debug)]
+pub struct TokioSocketCanIsoTp;
+
+#[cfg(feature = "tokio")]
+impl TokioSocketCanIsoTp {
+    pub fn open(
+        _iface: &str,
+        _rx_id: Id,
+        _tx_id: Id,
+        _options: &IsoTpKernelOptions,
+    ) -> Result<Self, Error> {
+        Err(Error)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
+    type Error = Error;
+
+    async fn send(
+        &mut self,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        Err(SendError::Backend(Error))
+    }
+
+    async fn recv_one<Cb>(
+        &mut self,
+        _timeout: Duration,
+        _on_payload: Cb,
+    ) -> Result<RecvStatus, RecvError<Self::Error>>
+    where
+        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+    {
+        Err(RecvError::Backend(Error))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl IsoTpRxFlowControlConfig for TokioSocketCanIsoTp {
+    type Error = Error;
+
+    fn set_rx_flow_control(&mut self, _fc: RxFlowControl) -> Result<(), Self::Error> {
+        Err(Error)
     }
 }
 
@@ -183,6 +250,14 @@ impl IsoTpEndpointMeta for KernelUdsDemux {
     }
 }
 
+impl IsoTpRxFlowControlConfig for KernelUdsDemux {
+    type Error = Error;
+
+    fn set_rx_flow_control(&mut self, _fc: RxFlowControl) -> Result<(), Self::Error> {
+        Err(Error)
+    }
+}
+
 /// Kernel ISO-TP flag constants.
 pub mod flags {
     pub const CAN_ISOTP_LISTEN_MODE: u32 = 0x0001;
@@ -200,4 +275,3 @@ pub mod flags {
     pub const CAN_ISOTP_CF_BROADCAST: u32 = 0x1000;
     pub const CAN_ISOTP_DYN_FC_PARMS: u32 = 0x2000;
 }
-

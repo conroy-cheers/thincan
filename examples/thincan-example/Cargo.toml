@@ -31,7 +31,6 @@ socketcan = ["dep:embedded-can-socketcan"]
 # under `cargo bench` (Cargo builds the package's binary targets too).
 socketcan-isotp = [
     "dep:linux-socketcan-iso-tp",
-    "thincan/isotp-interface",
     "socketcan",
 ]
 

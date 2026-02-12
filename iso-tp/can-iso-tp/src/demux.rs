@@ -19,6 +19,7 @@ use can_uds::uds29::{self, Uds29Kind};
 use embedded_can::Frame;
 use embedded_can_interface::{RxFrameIo, TxFrameIo};
 
+use crate::RxFlowControl;
 use crate::config::IsoTpConfig;
 use crate::errors::{IsoTpError, TimeoutKind};
 use crate::pdu::{
@@ -136,6 +137,7 @@ where
     tx: Tx,
     rx: Rx,
     base_cfg: IsoTpConfig,
+    rx_flow_control: RxFlowControl,
     clock: C,
     local_addr: u8,
     functional_addr: Option<u8>,
@@ -177,10 +179,12 @@ where
             free[i] = Some(s);
         }
 
+        let rx_flow_control = RxFlowControl::from_config(&base_cfg);
         Ok(Self {
             tx,
             rx,
             base_cfg,
+            rx_flow_control,
             clock,
             local_addr,
             functional_addr: None,
@@ -202,6 +206,16 @@ where
     /// UDS node address for this demux.
     pub fn local_addr(&self) -> u8 {
         self.local_addr
+    }
+
+    /// Get the current receive-side FlowControl parameters (BS/STmin).
+    pub fn rx_flow_control(&self) -> RxFlowControl {
+        self.rx_flow_control
+    }
+
+    /// Update receive-side FlowControl parameters (BS/STmin).
+    pub fn set_rx_flow_control(&mut self, fc: RxFlowControl) {
+        self.rx_flow_control = fc;
     }
 
     /// Acceptance filters that match frames addressed to this node.
@@ -303,6 +317,17 @@ where
                     block_size,
                     st_min,
                 });
+            } else if matches!(pdu, Pdu::FirstFrame { .. }) {
+                // The application has not drained the previous completed payload yet; reject new
+                // segmented transfers explicitly so the sender doesn't just time out.
+                let st_min = duration_to_st_min(self.rx_flow_control.st_min);
+                let _ = Self::send_flow_control_frame(
+                    &mut self.tx,
+                    &cfg,
+                    FlowStatus::Overflow,
+                    0,
+                    st_min,
+                );
             }
             return Ok(Progress::InFlight);
         }
@@ -335,7 +360,7 @@ where
                 Ok(Progress::InFlight)
             }
             _ => {
-                let outcome = match peer.rx_machine.on_pdu(&cfg, pdu) {
+                let outcome = match peer.rx_machine.on_pdu(&cfg, &self.rx_flow_control, pdu) {
                     Ok(o) => o,
                     Err(IsoTpError::Overflow) => {
                         let _ = Self::send_overflow_fc_frame(&mut self.tx, &cfg);
