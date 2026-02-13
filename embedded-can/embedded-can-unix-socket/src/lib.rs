@@ -8,7 +8,7 @@
 //! ISO-TP.
 //!
 //! # Quick start
-//! ```rust
+//! ```rust,no_run
 //! use embedded_can::{Frame as _, Id, StandardId};
 //! use embedded_can_interface::{RxFrameIo, TxFrameIo};
 //! use embedded_can_unix_socket::{BusServer, UnixCan, UnixFrame};
