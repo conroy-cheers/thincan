@@ -9,12 +9,14 @@ alloc = []
 std = ["alloc", "thincan/std"]
 heapless = ["dep:heapless"]
 tokio = ["std", "dep:tokio", "thincan/async"]
+embassy = ["dep:embassy-sync", "heapless", "thincan/async"]
 
 [dependencies]
 capnp = { version = "0.25.0", default-features = false, features = [
     "unaligned",
 ] }
 can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0" }
+embassy-sync = { version = "0.6", optional = true }
 heapless = { version = "0.8.0", default-features = false, optional = true }
 thincan = { path = "../thincan", default-features = false, features = [
     "capnp",
@@ -24,20 +26,4 @@ tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "t
 [build-dependencies]
 capnpc = "0.25.0"
 
-[dev-dependencies]
-embedded-can = "0.4.1"
-embedded-can-interface = "0.1.1"
-embedded-can-mock = "0.1.0"
-can-iso-tp = { version = "0.1.0", default-features = false, features = ["std"] }
-
 [lib]
-
-[[example]]
-name = "router_only"
-path = "examples/router_only.rs"
-required-features = ["alloc"]
-
-[[example]]
-name = "interface_two_threads"
-path = "examples/interface_two_threads.rs"
-required-features = ["alloc"]

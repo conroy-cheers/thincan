@@ -1,18 +1,96 @@
-//! File-transfer bundle for `thincan`.
+//! File-transfer protocol helpers for `thincan`.
 //!
-//! This crate provides a composable "file transfer" bundle built on top of `thincan` and Cap'n Proto.
-//! It is designed to be used from downstream crates without any per-atlas glue macros.
+//! This crate provides Cap'n Proto message types and helpers for building a simple file transfer
+//! protocol on top of `thincan`.
 //!
-//! ## Integration steps
+//! ## Integration steps (embassy-style, no-alloc)
 //! 1. Define the messages in your bus atlas (usually in your firmware/app crate):
 //!    - `FileReq` / `FileChunk` / `FileAck` using the Cap'n Proto owned types from
-//!      `thincan_file_transfer::schema`.
+//!      [`schema`].
 //! 2. Implement [`Atlas`] for your generated marker type `your_atlas::Atlas`.
-//! 3. Compose the bundle into a `bus_maplet!` using `file_transfer = thincan_file_transfer::Bundle`.
-//! 4. Provide storage by implementing [`FileStore`], and keep a state in your handlers.
+//! 3. Create two bounded channels:
+//!    - an inbound queue for `FileReq`/`FileChunk` events, and
+//!    - an outbound queue for `FileAck` responses to send.
+//! 4. In your ISO-TP receive loop, decode the `thincan` wire payload and enqueue file-transfer
+//!    messages via [`ReceiverIngress`].
+//! 5. In a separate async task, call [`ReceiverNoAlloc::process_one`] to perform storage I/O and
+//!    emit acks after writes complete (this provides natural backpressure).
 //!
-//! For a full routing example, see `examples/router_only.rs` and `examples/interface_two_threads.rs`.
+//! ### Sketch (enable `--features embassy`)
+//! ```rust,ignore
+//! use thincan_file_transfer as ft;
+//! use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+//! use embassy_sync::channel::Channel;
+//!
+//! // Your bus atlas defines FileReq/FileChunk/FileAck message IDs (capnp types from `ft::schema`).
+//! // `ReplyTo` is the addressing type provided by your ISO-TP demux (for UDS, typically `u8`).
+//! type ReplyTo = u8;
+//! const MAX_METADATA: usize = 64;
+//! const MAX_CHUNK: usize = 1024;
+//! const IN_DEPTH: usize = 8;
+//! const ACK_DEPTH: usize = 8;
+//!
+//! static INBOUND: ft::InboundQueue<NoopRawMutex, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH> =
+//!     Channel::new();
+//! static OUTBOUND_ACKS: ft::OutboundAckQueue<NoopRawMutex, ReplyTo, ACK_DEPTH> = Channel::new();
+//!
+//! // Receive loop: enqueue file-transfer messages (no storage I/O here).
+//! let ingestor = ft::ReceiverIngress::<MyAtlas, NoopRawMutex, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH>::new(&INBOUND);
+//! # let reply_to: ReplyTo = 0;
+//! # let payload: &[u8] = &[];
+//! if let Ok(raw) = thincan::decode_wire(payload) {
+//!     let _handled = ingestor.try_ingest_thincan_raw(reply_to, raw);
+//! }
+//!
+//! // Worker task: do async storage I/O and emit acks after writes complete.
+//! let mut rx = ft::ReceiverNoAlloc::<MyAtlas, MyStore, NoopRawMutex, ReplyTo, MAX_METADATA, 32, MAX_CHUNK, IN_DEPTH, ACK_DEPTH>::new(
+//!     MyStore::new(),
+//!     &INBOUND,
+//!     &OUTBOUND_ACKS,
+//! );
+//! loop {
+//!     rx.process_one().await?;
+//! }
+//! ```
+//!
+//! ## Backpressure / throttling
+//! This crate is designed so that **slow storage naturally throttles the transfer**:
+//! - [`ReceiverNoAlloc::process_one`] only emits an [`AckToSend`] after the corresponding
+//!   [`AsyncFileStore::write_at`] has completed.
+//! - The sender side is expected to be **ack-driven** and only send a bounded "window" of chunks
+//!   ahead of the most recent cumulative ack.
+//!
+//! The `tokio` feature includes [`AsyncSender`], which implements this "windowed, ack-driven"
+//! behavior.
+//!
+//! ## Sending acks back (embassy-style)
+//! [`ReceiverNoAlloc`] does not transmit on the bus. It pushes `AckToSend<ReplyTo>` items into your
+//! outbound ack queue, and your application is responsible for encoding and sending those acks
+//! to the correct `reply_to` address.
+//!
+//! With `--features heapless` you can encode Cap'n Proto bodies without allocation:
+//! ```rust,ignore
+//! # use thincan_file_transfer as ft;
+//! # let mut scratch = ft::CapnpScratch::<8>::new();
+//! # let mut out = [0u8; ft::file_ack_max_encoded_len()];
+//! # let ack: ft::AckToSend<u8> = todo!();
+//! let used = ft::encode_file_ack_into(
+//!     &mut scratch,
+//!     ack.ack.transfer_id,
+//!     ack.ack.kind,
+//!     ack.ack.next_offset,
+//!     ack.ack.chunk_size,
+//!     ack.ack.error,
+//!     &mut out,
+//! )?;
+//! // Send `&out[..used]` as the body of your bus's `FileAck` message to `ack.reply_to`.
+//! # Ok::<(), thincan::Error>(())
+//! ```
+//!
+//! This crate is async-first and is designed for runtimes like embassy where storage I/O must not
+//! block the executor.
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(async_fn_in_trait)]
 
 #[cfg(not(any(feature = "alloc", feature = "heapless")))]
 compile_error!(
@@ -27,7 +105,7 @@ use core::marker::PhantomData;
 capnp::generated_code!(pub mod file_transfer_capnp);
 pub use file_transfer_capnp as schema;
 
-/// Default chunk size (bytes) used by [`Sender`](crate::Sender) (alloc) and [`SenderNoAlloc`](crate::SenderNoAlloc).
+/// Default chunk size (bytes) used by senders.
 pub const DEFAULT_CHUNK_SIZE: usize = 64;
 
 /// Cap'n Proto "word padding" (Cap'n Proto Data blobs are padded to a word boundary).
@@ -60,7 +138,7 @@ pub const fn capnp_scratch_words_for_bytes(bytes: usize) -> usize {
     (bytes + 7) / 8
 }
 
-/// Receiver-side configuration (used by [`State`](crate::State) and [`StateNoAlloc`](crate::StateNoAlloc)).
+/// Receiver-side configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverConfig {
     /// Maximum accepted `FileChunk.data` length (bytes).
@@ -76,37 +154,37 @@ impl Default for ReceiverConfig {
     }
 }
 
-/// Generic bundle spec (used by `bus_maplet!`).
-pub struct Bundle;
-
-/// Atlas contract for this bundle.
+/// Atlas contract for file-transfer message types.
 pub trait Atlas {
     type FileReq: thincan::Message;
     type FileChunk: thincan::Message;
     type FileAck: thincan::Message;
 }
 
-/// Dependency required by the file-transfer bundle: a byte-addressable file store.
-pub trait FileStore {
+/// Async dependency required by the file-transfer bundle: a byte-addressable file store.
+///
+/// This is intended for async runtimes such as embassy, where storage I/O (flash, SD, etc.) should
+/// not block the entire executor.
+pub trait AsyncFileStore {
     type Error;
     type WriteHandle;
 
-    fn begin_write(
+    async fn begin_write(
         &mut self,
         transfer_id: u32,
         total_len: u32,
     ) -> Result<Self::WriteHandle, Self::Error>;
 
-    fn write_at(
+    async fn write_at(
         &mut self,
         handle: &mut Self::WriteHandle,
         offset: u32,
         bytes: &[u8],
     ) -> Result<(), Self::Error>;
 
-    fn commit(&mut self, handle: Self::WriteHandle) -> Result<(), Self::Error>;
+    async fn commit(&mut self, handle: Self::WriteHandle) -> Result<(), Self::Error>;
 
-    fn abort(&mut self, handle: Self::WriteHandle);
+    async fn abort(&mut self, handle: Self::WriteHandle);
 }
 
 /// Errors produced by the file-transfer state machine.
@@ -269,48 +347,15 @@ pub fn file_ack_reject<A>(transfer_id: u32, error: schema::FileAckError) -> File
     FileAckValue::new(transfer_id, schema::FileAckKind::Reject, 0, 0, error)
 }
 
-/// Summary of a completed send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendResult {
-    pub transfer_id: u32,
-    pub total_len: usize,
-    pub chunk_size: usize,
-    pub chunks: usize,
-}
-
-impl<A> thincan::BundleMeta<A> for Bundle
-where
-    A: Atlas,
-{
-    type Parser = thincan::DefaultParser;
-    const HANDLED_IDS: &'static [u16] = &[
-        <A::FileReq as thincan::Message>::ID,
-        <A::FileChunk as thincan::Message>::ID,
-        <A::FileAck as thincan::Message>::ID,
-    ];
-    const USED_IDS: &'static [u16] = <Self as thincan::BundleMeta<A>>::HANDLED_IDS;
-
-    fn is_known(id: u16) -> bool {
-        id == <A::FileReq as thincan::Message>::ID
-            || id == <A::FileChunk as thincan::Message>::ID
-            || id == <A::FileAck as thincan::Message>::ID
-    }
-}
-
 #[cfg(feature = "alloc")]
-mod alloc_impl;
-#[cfg(feature = "alloc")]
-pub use alloc_impl::{
-    Deps, SendEncoded, SendEncodedTo, Sender, State, handle_file_ack, handle_file_chunk,
-    handle_file_req,
-};
+mod alloc_encode;
 
 #[cfg(feature = "heapless")]
-mod heapless_impl;
+mod heapless_encode;
 #[cfg(feature = "heapless")]
-pub use heapless_impl::{
-    CapnpScratch, SendMsg, SendMsgTo, SenderNoAlloc, StateNoAlloc, handle_file_ack_no_alloc,
-    handle_file_chunk_no_alloc, handle_file_req_no_alloc,
+pub use heapless_encode::{
+    CapnpScratch, decode_file_ack_fields, encode_file_ack_into, encode_file_chunk_into,
+    encode_file_offer_into,
 };
 
 #[cfg(feature = "tokio")]
@@ -318,4 +363,12 @@ mod tokio_impl;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::{
     Ack, AckInbox, AckStream, AsyncSendResult, AsyncSender, ack_channel, decode_file_ack,
+};
+
+#[cfg(feature = "embassy")]
+mod embassy_receiver;
+#[cfg(feature = "embassy")]
+pub use embassy_receiver::{
+    AckToSend, InboundEvent, InboundQueue, OutboundAckQueue, ReceiverIngress, ReceiverNoAlloc,
+    ReceiverNoAllocConfig,
 };
