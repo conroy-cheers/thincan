@@ -2,9 +2,12 @@
 
 #[cfg(feature = "isotp-interface")]
 use can_isotp_interface::{
-    IsoTpAsyncEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvStatus,
-    RxFlowControl as IfaceRxFlowControl, SendError,
+    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, IsoTpRxFlowControlConfig, RecvControl,
+    RecvError, RecvIntoStatus, RecvStatus, RxFlowControl as IfaceRxFlowControl, SendError,
 };
+
+#[cfg(all(feature = "isotp-interface", feature = "uds"))]
+use can_isotp_interface::{IsoTpAsyncEndpointMetaRecvInto, RecvMetaIntoStatus};
 
 #[cfg(all(feature = "isotp-interface", feature = "uds"))]
 use can_isotp_interface::IsoTpAsyncEndpointMeta;
@@ -216,6 +219,58 @@ where
     }
 }
 
+#[cfg(feature = "isotp-interface")]
+impl<'rt, 'buf, Rt, Tx, Rx, F, C> IsoTpAsyncEndpointRecvInto
+    for AsyncWithRt<'rt, Rt, IsoTpAsyncNode<'buf, Tx, Rx, F, C>>
+where
+    Rt: AsyncRuntime,
+    Tx: AsyncTxFrameIo<Frame = F>,
+    Rx: AsyncRxFrameIo<Frame = F, Error = Tx::Error>,
+    F: Frame,
+    C: Clock,
+{
+    type Error = IsoTpError<Tx::Error>;
+
+    async fn recv_one_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvIntoStatus, RecvError<Self::Error>> {
+        let mut copied_len: Option<usize> = None;
+        let mut cb_err: Option<RecvError<Self::Error>> = None;
+
+        let res = self
+            .inner
+            .recv(self.rt, timeout, &mut |payload| {
+                if copied_len.is_some() || cb_err.is_some() {
+                    return;
+                }
+                if payload.len() > out.len() {
+                    cb_err = Some(RecvError::BufferTooSmall {
+                        needed: payload.len(),
+                        got: out.len(),
+                    });
+                    return;
+                }
+                out[..payload.len()].copy_from_slice(payload);
+                copied_len = Some(payload.len());
+            })
+            .await;
+
+        if let Some(e) = cb_err {
+            return Err(e);
+        }
+
+        match res {
+            Ok(()) => Ok(RecvIntoStatus::DeliveredOne {
+                len: copied_len.unwrap_or(0),
+            }),
+            Err(IsoTpError::Timeout(_)) => Ok(RecvIntoStatus::TimedOut),
+            Err(e) => Err(RecvError::Backend(e)),
+        }
+    }
+}
+
 #[cfg(all(feature = "isotp-interface", feature = "uds"))]
 impl<'a, Tx, Rx, F, C, const MAX: usize> can_isotp_interface::IsoTpEndpointMeta
     for crate::demux::IsoTpDemux<'a, Tx, Rx, F, C, MAX>
@@ -376,6 +431,63 @@ where
         match res {
             Ok(()) => Ok(RecvStatus::DeliveredOne),
             Err(IsoTpError::Timeout(_)) => Ok(RecvStatus::TimedOut),
+            Err(e) => Err(RecvError::Backend(e)),
+        }
+    }
+}
+
+#[cfg(all(feature = "isotp-interface", feature = "uds"))]
+impl<'rt, 'buf, Rt, Tx, Rx, F, C, const MAX_PEERS: usize> IsoTpAsyncEndpointMetaRecvInto
+    for AsyncWithRt<'rt, Rt, crate::async_demux::IsoTpAsyncDemux<'buf, Tx, Rx, F, C, MAX_PEERS>>
+where
+    Rt: AsyncRuntime,
+    Tx: AsyncTxFrameIo<Frame = F>,
+    Rx: AsyncRxFrameIo<Frame = F, Error = Tx::Error>,
+    F: Frame,
+    C: Clock,
+{
+    type Error = IsoTpError<Tx::Error>;
+    type ReplyTo = u8;
+
+    async fn recv_one_meta_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvMetaIntoStatus<Self::ReplyTo>, RecvError<Self::Error>> {
+        let mut copied: Option<(u8, usize)> = None;
+        let mut cb_err: Option<RecvError<Self::Error>> = None;
+
+        let res = self
+            .inner
+            .recv(self.rt, timeout, &mut |reply_to, payload| {
+                if copied.is_some() || cb_err.is_some() {
+                    return;
+                }
+                if payload.len() > out.len() {
+                    cb_err = Some(RecvError::BufferTooSmall {
+                        needed: payload.len(),
+                        got: out.len(),
+                    });
+                    return;
+                }
+                out[..payload.len()].copy_from_slice(payload);
+                copied = Some((reply_to, payload.len()));
+            })
+            .await;
+
+        if let Some(e) = cb_err {
+            return Err(e);
+        }
+
+        match res {
+            Ok(()) => {
+                let (reply_to, len) = copied.unwrap_or((0, 0));
+                Ok(RecvMetaIntoStatus::DeliveredOne {
+                    meta: RecvMeta { reply_to },
+                    len,
+                })
+            }
+            Err(IsoTpError::Timeout(_)) => Ok(RecvMetaIntoStatus::TimedOut),
             Err(e) => Err(RecvError::Backend(e)),
         }
     }
