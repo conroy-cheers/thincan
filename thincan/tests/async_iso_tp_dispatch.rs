@@ -1,4 +1,4 @@
-#![cfg(feature = "async")]
+#![cfg(feature = "std")]
 
 use core::time::Duration;
 
@@ -89,13 +89,21 @@ struct App {
 impl<'a> maplet::Handlers<'a> for App {
     type Error = ();
 
-    fn on_a(&mut self, msg: &'a [u8; atlas::A::BODY_LEN]) -> Result<(), Self::Error> {
+    async fn on_a(
+        &mut self,
+        _meta: thincan::RecvMeta<maplet::ReplyTo>,
+        msg: &'a [u8; atlas::A::BODY_LEN],
+    ) -> Result<(), Self::Error> {
         assert_eq!(*msg, [0xAA]);
         self.seen.push(<atlas::A as thincan::Message>::ID);
         Ok(())
     }
 
-    fn on_b(&mut self, msg: &'a [u8; atlas::B::BODY_LEN]) -> Result<(), Self::Error> {
+    async fn on_b(
+        &mut self,
+        _meta: thincan::RecvMeta<maplet::ReplyTo>,
+        msg: &'a [u8; atlas::B::BODY_LEN],
+    ) -> Result<(), Self::Error> {
         assert_eq!(*msg, [0xBB]);
         self.seen.push(<atlas::B as thincan::Message>::ID);
         Ok(())
@@ -148,10 +156,11 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
         app: App::default(),
         none: none::DefaultHandlers,
     };
+    let mut rx_buf = [0u8; 64];
 
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50))
+            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::A as thincan::Message>::ID,
@@ -160,7 +169,7 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
     );
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50))
+            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::B as thincan::Message>::ID,

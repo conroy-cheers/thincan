@@ -1,13 +1,89 @@
 #![cfg(feature = "std")]
 
-use can_iso_tp::{IsoTpConfig, IsoTpNode};
-use can_isotp_interface::{IsoTpEndpoint, RecvControl, RecvError, RecvStatus, SendError};
+use can_iso_tp::{IsoTpAsyncNode, IsoTpConfig};
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvControl, RecvError, RecvIntoStatus,
+    RecvStatus, SendError,
+};
 use embedded_can::StandardId;
-use embedded_can_interface::{Id, SplitTxRx};
-use embedded_can_mock::{BusHandle, MockCan};
+use embedded_can_interface::{AsyncRxFrameIo, AsyncTxFrameIo, Id};
+use embedded_can_mock::MockFrame;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+#[derive(Debug)]
+enum TokioCanError {
+    Closed,
+}
+
+struct TokioBus {
+    peers: TokioMutex<Vec<mpsc::UnboundedSender<MockFrame>>>,
+}
+
+impl TokioBus {
+    fn new() -> Self {
+        Self {
+            peers: TokioMutex::new(Vec::new()),
+        }
+    }
+
+    async fn add_interface(self: &Arc<Self>) -> (TokioTx, TokioRx) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.peers.lock().await.push(tx);
+        (TokioTx { bus: self.clone() }, TokioRx { rx })
+    }
+
+    async fn transmit(&self, frame: MockFrame) {
+        let peers = self.peers.lock().await;
+        for peer in peers.iter() {
+            let _ = peer.send(frame.clone());
+        }
+    }
+}
+
+struct TokioTx {
+    bus: Arc<TokioBus>,
+}
+
+struct TokioRx {
+    rx: mpsc::UnboundedReceiver<MockFrame>,
+}
+
+impl AsyncTxFrameIo for TokioTx {
+    type Frame = MockFrame;
+    type Error = TokioCanError;
+
+    async fn send(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
+        self.bus.transmit(frame.clone()).await;
+        Ok(())
+    }
+
+    async fn send_timeout(
+        &mut self,
+        frame: &Self::Frame,
+        _timeout: Duration,
+    ) -> Result<(), Self::Error> {
+        self.send(frame).await
+    }
+}
+
+impl AsyncRxFrameIo for TokioRx {
+    type Frame = MockFrame;
+    type Error = TokioCanError;
+
+    async fn recv(&mut self) -> Result<Self::Frame, Self::Error> {
+        self.rx.recv().await.ok_or(TokioCanError::Closed)
+    }
+
+    async fn recv_timeout(&mut self, _timeout: Duration) -> Result<Self::Frame, Self::Error> {
+        self.recv().await
+    }
+
+    async fn wait_not_empty(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -168,13 +244,18 @@ thincan::bundle! {
                 }
             }
 
-            impl<'a, T> Handlers<'a> for T
+            impl<'a, T, ReplyTo> Handlers<'a, ReplyTo> for T
             where
+                ReplyTo: Copy,
                 T: Deps,
             {
                 type Error = Error<<<T as Deps>::Store as FileStore>::Error>;
 
-                fn on_file_req(&mut self, msg: FileReqParsed) -> Result<(), Self::Error> {
+                async fn on_file_req(
+                    &mut self,
+                    _meta: thincan::RecvMeta<ReplyTo>,
+                    msg: FileReqParsed,
+                ) -> Result<(), Self::Error> {
                     let state = self.state();
                     if let Some(in_progress) = state.in_progress.take() {
                         state.store.abort(in_progress.handle);
@@ -188,7 +269,11 @@ thincan::bundle! {
                     Ok(())
                 }
 
-                fn on_file_chunk(&mut self, msg: FileChunkParsed<'a>) -> Result<(), Self::Error> {
+                async fn on_file_chunk(
+                    &mut self,
+                    _meta: thincan::RecvMeta<ReplyTo>,
+                    msg: FileChunkParsed<'a>,
+                ) -> Result<(), Self::Error> {
                     let state = self.state();
                     let in_progress = state.in_progress.as_mut().ok_or(Error::Protocol)?;
                     if in_progress.transfer_id != msg.transfer_id {
@@ -213,7 +298,11 @@ thincan::bundle! {
                     Ok(())
                 }
 
-                fn on_file_ack(&mut self, _msg: FileAckParsed) -> Result<(), Self::Error> {
+                async fn on_file_ack(
+                    &mut self,
+                    _meta: thincan::RecvMeta<ReplyTo>,
+                    _msg: FileAckParsed,
+                ) -> Result<(), Self::Error> {
                     Ok(())
                 }
             }
@@ -284,13 +373,18 @@ thincan::bundle! {
                 }
             }
 
-            impl<'a, T> Handlers<'a> for T
+            impl<'a, T, ReplyTo> Handlers<'a, ReplyTo> for T
             where
+                ReplyTo: Copy,
                 T: Deps,
             {
                 type Error = core::convert::Infallible;
 
-                fn on_log_line(&mut self, line: &'a [u8]) -> Result<(), Self::Error> {
+                async fn on_log_line(
+                    &mut self,
+                    _meta: thincan::RecvMeta<ReplyTo>,
+                    line: &'a [u8],
+                ) -> Result<(), Self::Error> {
                     self.sink().on_log_line(line);
                     Ok(())
                 }
@@ -481,41 +575,108 @@ impl<T> LoggingTransport<T> {
     }
 }
 
-impl<T> IsoTpEndpoint for LoggingTransport<T>
+impl<T> IsoTpAsyncEndpoint for LoggingTransport<T>
 where
-    T: IsoTpEndpoint,
+    T: IsoTpAsyncEndpoint,
 {
     type Error = T::Error;
 
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>> {
+    async fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>>
+    {
         self.sent.lock().unwrap().push(payload.to_vec());
-        self.inner.send(payload, timeout)
+        self.inner.send(payload, timeout).await
     }
 
-    fn recv_one<F>(
+    async fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
-        mut on_payload: F,
+        mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        F: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
     {
         let received = self.received.clone();
-        self.inner.recv_one(timeout, |payload| {
-            received.lock().unwrap().push(payload.to_vec());
-            on_payload(payload)
-        })
+        self.inner
+            .recv_one(timeout, |payload| {
+                received.lock().unwrap().push(payload.to_vec());
+                on_payload(payload)
+            })
+            .await
     }
 }
 
-#[test]
-fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
-    let bus = BusHandle::new();
-    let can_a = MockCan::new_with_bus(&bus, vec![]).unwrap();
-    let can_b = MockCan::new_with_bus(&bus, vec![]).unwrap();
+impl<T> IsoTpAsyncEndpointRecvInto for LoggingTransport<T>
+where
+    T: IsoTpAsyncEndpointRecvInto,
+{
+    type Error = T::Error;
 
-    let (tx_a, rx_a) = can_a.split();
-    let (tx_b, rx_b) = can_b.split();
+    async fn recv_one_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvIntoStatus, RecvError<Self::Error>> {
+        match self.inner.recv_one_into(timeout, out).await? {
+            RecvIntoStatus::TimedOut => Ok(RecvIntoStatus::TimedOut),
+            RecvIntoStatus::DeliveredOne { len } => {
+                self.received.lock().unwrap().push(out[..len].to_vec());
+                Ok(RecvIntoStatus::DeliveredOne { len })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TokioRuntime;
+
+impl can_iso_tp::AsyncRuntime for TokioRuntime {
+    type TimeoutError = tokio::time::error::Elapsed;
+
+    type Sleep<'a>
+        = tokio::time::Sleep
+    where
+        Self: 'a;
+    fn sleep<'a>(&'a self, duration: Duration) -> Self::Sleep<'a> {
+        tokio::time::sleep(duration)
+    }
+
+    type Timeout<'a, F>
+        = tokio::time::Timeout<F>
+    where
+        Self: 'a,
+        F: core::future::Future + 'a;
+    fn timeout<'a, F>(&'a self, duration: Duration, future: F) -> Self::Timeout<'a, F>
+    where
+        F: core::future::Future + 'a,
+    {
+        tokio::time::timeout(duration, future)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TokioClock;
+
+impl can_iso_tp::Clock for TokioClock {
+    type Instant = tokio::time::Instant;
+
+    fn now(&self) -> Self::Instant {
+        tokio::time::Instant::now()
+    }
+
+    fn elapsed(&self, earlier: Self::Instant) -> Duration {
+        earlier.elapsed()
+    }
+
+    fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
+        instant + dur
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
+    let bus = Arc::new(TokioBus::new());
+    let (tx_a, rx_a) = bus.add_interface().await;
+    let (tx_b, rx_b) = bus.add_interface().await;
 
     let file = b"one\ntwoooooooo\nthree\n".to_vec();
     let transfer_id = 1u32;
@@ -554,231 +715,247 @@ fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
     let sender_sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let sender_received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
 
-    #[derive(Clone, Copy, Debug, Default)]
-    struct StdInstantClock;
-
-    impl can_iso_tp::Clock for StdInstantClock {
-        type Instant = Instant;
-        fn now(&self) -> Self::Instant {
-            Instant::now()
-        }
-        fn elapsed(&self, earlier: Self::Instant) -> Duration {
-            earlier.elapsed()
-        }
-        fn add(&self, instant: Self::Instant, dur: Duration) -> Self::Instant {
-            instant.checked_add(dur).unwrap_or(instant)
-        }
-    }
-
     let file_for_sender = file.clone();
     let file_for_displayer = file.clone();
     let expected_logs_for_sender = expected_logs.clone();
 
     let sender_sent_t = sender_sent.clone();
     let sender_received_t = sender_received.clone();
-    let sender_thread = thread::spawn(
-        move || -> Result<(CommittedTransfer, DispatchCounts), thincan::Error> {
-            let mut rx_buf = [0u8; 256];
-            let node_sender = LoggingTransport::new(
-                IsoTpNode::with_clock(tx_b, rx_b, cfg(0x701, 0x700), StdInstantClock, &mut rx_buf)
-                    .unwrap(),
-                sender_sent_t,
-                sender_received_t,
-            );
+    let sender_fut = async move {
+        let mut rx_buf = [0u8; 256];
+        let node_sender = IsoTpAsyncNode::with_clock(
+            tx_b,
+            rx_b,
+            cfg(0x701, 0x700),
+            TokioClock,
+            &mut rx_buf,
+        )
+        .unwrap();
 
-            let mut tx_buf = [0u8; 512];
-            let mut iface =
-                thincan::Interface::new(node_sender, log_sender_bus::Router::new(), &mut tx_buf);
-            let mut handlers = log_sender_bus::HandlersImpl {
-                app: NoApp,
-                file_transfer: file_transfer::State::new(RecordingFileStore::default()),
-                log_tx: log_tx::DefaultHandlers,
-            };
+        let rt = TokioRuntime;
+        let node_sender = can_iso_tp::AsyncWithRt::new(&rt, node_sender);
+        let node_sender = LoggingTransport::new(node_sender, sender_sent_t, sender_received_t);
 
-            let mut dispatch = DispatchCounts::default();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let committed = loop {
-                if Instant::now() > deadline {
+        let mut tx_buf = [0u8; 512];
+        let mut iface =
+            thincan::Interface::new(node_sender, log_sender_bus::Router::new(), &mut tx_buf);
+        let mut handlers = log_sender_bus::HandlersImpl {
+            app: NoApp,
+            file_transfer: file_transfer::State::new(RecordingFileStore::default()),
+            log_tx: log_tx::DefaultHandlers,
+        };
+
+        let mut rx_payload = [0u8; 512];
+        let mut dispatch = DispatchCounts::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let committed = loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Timeout,
+                });
+            }
+            match iface
+                .recv_one_dispatch_async(
+                    &mut handlers,
+                    Duration::from_millis(50),
+                    &mut rx_payload,
+                )
+                .await?
+            {
+                thincan::RecvDispatch::TimedOut => continue,
+                thincan::RecvDispatch::MalformedPayload => {
                     return Err(thincan::Error {
-                        kind: thincan::ErrorKind::Timeout,
+                        kind: thincan::ErrorKind::Other,
                     });
                 }
-                match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
-                    thincan::RecvDispatch::TimedOut => continue,
-                    thincan::RecvDispatch::MalformedPayload => {
-                        return Err(thincan::Error {
-                            kind: thincan::ErrorKind::Other,
-                        });
+                thincan::RecvDispatch::Dispatched { id, kind } => match kind {
+                    thincan::RecvDispatchKind::Handled => dispatch.handled += 1,
+                    thincan::RecvDispatchKind::Unhandled => {
+                        panic!("sender received unhandled message id=0x{:04x}", id);
                     }
-                    thincan::RecvDispatch::Dispatched { id, kind } => match kind {
-                        thincan::RecvDispatchKind::Handled => dispatch.handled += 1,
-                        thincan::RecvDispatchKind::Unhandled => {
-                            panic!("sender received unhandled message id=0x{:04x}", id);
-                        }
-                        thincan::RecvDispatchKind::Unknown => {
-                            panic!("sender received unknown message id=0x{:04x}", id);
-                        }
-                    },
-                }
-                if let Some(transfer) = handlers.file_transfer.store.take_latest() {
-                    break transfer;
-                }
-            };
-
-            assert_eq!(
-                committed.transfer_id, transfer_id,
-                "sender committed unexpected transfer id"
-            );
-            assert_eq!(
-                committed.total_len as usize,
-                file_for_sender.len(),
-                "sender committed unexpected total len"
-            );
-            assert_eq!(
-                committed.bytes, file_for_sender,
-                "sender stored file bytes differ from sent bytes"
-            );
-            assert_eq!(
-                handlers.file_transfer.store.begin_calls,
-                vec![(transfer_id, committed.total_len)],
-                "sender should begin exactly one write with the correct parameters"
-            );
-            assert_eq!(
-                handlers.file_transfer.store.commit_calls, 1,
-                "sender should commit exactly once"
-            );
-            assert_eq!(
-                handlers.file_transfer.store.abort_calls, 0,
-                "sender should not abort transfers in this scenario"
-            );
-
-            let expected_chunk_count = (committed.total_len as usize).div_ceil(8);
-            assert_eq!(
-                committed.writes.len(),
-                expected_chunk_count,
-                "expected one write_at per chunk"
-            );
-            for (i, op) in committed.writes.iter().enumerate() {
-                assert_eq!(
-                    op.offset as usize,
-                    i * 8,
-                    "write_at offset should be chunk-aligned and increasing"
-                );
-                let expected = &committed.bytes
-                    [(i * 8)..((i * 8 + op.bytes.len()).min(committed.bytes.len()))];
-                assert_eq!(
-                    op.bytes, expected,
-                    "write_at bytes should match source slice"
-                );
+                    thincan::RecvDispatchKind::Unknown => {
+                        panic!("sender received unknown message id=0x{:04x}", id);
+                    }
+                },
             }
-
-            let mut logs_sent = 0usize;
-            for line in committed.bytes.split(|b| *b == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                logs_sent += 1;
-                iface.send_msg::<atlas::LogLine>(
-                    &log_tx::encode_line(line),
-                    Duration::from_millis(50),
-                )?;
+            if let Some(transfer) = handlers.file_transfer.store.take_latest() {
+                break transfer;
             }
-            assert_eq!(
-                logs_sent,
-                expected_logs_for_sender.len(),
-                "sender should send one log line per non-empty file line"
-            );
+        };
 
-            Ok((committed, dispatch))
-        },
-    );
+        assert_eq!(
+            committed.transfer_id, transfer_id,
+            "sender committed unexpected transfer id"
+        );
+        assert_eq!(
+            committed.total_len as usize,
+            file_for_sender.len(),
+            "sender committed unexpected total len"
+        );
+        assert_eq!(
+            committed.bytes, file_for_sender,
+            "sender stored file bytes differ from sent bytes"
+        );
+        assert_eq!(
+            handlers.file_transfer.store.begin_calls,
+            vec![(transfer_id, committed.total_len)],
+            "sender should begin exactly one write with the correct parameters"
+        );
+        assert_eq!(
+            handlers.file_transfer.store.commit_calls, 1,
+            "sender should commit exactly once"
+        );
+        assert_eq!(
+            handlers.file_transfer.store.abort_calls, 0,
+            "sender should not abort transfers in this scenario"
+        );
+
+        let expected_chunk_count = (committed.total_len as usize).div_ceil(8);
+        assert_eq!(
+            committed.writes.len(),
+            expected_chunk_count,
+            "expected one write_at per chunk"
+        );
+        for (i, op) in committed.writes.iter().enumerate() {
+            assert_eq!(
+                op.offset as usize,
+                i * 8,
+                "write_at offset should be chunk-aligned and increasing"
+            );
+            let expected = &committed.bytes
+                [(i * 8)..((i * 8 + op.bytes.len()).min(committed.bytes.len()))];
+            assert_eq!(op.bytes, expected, "write_at bytes should match source slice");
+        }
+
+        let mut logs_sent = 0usize;
+        for line in committed.bytes.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            logs_sent += 1;
+            iface.send_msg_async::<atlas::LogLine>(
+                &log_tx::encode_line(line),
+                Duration::from_millis(50),
+            )
+            .await?;
+        }
+        assert_eq!(
+            logs_sent,
+            expected_logs_for_sender.len(),
+            "sender should send one log line per non-empty file line"
+        );
+
+        Ok::<(CommittedTransfer, DispatchCounts), thincan::Error>((committed, dispatch))
+    };
 
     let expected_log_count = expected_logs.len();
     let displayer_sent_t = displayer_sent.clone();
     let displayer_received_t = displayer_received.clone();
-    let displayer_thread = thread::spawn(
-        move || -> Result<(Vec<Vec<u8>>, DispatchCounts, RecordingFileStore), thincan::Error> {
-            let mut rx_buf = [0u8; 256];
-            let node_displayer = LoggingTransport::new(
-                IsoTpNode::with_clock(tx_a, rx_a, cfg(0x700, 0x701), StdInstantClock, &mut rx_buf)
-                    .unwrap(),
-                displayer_sent_t,
-                displayer_received_t,
-            );
+    let displayer_fut = async move {
+        let mut rx_buf = [0u8; 256];
+        let node_displayer = IsoTpAsyncNode::with_clock(
+            tx_a,
+            rx_a,
+            cfg(0x700, 0x701),
+            TokioClock,
+            &mut rx_buf,
+        )
+        .unwrap();
 
-            let mut tx_buf = [0u8; 512];
-            let mut iface = thincan::Interface::new(
-                node_displayer,
-                log_displayer_bus::Router::new(),
-                &mut tx_buf,
-            );
-            let displayer_store = RecordingFileStore::default();
-            let mut handlers = log_displayer_bus::HandlersImpl {
-                app: NoApp,
-                file_transfer: file_transfer::State::new(displayer_store),
-                log_display: log_display::State {
-                    sink: CollectingLogSink::default(),
-                },
-            };
+        let rt = TokioRuntime;
+        let node_displayer = can_iso_tp::AsyncWithRt::new(&rt, node_displayer);
+        let node_displayer = LoggingTransport::new(node_displayer, displayer_sent_t, displayer_received_t);
 
-            iface.send_msg::<atlas::FileReq>(
+        let mut tx_buf = [0u8; 512];
+        let mut iface = thincan::Interface::new(
+            node_displayer,
+            log_displayer_bus::Router::new(),
+            &mut tx_buf,
+        );
+        let displayer_store = RecordingFileStore::default();
+        let mut handlers = log_displayer_bus::HandlersImpl {
+            app: NoApp,
+            file_transfer: file_transfer::State::new(displayer_store),
+            log_display: log_display::State {
+                sink: CollectingLogSink::default(),
+            },
+        };
+
+        iface
+            .send_msg_async::<atlas::FileReq>(
                 &file_transfer::encode_req(transfer_id, file_for_displayer.len() as u32),
                 Duration::from_millis(50),
-            )?;
-            for offset in (0..file_for_displayer.len()).step_by(8) {
-                let body = file_transfer::encode_chunk(
-                    transfer_id,
-                    offset as u32,
-                    &file_for_displayer[offset..],
-                );
-                iface.send_msg::<atlas::FileChunk>(&body, Duration::from_millis(50))?;
-            }
+            )
+            .await?;
+        for offset in (0..file_for_displayer.len()).step_by(8) {
+            let body = file_transfer::encode_chunk(
+                transfer_id,
+                offset as u32,
+                &file_for_displayer[offset..],
+            );
+            iface
+                .send_msg_async::<atlas::FileChunk>(&body, Duration::from_millis(50))
+                .await?;
+        }
 
-            let mut dispatch = DispatchCounts::default();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while handlers.log_display.sink.lines.len() < expected_log_count {
-                if Instant::now() > deadline {
+        let mut dispatch = DispatchCounts::default();
+        let mut rx_payload = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while handlers.log_display.sink.lines.len() < expected_log_count {
+            if tokio::time::Instant::now() > deadline {
+                return Err(thincan::Error {
+                    kind: thincan::ErrorKind::Timeout,
+                });
+            }
+            match iface
+                .recv_one_dispatch_async(
+                    &mut handlers,
+                    Duration::from_millis(50),
+                    &mut rx_payload,
+                )
+                .await?
+            {
+                thincan::RecvDispatch::TimedOut => continue,
+                thincan::RecvDispatch::MalformedPayload => {
                     return Err(thincan::Error {
-                        kind: thincan::ErrorKind::Timeout,
+                        kind: thincan::ErrorKind::Other,
                     });
                 }
-                match iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))? {
-                    thincan::RecvDispatch::TimedOut => continue,
-                    thincan::RecvDispatch::MalformedPayload => {
-                        return Err(thincan::Error {
-                            kind: thincan::ErrorKind::Other,
-                        });
+                thincan::RecvDispatch::Dispatched { kind, .. } => match kind {
+                    thincan::RecvDispatchKind::Handled => {
+                        dispatch.handled += 1;
+                        assert!(
+                            handlers.log_display.sink.lines.len() <= expected_log_count,
+                            "displayer received more logs than expected"
+                        );
                     }
-                    thincan::RecvDispatch::Dispatched { kind, .. } => match kind {
-                        thincan::RecvDispatchKind::Handled => {
-                            dispatch.handled += 1;
-                            assert!(
-                                handlers.log_display.sink.lines.len() <= expected_log_count,
-                                "displayer received more logs than expected"
-                            );
-                        }
-                        thincan::RecvDispatchKind::Unhandled => {
-                            panic!("displayer received unhandled message")
-                        }
-                        thincan::RecvDispatchKind::Unknown => {
-                            panic!("displayer received unknown message")
-                        }
-                    },
-                }
+                    thincan::RecvDispatchKind::Unhandled => {
+                        panic!("displayer received unhandled message")
+                    }
+                    thincan::RecvDispatchKind::Unknown => {
+                        panic!("displayer received unknown message")
+                    }
+                },
             }
+        }
 
-            for _ in 0..3 {
-                let r = iface.recv_one_dispatch(&mut handlers, Duration::from_millis(50))?;
-                assert_eq!(r, thincan::RecvDispatch::TimedOut);
-            }
+        for _ in 0..3 {
+            let r = iface
+                .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_payload)
+                .await?;
+            assert_eq!(r, thincan::RecvDispatch::TimedOut);
+        }
 
-            let store = handlers.file_transfer.store;
-            Ok((handlers.log_display.sink.lines, dispatch, store))
-        },
-    );
+        let store = handlers.file_transfer.store;
+        Ok::<(Vec<Vec<u8>>, DispatchCounts, RecordingFileStore), thincan::Error>((
+            handlers.log_display.sink.lines,
+            dispatch,
+            store,
+        ))
+    };
 
-    let (committed, sender_dispatch) = sender_thread.join().unwrap()?;
-    let (logs, displayer_dispatch, displayer_store) = displayer_thread.join().unwrap()?;
+    let ((committed, sender_dispatch), (logs, displayer_dispatch, displayer_store)) =
+        tokio::try_join!(sender_fut, displayer_fut)?;
 
     assert_eq!(
         logs, expected_logs,

@@ -7,7 +7,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use can_isotp_interface::{IsoTpEndpoint, RecvControl, RecvError, RecvStatus, SendError};
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, IsoTpEndpoint, RecvControl, RecvError,
+    RecvIntoStatus, RecvStatus, SendError,
+};
 use capnp::message::ReaderOptions;
 use capnp::message::SingleSegmentAllocator;
 
@@ -79,6 +82,70 @@ impl IsoTpEndpoint for PipeEnd {
     }
 }
 
+impl IsoTpAsyncEndpoint for PipeEnd {
+    type Error = thincan::Error;
+
+    async fn send(
+        &mut self,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        IsoTpEndpoint::send(self, payload, timeout)
+    }
+
+    async fn recv_one<Cb>(
+        &mut self,
+        timeout: Duration,
+        mut on_payload: Cb,
+    ) -> Result<RecvStatus, RecvError<Self::Error>>
+    where
+        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+    {
+        let _ = timeout;
+        let mut shared = self.shared.lock().unwrap();
+        let queue = match self.dir {
+            Direction::A => &mut shared.b_to_a,
+            Direction::B => &mut shared.a_to_b,
+        };
+
+        if queue.is_empty() {
+            return Ok(RecvStatus::TimedOut);
+        }
+        let payload = queue.pop_front().unwrap();
+        let _ = on_payload(&payload).map_err(RecvError::Backend)?;
+        Ok(RecvStatus::DeliveredOne)
+    }
+}
+
+impl IsoTpAsyncEndpointRecvInto for PipeEnd {
+    type Error = thincan::Error;
+
+    async fn recv_one_into(
+        &mut self,
+        _timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvIntoStatus, RecvError<Self::Error>> {
+        let mut shared = self.shared.lock().unwrap();
+        let queue = match self.dir {
+            Direction::A => &mut shared.b_to_a,
+            Direction::B => &mut shared.a_to_b,
+        };
+
+        if queue.is_empty() {
+            return Ok(RecvIntoStatus::TimedOut);
+        }
+        let payload = queue.pop_front().unwrap();
+        if out.len() < payload.len() {
+            return Err(RecvError::BufferTooSmall {
+                needed: payload.len(),
+                got: out.len(),
+            });
+        }
+        out[..payload.len()].copy_from_slice(&payload);
+        Ok(RecvIntoStatus::DeliveredOne { len: payload.len() })
+    }
+}
+
 thincan::bus_atlas! {
     pub mod atlas {
         0x2000 => Person(capnp = crate::person_capnp::person::Owned);
@@ -113,8 +180,9 @@ struct App {
 impl<'a> maplet::Handlers<'a> for App {
     type Error = ();
 
-    fn on_person(
+    async fn on_person(
         &mut self,
+        _meta: thincan::RecvMeta<maplet::ReplyTo>,
         msg: thincan::CapnpTyped<'a, person_capnp::person::Owned>,
     ) -> Result<(), Self::Error> {
         let (name, email) = msg
@@ -168,8 +236,8 @@ impl thincan::Encode<atlas::Person> for PersonValue {
     }
 }
 
-#[test]
-fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::Error> {
+#[tokio::test]
+async fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::Error> {
     let (a, b) = PipeEnd::pair();
 
     let mut tx_a = [0u8; 2048];
@@ -191,7 +259,10 @@ fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::Error> 
         none: none::DefaultHandlers,
     };
 
-    let _ = iface_b.recv_one_dispatch(&mut handlers, Duration::from_millis(1))?;
+    let mut rx = [0u8; 2048];
+    let _ = iface_b
+        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .await?;
 
     assert_eq!(
         *seen.lock().unwrap(),

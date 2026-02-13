@@ -22,7 +22,7 @@
 //!   handled by the application, which are handled by bundles, and which should be ignored.
 //!
 //! # Quick start (atlas → bundle → maplet → dispatch)
-//! ```rust
+//! ```rust,ignore
 //! use thincan::{bus_atlas, bus_maplet, bundle, DispatchOutcome, Message, RawMessage, RouterDispatch};
 //!
 //! bus_atlas! {
@@ -54,21 +54,29 @@
 //! #[derive(Default)]
 //! struct Handlers;
 //!
-//! impl<'a> demo_bundle::Handlers<'a> for Handlers {
+//! impl<'a> demo_bundle::Handlers<'a, demo_maplet::ReplyTo> for Handlers {
 //!     type Error = ();
-//!     fn on_ping(&mut self, _msg: &'a [u8; atlas::Ping::BODY_LEN]) -> Result<(), Self::Error> {
+//!     async fn on_ping(
+//!         &mut self,
+//!         _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
+//!         _msg: &'a [u8; atlas::Ping::BODY_LEN],
+//!     ) -> Result<(), Self::Error> {
 //!         Ok(())
 //!     }
 //! }
 //!
 //! impl<'a> demo_maplet::Handlers<'a> for Handlers {
 //!     type Error = ();
-//!     fn on_pong(&mut self, _msg: &'a [u8; atlas::Pong::BODY_LEN]) -> Result<(), Self::Error> {
+//!     async fn on_pong(
+//!         &mut self,
+//!         _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
+//!         _msg: &'a [u8; atlas::Pong::BODY_LEN],
+//!     ) -> Result<(), Self::Error> {
 //!         Ok(())
 //!     }
 //! }
 //!
-//! fn main() -> Result<(), thincan::Error> {
+//! async fn demo() -> Result<(), thincan::Error> {
 //!     let mut router = demo_maplet::Router::new();
 //!     let mut handlers = demo_maplet::HandlersImpl {
 //!         app: Handlers::default(),
@@ -79,7 +87,11 @@
 //!         id: <atlas::Ping as Message>::ID,
 //!         body: &[0u8; atlas::Ping::BODY_LEN],
 //!     };
-//!     assert_eq!(router.dispatch(&mut handlers, msg)?, DispatchOutcome::Handled);
+//!     let meta = thincan::RecvMeta { reply_to: () };
+//!     assert_eq!(
+//!         router.dispatch(&mut handlers, meta, msg).await?,
+//!         DispatchOutcome::Handled
+//!     );
 //!     Ok(())
 //! }
 //! ```
@@ -93,7 +105,6 @@
 //!
 //! # Feature flags
 //! - `std` (default): enables `std::error::Error` and `Display` for [`Error`].
-//! - `async`: enables async helpers for `can-iso-tp`'s async node.
 //! - `capnp`: enables Cap'n Proto decode helpers (`Capnp` / `CapnpTyped`).
 //! - `isotp-uds`: enables UDS 29-bit ISO-TP demux transport helpers (reply-to metadata).
 //!
@@ -108,6 +119,7 @@
 #![doc = include_str!("../tests/capnp_person.rs")]
 #![doc = "```"]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(async_fn_in_trait)]
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -488,16 +500,14 @@ fn map_isotp_send_error<E>(err: can_isotp_interface::SendError<E>) -> Error {
     }
 }
 
-fn map_isotp_recv_error<E>(_: can_isotp_interface::RecvError<E>) -> Error {
+fn map_isotp_recv_error<E>(err: can_isotp_interface::RecvError<E>) -> Error {
     Error {
-        kind: ErrorKind::Other,
-    }
-}
-
-fn map_isotp_control(control: RecvControl) -> can_isotp_interface::RecvControl {
-    match control {
-        RecvControl::Continue => can_isotp_interface::RecvControl::Continue,
-        RecvControl::Stop => can_isotp_interface::RecvControl::Stop,
+        kind: match err {
+            can_isotp_interface::RecvError::BufferTooSmall { needed, got } => {
+                ErrorKind::BufferTooSmall { needed, got }
+            }
+            can_isotp_interface::RecvError::Backend(_) => ErrorKind::Other,
+        },
     }
 }
 
@@ -520,11 +530,15 @@ where
 }
 
 /// Dispatch raw messages into bundle/app handlers.
-pub trait RouterDispatch<Handlers> {
+pub trait RouterDispatch<Handlers, ReplyTo>
+where
+    ReplyTo: Copy,
+{
     /// Decode and route a raw message into the appropriate handler.
-    fn dispatch<'a>(
+    async fn dispatch<'a>(
         &mut self,
         handlers: &mut Handlers,
+        meta: RecvMeta<ReplyTo>,
         msg: RawMessage<'a>,
     ) -> Result<DispatchOutcome<'a>, Error>;
 }
@@ -545,11 +559,15 @@ pub trait BundleMeta<Atlas> {
 }
 
 /// Bundle dispatch for a specific handler type.
-pub trait BundleDispatch<Atlas, Handlers>: BundleMeta<Atlas> {
+pub trait BundleDispatch<Atlas, Handlers, ReplyTo>: BundleMeta<Atlas>
+where
+    ReplyTo: Copy,
+{
     /// Attempt to dispatch a raw message; return `None` if this bundle doesn't handle it.
-    fn try_dispatch<'a>(
+    async fn try_dispatch<'a>(
         parser: &Self::Parser,
         handlers: &mut Handlers,
+        meta: RecvMeta<ReplyTo>,
         msg: RawMessage<'a>,
     ) -> Option<Result<(), Error>>;
 }
@@ -576,7 +594,8 @@ pub enum RecvDispatchKind {
 /// High-level interface that couples a transport node and a generated maplet router.
 ///
 /// This interface is designed to be allocation-free: callers supply a TX scratch buffer and
-/// receive-side dispatch happens directly inside the transport's receive callback.
+/// callers supply an RX buffer for `recv_one_dispatch_*` so higher-level handlers can `await`
+/// (backpressure) without being constrained by callback lifetimes.
 #[derive(Debug)]
 pub struct Interface<Node, Router, TxBuf> {
     node: Node,
@@ -746,162 +765,10 @@ where
             .map_err(map_isotp_send_error)
     }
 
-    /// Receive at most one payload and dispatch it through the router.
-    ///
-    /// This returns a small owned summary. Use [`Interface::recv_one_dispatch_with`] if you need
-    /// borrowed access to bodies (unknown/unhandled payload bytes) for logging or tooling.
-    pub fn recv_one_dispatch<Handlers>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpoint,
-        Router: RouterDispatch<Handlers>,
-    {
-        self.recv_one_dispatch_with(handlers, timeout, |_| Ok(RecvControl::Continue))
-    }
-
-    /// Receive at most one payload, dispatch it, and emit structured events.
-    pub fn recv_one_dispatch_with<Handlers, F>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        mut on_event: F,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpoint,
-        Router: RouterDispatch<Handlers>,
-        F: for<'a> FnMut(DispatchEvent<'a>) -> Result<RecvControl, Error>,
-    {
-        let (node, router) = (&mut self.node, &mut self.router);
-
-        let mut summary = RecvDispatch::TimedOut;
-        let mut cb_err: Option<Error> = None;
-        let status = node
-            .recv_one(timeout, |payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
-                let res: Result<RecvControl, Error> = match decode_wire(payload) {
-                    Ok(raw) => match router.dispatch(handlers, raw) {
-                        Ok(outcome) => {
-                            summary = RecvDispatch::Dispatched {
-                                id: raw.id,
-                                kind: match outcome {
-                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                                },
-                            };
-                            on_event(DispatchEvent::Dispatched { raw, outcome })
-                        }
-                        Err(err) => Err(err),
-                    },
-                    Err(_) => {
-                        summary = RecvDispatch::MalformedPayload;
-                        on_event(DispatchEvent::MalformedPayload { payload })
-                    }
-                };
-                match res {
-                    Ok(control) => Ok(map_isotp_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
-                    }
-                }
-            })
-            .map_err(map_isotp_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
-        }
-
-        Ok(match status {
-            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            can_isotp_interface::RecvStatus::DeliveredOne => summary,
-        })
-    }
-
-    /// Receive at most one payload and dispatch it through the router, with reply-to metadata.
-    pub fn recv_one_dispatch_meta<Handlers>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpointMeta,
-        Router: RouterDispatch<Handlers>,
-    {
-        self.recv_one_dispatch_with_meta(handlers, timeout, |_| Ok(RecvControl::Continue))
-    }
-
-    /// Receive at most one payload, dispatch it, and emit structured events with reply-to metadata.
-    pub fn recv_one_dispatch_with_meta<Handlers, F>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        mut on_event: F,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpointMeta,
-        Router: RouterDispatch<Handlers>,
-        F: for<'a> FnMut(DispatchEventMeta<'a, Node::ReplyTo>) -> Result<RecvControl, Error>,
-    {
-        let (node, router) = (&mut self.node, &mut self.router);
-
-        let mut summary = RecvDispatch::TimedOut;
-        let mut cb_err: Option<Error> = None;
-        let status = node
-            .recv_one_meta(timeout, |meta, payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
-                let meta = RecvMeta {
-                    reply_to: meta.reply_to,
-                };
-                let res: Result<RecvControl, Error> = match decode_wire(payload) {
-                    Ok(raw) => match router.dispatch(handlers, raw) {
-                        Ok(outcome) => {
-                            summary = RecvDispatch::Dispatched {
-                                id: raw.id,
-                                kind: match outcome {
-                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                                },
-                            };
-                            on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
-                        }
-                        Err(err) => Err(err),
-                    },
-                    Err(_) => {
-                        summary = RecvDispatch::MalformedPayload;
-                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })
-                    }
-                };
-                match res {
-                    Ok(control) => Ok(map_isotp_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
-                    }
-                }
-            })
-            .map_err(map_isotp_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
-        }
-
-        Ok(match status {
-            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            can_isotp_interface::RecvStatus::DeliveredOne => summary,
-        })
-    }
+    // NOTE: Sync receive+dispatch helpers were removed in favor of async-native dispatch that can
+    // apply backpressure by awaiting in handlers (e.g. slow storage I/O).
 }
 
-#[cfg(feature = "async")]
 impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
     Node: can_isotp_interface::IsoTpAsyncEndpoint,
@@ -932,17 +799,24 @@ where
             .await
             .map_err(map_isotp_send_error)
     }
+}
 
+impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
+where
+    Node: can_isotp_interface::IsoTpAsyncEndpoint + can_isotp_interface::IsoTpAsyncEndpointRecvInto,
+    TxBuf: AsMut<[u8]>,
+{
     /// Async receive+dispatch helper for ISO-TP async endpoints.
     pub async fn recv_one_dispatch_async<Handlers>(
         &mut self,
         handlers: &mut Handlers,
         timeout: Duration,
+        rx: &mut [u8],
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<Handlers>,
+        Router: RouterDispatch<Handlers, ()>,
     {
-        self.recv_one_dispatch_with_async(handlers, timeout, |_| Ok(RecvControl::Continue))
+        self.recv_one_dispatch_with_async(handlers, timeout, rx, |_| Ok(()))
             .await
     }
 
@@ -951,67 +825,48 @@ where
         &mut self,
         handlers: &mut Handlers,
         timeout: Duration,
+        rx: &mut [u8],
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<Handlers>,
-        Ev: for<'a> FnMut(DispatchEvent<'a>) -> Result<RecvControl, Error>,
+        Router: RouterDispatch<Handlers, ()>,
+        Ev: for<'a> FnMut(DispatchEvent<'a>) -> Result<(), Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
-        let mut summary = RecvDispatch::TimedOut;
-        let mut cb_err: Option<Error> = None;
-
-        let status = node
-            .recv_one(timeout, |payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
-
-                let res: Result<RecvControl, Error> = match decode_wire(payload) {
-                    Ok(raw) => match router.dispatch(handlers, raw) {
-                        Ok(outcome) => {
-                            summary = RecvDispatch::Dispatched {
-                                id: raw.id,
-                                kind: match outcome {
-                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                                },
-                            };
-                            on_event(DispatchEvent::Dispatched { raw, outcome })
-                        }
-                        Err(err) => Err(err),
-                    },
-                    Err(_) => {
-                        summary = RecvDispatch::MalformedPayload;
-                        on_event(DispatchEvent::MalformedPayload { payload })
-                    }
-                };
-
-                match res {
-                    Ok(control) => Ok(map_isotp_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
-                    }
-                }
-            })
+        match node
+            .recv_one_into(timeout, rx)
             .await
-            .map_err(map_isotp_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
+            .map_err(map_isotp_recv_error)?
+        {
+            can_isotp_interface::RecvIntoStatus::TimedOut => Ok(RecvDispatch::TimedOut),
+            can_isotp_interface::RecvIntoStatus::DeliveredOne { len } => {
+                let payload = &rx[..len];
+                match decode_wire(payload) {
+                    Ok(raw) => {
+                        let meta = RecvMeta { reply_to: () };
+                        let outcome = router.dispatch(handlers, meta, raw).await?;
+                        on_event(DispatchEvent::Dispatched { raw, outcome })?;
+                        Ok(RecvDispatch::Dispatched {
+                            id: raw.id,
+                            kind: match outcome {
+                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                            },
+                        })
+                    }
+                    Err(_) => {
+                        on_event(DispatchEvent::MalformedPayload { payload })?;
+                        Ok(RecvDispatch::MalformedPayload)
+                    }
+                }
+            }
         }
-
-        Ok(match status {
-            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            can_isotp_interface::RecvStatus::DeliveredOne => summary,
-        })
     }
 }
 
-#[cfg(all(feature = "async", feature = "isotp-uds"))]
+#[cfg(feature = "isotp-uds")]
 impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
     Node: can_isotp_interface::IsoTpAsyncEndpointMeta,
@@ -1020,7 +875,7 @@ where
     /// Async send helper for ISO-TP async demux nodes (addressed send).
     pub async fn send_msg_to_async<M: Message>(
         &mut self,
-        to: Node::ReplyTo,
+        to: <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
         body: &[u8],
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -1034,7 +889,7 @@ where
     /// Async send-encoded helper for ISO-TP async demux nodes (addressed send).
     pub async fn send_encoded_to_async<M: Message, V: Encode<M>>(
         &mut self,
-        to: Node::ReplyTo,
+        to: <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
         value: &V,
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -1044,72 +899,67 @@ where
             .await
             .map_err(map_isotp_send_error)
     }
+}
 
+#[cfg(feature = "isotp-uds")]
+impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
+where
+    Node: can_isotp_interface::IsoTpAsyncEndpointMeta
+        + can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+            ReplyTo = <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        >,
+    TxBuf: AsMut<[u8]>,
+{
     /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
     pub async fn recv_one_dispatch_with_meta_async<Handlers, Ev>(
         &mut self,
         handlers: &mut Handlers,
         timeout: Duration,
+        rx: &mut [u8],
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<Handlers>,
-        Ev: for<'a> FnMut(DispatchEventMeta<'a, Node::ReplyTo>) -> Result<RecvControl, Error>,
+        Router: RouterDispatch<
+            Handlers,
+            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        >,
+        Ev: for<'a> FnMut(
+            DispatchEventMeta<'a, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
+        ) -> Result<(), Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
-        let mut summary = RecvDispatch::TimedOut;
-        let mut cb_err: Option<Error> = None;
-
-        let status = node
-            .recv_one_meta(timeout, |meta, payload| {
-                if cb_err.is_some() {
-                    return Ok(can_isotp_interface::RecvControl::Stop);
-                }
+        match node
+            .recv_one_meta_into(timeout, rx)
+            .await
+            .map_err(map_isotp_recv_error)?
+        {
+            can_isotp_interface::RecvMetaIntoStatus::TimedOut => Ok(RecvDispatch::TimedOut),
+            can_isotp_interface::RecvMetaIntoStatus::DeliveredOne { meta, len } => {
                 let meta = RecvMeta {
                     reply_to: meta.reply_to,
                 };
-
-                let res: Result<RecvControl, Error> = match decode_wire(payload) {
-                    Ok(raw) => match router.dispatch(handlers, raw) {
-                        Ok(outcome) => {
-                            summary = RecvDispatch::Dispatched {
-                                id: raw.id,
-                                kind: match outcome {
-                                    DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                    DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                    DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                                },
-                            };
-                            on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })
-                        }
-                        Err(err) => Err(err),
-                    },
-                    Err(_) => {
-                        summary = RecvDispatch::MalformedPayload;
-                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })
+                let payload = &rx[..len];
+                match decode_wire(payload) {
+                    Ok(raw) => {
+                        let outcome = router.dispatch(handlers, meta, raw).await?;
+                        on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })?;
+                        Ok(RecvDispatch::Dispatched {
+                            id: raw.id,
+                            kind: match outcome {
+                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
+                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
+                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
+                            },
+                        })
                     }
-                };
-
-                match res {
-                    Ok(control) => Ok(map_isotp_control(control)),
-                    Err(err) => {
-                        cb_err = Some(err);
-                        Ok(can_isotp_interface::RecvControl::Stop)
+                    Err(_) => {
+                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })?;
+                        Ok(RecvDispatch::MalformedPayload)
                     }
                 }
-            })
-            .await
-            .map_err(map_isotp_recv_error)?;
-
-        if let Some(err) = cb_err {
-            return Err(err);
+            }
         }
-
-        Ok(match status {
-            can_isotp_interface::RecvStatus::TimedOut => RecvDispatch::TimedOut,
-            can_isotp_interface::RecvStatus::DeliveredOne => summary,
-        })
     }
 
     /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
@@ -1117,11 +967,15 @@ where
         &mut self,
         handlers: &mut Handlers,
         timeout: Duration,
+        rx: &mut [u8],
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<Handlers>,
+        Router: RouterDispatch<
+            Handlers,
+            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        >,
     {
-        self.recv_one_dispatch_with_meta_async(handlers, timeout, |_| Ok(RecvControl::Continue))
+        self.recv_one_dispatch_with_meta_async(handlers, timeout, rx, |_| Ok(()))
             .await
     }
 }
@@ -1257,12 +1111,16 @@ macro_rules! bundle {
             ///
             /// A `bundle!` expands to a trait with one method per handled message. A maplet can then
             /// embed this bundle's handler implementation inside [`bus_maplet!`]'s `HandlersImpl`.
-            pub trait Handlers<'a> {
+            pub trait Handlers<'a, ReplyTo>
+            where
+                ReplyTo: Copy,
+            {
                 /// Bundle-specific error type.
                 type Error;
                 $(
-                    fn $method(
+                    async fn $method(
                         &mut self,
+                        meta: $crate::RecvMeta<ReplyTo>,
                         msg: <$parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
                     ) -> Result<(), Self::Error>;
                 )*
@@ -1272,11 +1130,15 @@ macro_rules! bundle {
             /// A no-op handler implementation that accepts all handled messages.
             pub struct DefaultHandlers;
 
-            impl<'a> Handlers<'a> for DefaultHandlers {
+            impl<'a, ReplyTo> Handlers<'a, ReplyTo> for DefaultHandlers
+            where
+                ReplyTo: Copy,
+            {
                 type Error = core::convert::Infallible;
                 $(
-                    fn $method(
+                    async fn $method(
                         &mut self,
+                        _meta: $crate::RecvMeta<ReplyTo>,
                         _msg: <$parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
                     ) -> Result<(), Self::Error> {
                         Ok(())
@@ -1317,13 +1179,15 @@ macro_rules! bundle {
             /// Attempt to dispatch a decoded message to this bundle's handlers.
             ///
             /// Returns `None` when the message is not handled by this bundle.
-            pub fn try_dispatch<'a, H>(
+            pub async fn try_dispatch<'a, H, ReplyTo>(
                 parser: &BundleParser,
                 handlers: &mut H,
+                meta: $crate::RecvMeta<ReplyTo>,
                 msg: $crate::RawMessage<'a>,
             ) -> Option<Result<(), $crate::Error>>
             where
-                H: Handlers<'a>,
+                ReplyTo: Copy,
+                H: Handlers<'a, ReplyTo>,
             {
                 let _ = parser;
                 let _ = handlers;
@@ -1334,7 +1198,7 @@ macro_rules! bundle {
                                 Ok(v) => v,
                                 Err(e) => return Some(Err(e)),
                             };
-                            if let Err(_e) = handlers.$method(parsed) {
+                            if let Err(_e) = handlers.$method(meta, parsed).await {
                                 return Some(Err($crate::Error { kind: $crate::ErrorKind::Other }));
                             }
                             Some(Ok(()))
@@ -1353,16 +1217,18 @@ macro_rules! bundle {
                 }
             }
 
-            impl<Atlas, H> $crate::BundleDispatch<Atlas, H> for Bundle
+            impl<Atlas, H, ReplyTo> $crate::BundleDispatch<Atlas, H, ReplyTo> for Bundle
             where
-                for<'a> H: Handlers<'a>,
+                ReplyTo: Copy,
+                for<'a> H: Handlers<'a, ReplyTo>,
             {
-                fn try_dispatch<'a>(
+                async fn try_dispatch<'a>(
                     parser: &Self::Parser,
                     handlers: &mut H,
+                    meta: $crate::RecvMeta<ReplyTo>,
                     msg: $crate::RawMessage<'a>,
                 ) -> Option<Result<(), $crate::Error>> {
-                    try_dispatch(parser, handlers, msg)
+                    try_dispatch::<H, ReplyTo>(parser, handlers, meta, msg).await
                 }
             }
 
@@ -1381,6 +1247,7 @@ macro_rules! bundle {
 macro_rules! bus_maplet {
     (
         $vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             bundles [ $($bundles:tt)* ];
             parser: $app_parser:ty;
             use msgs [ $($msg:ident),* $(,)? ];
@@ -1391,6 +1258,31 @@ macro_rules! bus_maplet {
     ) => {
         $crate::bus_maplet!(@parse_bundles
             ($vis mod $maplet : $atlas {
+                reply_to: $reply_to;
+                parser: $app_parser;
+                use msgs [ $($msg,)* ];
+                handles { $($handled => $method,)* }
+                unhandled_by_default = $unhandled_by_default;
+                ignore [ $($ignore,)* ];
+            })
+            []
+            $($bundles)*
+        );
+    };
+
+    (
+        $vis:vis mod $maplet:ident : $atlas:ident {
+            bundles [ $($bundles:tt)* ];
+            parser: $app_parser:ty;
+            use msgs [ $($msg:ident),* $(,)? ];
+            handles { $($handled:ident => $method:ident),* $(,)? }
+            unhandled_by_default = $unhandled_by_default:literal;
+            ignore [ $($ignore:ident),* $(,)? ];
+        }
+    ) => {
+        $crate::bus_maplet!(@parse_bundles
+            ($vis mod $maplet : $atlas {
+                reply_to: ();
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1404,6 +1296,7 @@ macro_rules! bus_maplet {
 
     (@parse_bundles
         ($vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1415,6 +1308,7 @@ macro_rules! bus_maplet {
         $crate::bus_maplet!(@expand
             $vis mod $maplet : $atlas {
                 bundles [ $($out)* ];
+                reply_to: $reply_to;
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1426,6 +1320,7 @@ macro_rules! bus_maplet {
 
     (@parse_bundles
         ($vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1437,6 +1332,7 @@ macro_rules! bus_maplet {
     ) => {
         $crate::bus_maplet!(@parse_bundles
             ($vis mod $maplet : $atlas {
+                reply_to: $reply_to;
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1450,6 +1346,7 @@ macro_rules! bus_maplet {
 
     (@parse_bundles
         ($vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1461,6 +1358,7 @@ macro_rules! bus_maplet {
     ) => {
         $crate::bus_maplet!(@parse_bundles
             ($vis mod $maplet : $atlas {
+                reply_to: $reply_to;
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1474,6 +1372,7 @@ macro_rules! bus_maplet {
 
     (@parse_bundles
         ($vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1485,6 +1384,7 @@ macro_rules! bus_maplet {
     ) => {
         $crate::bus_maplet!(@parse_bundles
             ($vis mod $maplet : $atlas {
+                reply_to: $reply_to;
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1497,6 +1397,7 @@ macro_rules! bus_maplet {
 
     (@parse_bundles
         ($vis:vis mod $maplet:ident : $atlas:ident {
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1508,6 +1409,7 @@ macro_rules! bus_maplet {
     ) => {
         $crate::bus_maplet!(@parse_bundles
             ($vis mod $maplet : $atlas {
+                reply_to: $reply_to;
                 parser: $app_parser;
                 use msgs [ $($msg,)* ];
                 handles { $($handled => $method,)* }
@@ -1521,6 +1423,7 @@ macro_rules! bus_maplet {
     (@expand
         $vis:vis mod $maplet:ident : $atlas:ident {
             bundles [ $(($bundle:ident, $bundle_spec:ty),)* ];
+            reply_to: $reply_to:ty;
             parser: $app_parser:ty;
             use msgs [ $($msg:ident,)* ];
             handles { $($handled:ident => $method:ident,)* }
@@ -1531,6 +1434,9 @@ macro_rules! bus_maplet {
         $vis mod $maplet {
             #![allow(non_camel_case_types)]
             pub use super::$atlas;
+
+            /// Transport reply-to metadata type used by this maplet's handler signatures.
+            pub type ReplyTo = $reply_to;
 
             #[derive(Debug)]
             /// Router generated for this maplet.
@@ -1585,8 +1491,9 @@ macro_rules! bus_maplet {
                 /// Application-specific error type.
                 type Error;
                 $(
-                    fn $method(
+                    async fn $method(
                         &mut self,
+                        meta: $crate::RecvMeta<ReplyTo>,
                         msg: <$app_parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
                     ) -> Result<(), Self::Error>;
                 )*
@@ -1612,11 +1519,12 @@ macro_rules! bus_maplet {
             {
                 type Error = <App as Handlers<'a>>::Error;
                 $(
-                    fn $method(
+                    async fn $method(
                         &mut self,
+                        meta: $crate::RecvMeta<ReplyTo>,
                         msg: <$app_parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
                     ) -> Result<(), Self::Error> {
-                        self.app.$method(msg)
+                        self.app.$method(meta, msg).await
                     }
                 )*
             }
@@ -1652,18 +1560,19 @@ macro_rules! bus_maplet {
                 }
             }
 
-            impl<App, $($bundle),*> $crate::RouterDispatch<HandlersImpl<App, $($bundle),*>> for Router
+            impl<App, $($bundle),*> $crate::RouterDispatch<HandlersImpl<App, $($bundle),*>, ReplyTo> for Router
             where
                 for<'a> App: Handlers<'a>,
-                $($bundle_spec: $crate::BundleDispatch<super::$atlas::Atlas, $bundle>,)*
+                $($bundle_spec: $crate::BundleDispatch<super::$atlas::Atlas, $bundle, ReplyTo>,)*
             {
-                fn dispatch<'a>(
+                async fn dispatch<'a>(
                     &mut self,
                     handlers: &mut HandlersImpl<App, $($bundle),*>,
+                    meta: $crate::RecvMeta<ReplyTo>,
                     msg: $crate::RawMessage<'a>,
                 ) -> Result<$crate::DispatchOutcome<'a>, $crate::Error> {
                     $(
-                        if let Some(result) = <$bundle_spec as $crate::BundleDispatch<super::$atlas::Atlas, $bundle>>::try_dispatch(&self.$bundle, &mut handlers.$bundle, msg) {
+                        if let Some(result) = <$bundle_spec as $crate::BundleDispatch<super::$atlas::Atlas, $bundle, ReplyTo>>::try_dispatch(&self.$bundle, &mut handlers.$bundle, meta, msg).await {
                             result?;
                             return Ok($crate::DispatchOutcome::Handled);
                         }
@@ -1676,7 +1585,7 @@ macro_rules! bus_maplet {
                                     &self.app_parser,
                                     msg.body,
                                 )?;
-                                if let Err(_e) = Handlers::$method(&mut handlers.app, parsed) {
+                                if let Err(_e) = handlers.app.$method(meta, parsed).await {
                                     return Err($crate::Error { kind: $crate::ErrorKind::Other });
                                 }
                                 return Ok($crate::DispatchOutcome::Handled);

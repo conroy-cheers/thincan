@@ -49,7 +49,11 @@ struct AppHandlers {
 impl<'a> maplet_unhandled::Handlers<'a> for AppHandlers {
     type Error = ();
 
-    fn on_pong(&mut self, _msg: &'a [u8; atlas::Pong::BODY_LEN]) -> Result<(), Self::Error> {
+    async fn on_pong(
+        &mut self,
+        _meta: thincan::RecvMeta<maplet_unhandled::ReplyTo>,
+        _msg: &'a [u8; atlas::Pong::BODY_LEN],
+    ) -> Result<(), Self::Error> {
         if self.fail_pong {
             return Err(());
         }
@@ -60,7 +64,11 @@ impl<'a> maplet_unhandled::Handlers<'a> for AppHandlers {
 impl<'a> maplet_handled::Handlers<'a> for AppHandlers {
     type Error = ();
 
-    fn on_pong(&mut self, _msg: &'a [u8; atlas::Pong::BODY_LEN]) -> Result<(), Self::Error> {
+    async fn on_pong(
+        &mut self,
+        _meta: thincan::RecvMeta<maplet_handled::ReplyTo>,
+        _msg: &'a [u8; atlas::Pong::BODY_LEN],
+    ) -> Result<(), Self::Error> {
         if self.fail_pong {
             return Err(());
         }
@@ -73,10 +81,14 @@ struct BundleHandlers {
     fail_ping: bool,
 }
 
-impl<'a> demo_bundle::Handlers<'a> for BundleHandlers {
+impl<'a> demo_bundle::Handlers<'a, ()> for BundleHandlers {
     type Error = ();
 
-    fn on_ping(&mut self, _msg: &'a [u8; atlas::Ping::BODY_LEN]) -> Result<(), Self::Error> {
+    async fn on_ping(
+        &mut self,
+        _meta: thincan::RecvMeta<()>,
+        _msg: &'a [u8; atlas::Ping::BODY_LEN],
+    ) -> Result<(), Self::Error> {
         if self.fail_ping {
             return Err(());
         }
@@ -148,8 +160,9 @@ fn assert_unique_u16_slices_accepts_unique_slices() {
     thincan::__assert_unique_u16_slices([&[1, 2], &[3]]);
 }
 
-#[test]
-fn dispatch_outcomes_and_error_paths_are_exercised() {
+#[tokio::test]
+async fn dispatch_outcomes_and_error_paths_are_exercised() {
+    let meta = thincan::RecvMeta { reply_to: () };
     // Bundle-handled Ping.
     {
         let mut router = maplet_unhandled::Router::new();
@@ -163,7 +176,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[0x01],
         };
         assert_eq!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Handled
         );
     }
@@ -181,7 +194,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[0x01],
         };
         assert_eq!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Handled
         );
     }
@@ -199,7 +212,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[0x01, 0x02],
         };
         assert_eq!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Handled
         );
     }
@@ -217,7 +230,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[],
         };
         assert_eq!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Handled
         );
     }
@@ -235,7 +248,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[0x00],
         };
         assert!(matches!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Unhandled(_)
         ));
     }
@@ -253,7 +266,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[0x00],
         };
         assert_eq!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Handled
         );
     }
@@ -271,7 +284,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             body: &[1, 2, 3],
         };
         assert!(matches!(
-            router.dispatch(&mut handlers, msg).unwrap(),
+            router.dispatch(&mut handlers, meta, msg).await.unwrap(),
             DispatchOutcome::Unknown { .. }
         ));
     }
@@ -287,7 +300,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             id: <atlas::Ping as Message>::ID,
             body: &[],
         };
-        let err = router.dispatch(&mut handlers, msg).unwrap_err();
+        let err = router.dispatch(&mut handlers, meta, msg).await.unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Other));
     }
 
@@ -302,7 +315,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             id: <atlas::Ping as Message>::ID,
             body: &[0x01],
         };
-        let err = router.dispatch(&mut handlers, msg).unwrap_err();
+        let err = router.dispatch(&mut handlers, meta, msg).await.unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Other));
     }
 
@@ -317,7 +330,7 @@ fn dispatch_outcomes_and_error_paths_are_exercised() {
             id: <atlas::Pong as Message>::ID,
             body: &[0x01, 0x02],
         };
-        let err = router.dispatch(&mut handlers, msg).unwrap_err();
+        let err = router.dispatch(&mut handlers, meta, msg).await.unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Other));
     }
 }
@@ -446,16 +459,6 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
-    // Receive timeout maps to a TimedOut dispatch result (not an error).
-    let mut handlers = maplet_unhandled::HandlersImpl {
-        app: AppHandlers::default(),
-        demo_bundle: BundleHandlers::default(),
-    };
-    let st = iface
-        .recv_one_dispatch(&mut handlers, Duration::from_millis(1))
-        .unwrap();
-    assert_eq!(st, thincan::RecvDispatch::TimedOut);
-
     // Send timeout from ISO-TP maps to ErrorKind::Timeout (multi-frame requires flow control).
     let can_b = MockCan::new_with_bus(&bus, vec![]).unwrap();
     let (tx_b, rx_b) = can_b.split();
@@ -487,6 +490,121 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
         .send_msg::<Big>(&[0u8; 6], Duration::from_millis(1))
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Timeout));
+}
+
+#[cfg(feature = "std")]
+#[tokio::test]
+async fn async_recv_timeout_maps_to_timedout_dispatch() {
+    #[derive(Debug, Default)]
+    struct DummyAsync;
+
+    impl can_isotp_interface::IsoTpAsyncEndpoint for DummyAsync {
+        type Error = thincan::Error;
+
+        async fn send(
+            &mut self,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
+            Ok(())
+        }
+
+        async fn recv_one<Cb>(
+            &mut self,
+            _timeout: Duration,
+            _on_payload: Cb,
+        ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
+        where
+            Cb: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
+        {
+            Ok(can_isotp_interface::RecvStatus::TimedOut)
+        }
+    }
+
+    impl can_isotp_interface::IsoTpAsyncEndpointRecvInto for DummyAsync {
+        type Error = thincan::Error;
+
+        async fn recv_one_into(
+            &mut self,
+            _timeout: Duration,
+            _out: &mut [u8],
+        ) -> Result<can_isotp_interface::RecvIntoStatus, can_isotp_interface::RecvError<Self::Error>>
+        {
+            Ok(can_isotp_interface::RecvIntoStatus::TimedOut)
+        }
+    }
+
+    let mut tx = [0u8; 64];
+    let mut iface = thincan::Interface::new(DummyAsync, maplet_unhandled::Router::new(), &mut tx);
+    let mut handlers = maplet_unhandled::HandlersImpl {
+        app: AppHandlers::default(),
+        demo_bundle: BundleHandlers::default(),
+    };
+    let mut rx = [0u8; 64];
+    let st = iface
+        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .await
+        .unwrap();
+    assert_eq!(st, thincan::RecvDispatch::TimedOut);
+}
+
+#[cfg(feature = "std")]
+#[tokio::test]
+async fn async_recv_buffer_too_small_maps_to_thincan_error_kind() {
+    #[derive(Debug, Default)]
+    struct DummyAsync;
+
+    impl can_isotp_interface::IsoTpAsyncEndpoint for DummyAsync {
+        type Error = thincan::Error;
+
+        async fn send(
+            &mut self,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
+            Ok(())
+        }
+
+        async fn recv_one<Cb>(
+            &mut self,
+            _timeout: Duration,
+            _on_payload: Cb,
+        ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
+        where
+            Cb: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
+        {
+            Ok(can_isotp_interface::RecvStatus::TimedOut)
+        }
+    }
+
+    impl can_isotp_interface::IsoTpAsyncEndpointRecvInto for DummyAsync {
+        type Error = thincan::Error;
+
+        async fn recv_one_into(
+            &mut self,
+            _timeout: Duration,
+            out: &mut [u8],
+        ) -> Result<can_isotp_interface::RecvIntoStatus, can_isotp_interface::RecvError<Self::Error>>
+        {
+            Err(can_isotp_interface::RecvError::BufferTooSmall {
+                needed: out.len() + 1,
+                got: out.len(),
+            })
+        }
+    }
+
+    let mut tx = [0u8; 64];
+    let mut iface = thincan::Interface::new(DummyAsync, maplet_unhandled::Router::new(), &mut tx);
+    let mut handlers = maplet_unhandled::HandlersImpl {
+        app: AppHandlers::default(),
+        demo_bundle: BundleHandlers::default(),
+    };
+    let mut rx = [0u8; 8];
+    let err = iface
+        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::BufferTooSmall { .. }));
 }
 
 #[cfg(feature = "async")]
