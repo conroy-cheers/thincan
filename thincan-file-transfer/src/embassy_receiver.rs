@@ -10,8 +10,8 @@ use heapless::Vec;
 
 use crate::{AsyncFileStore, Atlas, Error, PendingAck, ReceiverConfig, schema};
 
-/// Inbound events produced by the synchronous `thincan` dispatch callback and consumed by the async
-/// receiver task.
+/// Inbound events produced by an ingress layer (e.g. a `thincan` dispatch callback or async
+/// bundle handler) and consumed by the async receiver task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundEvent<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize> {
     FileReq {
@@ -50,7 +50,8 @@ pub type InboundQueue<
 
 pub type OutboundAckQueue<M, ReplyTo, const DEPTH: usize> = Channel<M, AckToSend<ReplyTo>, DEPTH>;
 
-/// Synchronous ingest helper for `thincan` dispatch callbacks.
+/// Ingest helper for environments where you can't `await` during dispatch (e.g. `DispatchEvent`
+/// callbacks).
 ///
 /// This exists so your receive loop can enqueue file-transfer messages without needing access to
 /// the async store or receiver worker task.

@@ -63,7 +63,7 @@ pub fn decode_file_ack<'a>(
 
 /// Tokio watch-based ack mailbox.
 ///
-/// This is designed to be updated from synchronous dispatch handlers via [`AckInbox::push`].
+/// This is designed to be updated from dispatch handlers via [`AckInbox::push`].
 #[derive(Clone, Debug)]
 pub struct AckInbox {
     tx: watch::Sender<SeqAck>,

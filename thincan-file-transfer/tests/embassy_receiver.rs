@@ -21,6 +21,29 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
+thincan_file_transfer::file_transfer_bundle! {
+    pub mod ft_bundle(atlas) {}
+}
+
+thincan::bus_maplet! {
+    pub mod ft_maplet: atlas {
+        reply_to: u8;
+        bundles [ft_bundle];
+        parser: thincan::DefaultParser;
+        use msgs [FileReq, FileChunk, FileAck];
+        handles {}
+        unhandled_by_default = true;
+        ignore [];
+    }
+}
+
+#[derive(Default)]
+struct NoApp;
+
+impl<'a> ft_maplet::Handlers<'a> for NoApp {
+    type Error = core::convert::Infallible;
+}
+
 #[derive(Debug, Default)]
 struct MemStore {
     slow_offset: Option<u32>,
@@ -381,4 +404,63 @@ async fn ingress_returns_err_when_queue_is_full() {
     let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"");
     let raw = thincan::decode_wire(&payload).unwrap();
     assert!(ingestor.try_ingest_thincan_raw(reply_to, raw).is_err());
+}
+
+#[tokio::test]
+async fn bundle_ingress_backpressures_when_queue_is_full() {
+    use thincan::RouterDispatch;
+
+    type ReplyTo = u8;
+    const MAX_METADATA: usize = 16;
+    const MAX_CHUNK: usize = 8;
+    const IN_DEPTH: usize = 1;
+
+    let inbound: thincan_file_transfer::InboundQueue<
+        NoopRawMutex,
+        ReplyTo,
+        MAX_METADATA,
+        MAX_CHUNK,
+        IN_DEPTH,
+    > = Channel::new();
+
+    let mut router = ft_maplet::Router::new();
+    let mut handlers = ft_maplet::HandlersImpl {
+        app: NoApp,
+        ft_bundle: ft_bundle::ReceiverIngressHandlers::new(&inbound),
+    };
+
+    let mut tx_buf = [0u8; 512];
+    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
+
+    let transfer_id = 1u32;
+    let reply_to = 1u8;
+    let meta = thincan::RecvMeta { reply_to };
+
+    // Fill the inbound queue (depth=1).
+    let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"meta");
+    let raw = thincan::decode_wire(&payload).unwrap();
+    assert_eq!(
+        router.dispatch(&mut handlers, meta, raw).await.unwrap(),
+        thincan::DispatchOutcome::Handled
+    );
+
+    // Second dispatch must await on inbound queue send (backpressure).
+    let payload2 = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"meta");
+    let raw2 = thincan::decode_wire(&payload2).unwrap();
+
+    let mut dispatch_fut = core::pin::pin!(router.dispatch(&mut handlers, meta, raw2));
+    tokio::select! {
+        r = &mut dispatch_fut => {
+            r.unwrap();
+            panic!("dispatch unexpectedly completed while inbound queue was full");
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+
+    // Drain one event; this should unblock the pending dispatch.
+    let _first = inbound.receive().await;
+    let _ = dispatch_fut.await.unwrap();
+
+    // And the second event should now be enqueued.
+    let _second = inbound.receive().await;
 }
