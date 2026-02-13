@@ -71,8 +71,44 @@ pub enum SendError<E> {
 /// Error for a receive attempt.
 #[derive(Debug)]
 pub enum RecvError<E> {
+    /// Caller-provided buffer was too small to hold the received payload.
+    BufferTooSmall {
+        /// Needed payload length in bytes.
+        needed: usize,
+        /// Provided buffer length in bytes.
+        got: usize,
+    },
     /// Backend-specific error.
     Backend(E),
+}
+
+/// Result of a receive-into attempt (point-to-point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvIntoStatus {
+    /// No payload arrived before the timeout elapsed.
+    TimedOut,
+    /// One payload was delivered into the provided buffer.
+    DeliveredOne {
+        /// Number of payload bytes written into the output buffer.
+        len: usize,
+    },
+}
+
+/// Result of a receive-into attempt (multi-peer with reply-to metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvMetaIntoStatus<A>
+where
+    A: Copy,
+{
+    /// No payload arrived before the timeout elapsed.
+    TimedOut,
+    /// One payload was delivered into the provided buffer.
+    DeliveredOne {
+        /// Reply-to metadata (sender identity).
+        meta: RecvMeta<A>,
+        /// Number of payload bytes written into the output buffer.
+        len: usize,
+    },
 }
 
 /// Point-to-point ISO-TP endpoint.
@@ -121,6 +157,23 @@ pub trait IsoTpAsyncEndpoint {
         Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>;
 }
 
+/// Async point-to-point ISO-TP endpoint (recv-into API).
+///
+/// This is an alternative to [`IsoTpAsyncEndpoint::recv_one`] that avoids callbacks by copying
+/// the received payload into a caller-provided buffer. This shape is required for higher-level
+/// protocols that need to `await` during dispatch/handling (e.g. async file I/O backpressure).
+pub trait IsoTpAsyncEndpointRecvInto {
+    /// Backend-specific error type.
+    type Error;
+
+    /// Receive at most one payload and copy it into `out`.
+    async fn recv_one_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvIntoStatus, RecvError<Self::Error>>;
+}
+
 /// Async multi-peer ISO-TP endpoint with reply-to metadata.
 ///
 /// This is the async equivalent of [`IsoTpEndpointMeta`].
@@ -146,6 +199,24 @@ pub trait IsoTpAsyncEndpointMeta {
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
         Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Self::Error>;
+}
+
+/// Async multi-peer ISO-TP endpoint with reply-to metadata (recv-into API).
+///
+/// This is an alternative to [`IsoTpAsyncEndpointMeta::recv_one_meta`] that avoids callbacks by
+/// copying the received payload into a caller-provided buffer.
+pub trait IsoTpAsyncEndpointMetaRecvInto {
+    /// Backend-specific error type.
+    type Error;
+    /// Reply-to address type.
+    type ReplyTo: Copy;
+
+    /// Receive at most one payload and copy it into `out`.
+    async fn recv_one_meta_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvMetaIntoStatus<Self::ReplyTo>, RecvError<Self::Error>>;
 }
 
 /// Multi-peer ISO-TP endpoint with reply-to metadata.
