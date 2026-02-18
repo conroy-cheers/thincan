@@ -1,0 +1,19 @@
+[package]
+name = "thincan-log"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc", "thincan/std"]
+embassy = ["dep:embassy-sync", "thincan/async", "thincan/isotp-uds"]
+
+[dependencies]
+capnp = { version = "0.25.0", default-features = false, features = ["unaligned"] }
+embassy-sync = { version = "0.6", optional = true }
+can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0" }
+thincan = { path = "../thincan", default-features = false, features = ["capnp"] }
+
+[build-dependencies]
+capnpc = "0.25.0"

@@ -265,11 +265,10 @@ where
                 kind: thincan::ErrorKind::Other,
             })?;
 
+        let offer = file_offer::<A>(transfer_id, total_len_u32, max_chunk_u32, &[]);
+        let offer_ref = offer.as_slice();
         iface
-            .send_encoded_async::<A::FileReq, _>(
-                &file_offer::<A>(transfer_id, total_len_u32, max_chunk_u32, &[]),
-                timeout,
-            )
+            .send_encoded_async::<A::FileReq, _>(&offer_ref, timeout)
             .await?;
 
         let accept = loop {
@@ -306,11 +305,10 @@ where
                 let offset = next_to_send as usize;
                 let end = (offset + chunk_size).min(total_len);
                 let data = &bytes[offset..end];
+                let chunk = file_chunk::<A>(transfer_id, next_to_send, data);
+                let chunk_ref = chunk.as_slice();
                 iface
-                    .send_encoded_async::<A::FileChunk, _>(
-                        &file_chunk::<A>(transfer_id, next_to_send, data),
-                        timeout,
-                    )
+                    .send_encoded_async::<A::FileChunk, _>(&chunk_ref, timeout)
                     .await?;
                 in_flight.push_back(next_to_send);
                 next_to_send = next_to_send

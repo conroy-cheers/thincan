@@ -40,6 +40,18 @@ pub struct AckToSend<ReplyTo> {
     pub ack: PendingAck,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverOutcome {
+    None,
+    Completed { transfer_id: u32, total_len: u32 },
+}
+
+#[derive(Debug)]
+pub struct ReceiverError<E> {
+    pub transfer_id: u32,
+    pub error: Error<E>,
+}
+
 pub type InboundQueue<
     M,
     ReplyTo,
@@ -200,6 +212,7 @@ where
     file_metadata: Vec<u8, MAX_METADATA>,
     handle: S::WriteHandle,
     received: Vec<(u32, u32), MAX_RANGES>,
+    last_ack_offset: u32,
 }
 
 /// Async, no-alloc receiver for file transfers.
@@ -289,8 +302,15 @@ where
         ReceiverIngress::new(self.inbound)
     }
 
-    /// Process exactly one inbound event, performing async store I/O and emitting any resulting ack.
-    pub async fn process_one(&mut self) -> Result<(), Error<S::Error>> {
+    /// Transfer ID for the currently in-progress transfer (if any).
+    pub fn in_progress_transfer_id(&self) -> Option<u32> {
+        self.in_progress.as_ref().map(|ip| ip.transfer_id)
+    }
+
+    /// Process one inbound event, returning a completion outcome when a transfer finishes.
+    pub async fn process_one_with_outcome(
+        &mut self,
+    ) -> Result<ReceiverOutcome, ReceiverError<S::Error>> {
         let ev = self.inbound.receive().await;
         match ev {
             InboundEvent::FileReq {
@@ -311,7 +331,7 @@ where
                         error: schema::FileAckError::InvalidRequest,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 if let Some(in_progress) = self.in_progress.take() {
@@ -334,7 +354,7 @@ where
                         error: schema::FileAckError::ChunkSizeTooLarge,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 let negotiated_chunk_size = match (receiver_max, sender_max_chunk_size) {
@@ -353,7 +373,7 @@ where
                         error: schema::FileAckError::ChunkSizeTooSmall,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 if negotiated_chunk_size > receiver_max {
@@ -365,7 +385,7 @@ where
                         error: schema::FileAckError::ChunkSizeTooLarge,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 let mut meta_vec: Vec<u8, MAX_METADATA> = Vec::new();
@@ -377,10 +397,16 @@ where
                     .store
                     .begin_write(transfer_id, total_len)
                     .await
-                    .map_err(Error::Store)?;
+                    .map_err(|e| ReceiverError {
+                        transfer_id,
+                        error: Error::Store(e),
+                    })?;
 
                 if total_len == 0 {
-                    self.store.commit(handle).await.map_err(Error::Store)?;
+                    self.store.commit(handle).await.map_err(|e| ReceiverError {
+                        transfer_id,
+                        error: Error::Store(e),
+                    })?;
                 } else {
                     self.in_progress = Some(InProgress {
                         reply_to,
@@ -390,6 +416,7 @@ where
                         file_metadata: meta_vec,
                         handle,
                         received: Vec::new(),
+                        last_ack_offset: 0,
                     });
                 }
 
@@ -401,7 +428,15 @@ where
                     error: schema::FileAckError::None,
                 };
                 self.acks.send(AckToSend { reply_to, ack }).await;
-                Ok(())
+
+                if total_len == 0 {
+                    Ok(ReceiverOutcome::Completed {
+                        transfer_id,
+                        total_len,
+                    })
+                } else {
+                    Ok(ReceiverOutcome::None)
+                }
             }
             InboundEvent::FileChunk {
                 reply_to,
@@ -420,7 +455,7 @@ where
                         error: schema::FileAckError::InvalidRequest,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 };
 
                 if in_progress.reply_to != reply_to || in_progress.transfer_id != transfer_id {
@@ -434,7 +469,7 @@ where
                         error: schema::FileAckError::InvalidRequest,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 if data_overflow {
@@ -448,7 +483,7 @@ where
                         error: schema::FileAckError::ChunkSizeTooLarge,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 let data_len = (data_len as usize).min(MAX_CHUNK);
@@ -465,19 +500,22 @@ where
                         error: schema::FileAckError::ChunkSizeTooLarge,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 let remaining = in_progress.total_len.saturating_sub(offset);
                 if remaining == 0 {
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
                 let chunk_len = (data_len as u32).min(remaining) as usize;
                 self.store
                     .write_at(&mut in_progress.handle, offset, &data[..chunk_len])
                     .await
-                    .map_err(Error::Store)?;
+                    .map_err(|e| ReceiverError {
+                        transfer_id,
+                        error: Error::Store(e),
+                    })?;
 
                 if insert_received_range::<MAX_RANGES>(
                     &mut in_progress.received,
@@ -496,43 +534,90 @@ where
                         error: schema::FileAckError::Internal,
                     };
                     self.acks.send(AckToSend { reply_to, ack }).await;
-                    return Ok(());
+                    return Ok(ReceiverOutcome::None);
                 }
 
-                let mut next_offset = 0u32;
-                if in_progress.received.first().is_some_and(|r| r.0 == 0) {
-                    next_offset = in_progress.received[0].1.min(in_progress.total_len);
-                }
+                let (ack, should_ack, completed) = {
+                    let mut next_offset = 0u32;
+                    if in_progress.received.first().is_some_and(|r| r.0 == 0) {
+                        next_offset = in_progress.received[0].1.min(in_progress.total_len);
+                    }
 
-                let mut ack = PendingAck {
-                    transfer_id,
-                    kind: schema::FileAckKind::Ack,
-                    next_offset,
-                    chunk_size: 0,
-                    error: schema::FileAckError::None,
-                };
-
-                if in_progress.received.len() == 1
-                    && in_progress.received[0].0 == 0
-                    && in_progress.received[0].1 >= in_progress.total_len
-                {
-                    let in_progress = self.in_progress.take().unwrap();
-                    self.store
-                        .commit(in_progress.handle)
-                        .await
-                        .map_err(Error::Store)?;
-                    ack = PendingAck {
+                    let mut ack = PendingAck {
                         transfer_id,
-                        kind: schema::FileAckKind::Complete,
-                        next_offset: in_progress.total_len,
+                        kind: schema::FileAckKind::Ack,
+                        next_offset,
                         chunk_size: 0,
                         error: schema::FileAckError::None,
                     };
+
+                    let completed = in_progress.received.len() == 1
+                        && in_progress.received[0].0 == 0
+                        && in_progress.received[0].1 >= in_progress.total_len;
+                    if completed {
+                        ack = PendingAck {
+                            transfer_id,
+                            kind: schema::FileAckKind::Complete,
+                            next_offset: in_progress.total_len,
+                            chunk_size: 0,
+                            error: schema::FileAckError::None,
+                        };
+                    }
+
+                    let mut should_ack = true;
+                    if ack.kind == schema::FileAckKind::Ack {
+                        let ack_every_bytes = self.config.receiver.ack_every_bytes;
+                        if ack_every_bytes != 0 {
+                            let progress = next_offset.saturating_sub(in_progress.last_ack_offset);
+                            if progress < ack_every_bytes {
+                                should_ack = false;
+                            }
+                        }
+                    }
+
+                    if should_ack && ack.kind == schema::FileAckKind::Ack {
+                        in_progress.last_ack_offset = ack.next_offset;
+                    }
+
+                    (ack, should_ack, completed)
+                };
+
+                let completed_outcome = if completed {
+                    let in_progress = self.in_progress.take().unwrap();
+                    let total_len = in_progress.total_len;
+                    self.store
+                        .commit(in_progress.handle)
+                        .await
+                        .map_err(|e| ReceiverError {
+                            transfer_id,
+                            error: Error::Store(e),
+                        })?;
+                    Some(total_len)
+                } else {
+                    None
+                };
+
+                if should_ack {
+                    self.acks.send(AckToSend { reply_to, ack }).await;
                 }
 
-                self.acks.send(AckToSend { reply_to, ack }).await;
-                Ok(())
+                if let Some(total_len) = completed_outcome {
+                    Ok(ReceiverOutcome::Completed {
+                        transfer_id,
+                        total_len,
+                    })
+                } else {
+                    Ok(ReceiverOutcome::None)
+                }
             }
+        }
+    }
+
+    /// Process exactly one inbound event, performing async store I/O and emitting any resulting ack.
+    pub async fn process_one(&mut self) -> Result<(), Error<S::Error>> {
+        match self.process_one_with_outcome().await {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err.error),
         }
     }
 }
@@ -566,4 +651,61 @@ fn insert_received_range<const N: usize>(
         .insert(i, (merged_start, merged_end))
         .map_err(|_| ())?;
     Ok(())
+}
+
+pub async fn run_receiver_task_from_app<
+    A,
+    App,
+    M,
+    ReplyTo,
+    const MAX_METADATA: usize,
+    const MAX_RANGES: usize,
+    const MAX_CHUNK: usize,
+    const IN_DEPTH: usize,
+    const ACK_DEPTH: usize,
+>(
+    app: &mut App,
+) -> !
+where
+    A: Atlas,
+    M: RawMutex,
+    ReplyTo: Copy + PartialEq,
+    App: crate::FileTransferReceiverApp
+        + crate::FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+    App::Store: AsyncFileStore,
+    App::InboundQueue:
+        core::ops::Deref<Target = InboundQueue<M, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH>>,
+    App::AckOutboundQueue: core::ops::Deref<Target = OutboundAckQueue<M, ReplyTo, ACK_DEPTH>>,
+{
+    let inbound = app.inbound_queue();
+    let acks = app.ack_outbound_queue();
+    let store = app.receiver_store();
+
+    let mut rx = ReceiverNoAlloc::<
+        A,
+        _,
+        M,
+        ReplyTo,
+        MAX_METADATA,
+        MAX_RANGES,
+        MAX_CHUNK,
+        IN_DEPTH,
+        ACK_DEPTH,
+    >::new(store, &*inbound, &*acks);
+    rx.set_config(app.receiver_config());
+
+    loop {
+        match rx.process_one_with_outcome().await {
+            Ok(ReceiverOutcome::Completed {
+                transfer_id,
+                total_len,
+            }) => {
+                app.on_receive_complete(transfer_id, total_len);
+            }
+            Ok(ReceiverOutcome::None) => {}
+            Err(err) => {
+                app.on_receive_error(err.transfer_id, err.error);
+            }
+        }
+    }
 }

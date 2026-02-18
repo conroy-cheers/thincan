@@ -15,6 +15,7 @@ use embedded_can_interface::{AsyncRxFrameIo, AsyncTxFrameIo};
 use crate::RxFlowControl;
 use crate::async_io::AsyncRuntime;
 use crate::config::IsoTpConfig;
+use crate::demux::rx_storages_from_buffers;
 use crate::errors::{IsoTpError, TimeoutKind};
 use crate::pdu::{
     FlowStatus, Pdu, decode_with_offset, duration_to_st_min, encode_with_prefix_sized,
@@ -22,6 +23,36 @@ use crate::pdu::{
 };
 use crate::rx::{RxMachine, RxOutcome, RxStorage};
 use crate::timer::Clock;
+
+#[cfg(feature = "defmt")]
+use defmt::{debug, warn};
+
+#[cfg(not(feature = "defmt"))]
+macro_rules! debug {
+    ($($t:tt)*) => {};
+}
+#[cfg(not(feature = "defmt"))]
+macro_rules! warn {
+    ($($t:tt)*) => {};
+}
+
+fn flow_status_str(status: FlowStatus) -> &'static str {
+    match status {
+        FlowStatus::ClearToSend => "cts",
+        FlowStatus::Wait => "wait",
+        FlowStatus::Overflow => "overflow",
+    }
+}
+
+fn timeout_kind_str(kind: TimeoutKind) -> &'static str {
+    match kind {
+        TimeoutKind::NAs => "N_As",
+        TimeoutKind::NAr => "N_Ar",
+        TimeoutKind::NBs => "N_Bs",
+        TimeoutKind::NBr => "N_Br",
+        TimeoutKind::NCs => "N_Cs",
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PendingFc {
@@ -154,6 +185,19 @@ where
         })
     }
 
+    /// Create a demux with borrowed RX buffers (one per peer).
+    pub fn with_borrowed_rx_buffers<const L: usize>(
+        tx: Tx,
+        rx: Rx,
+        base_cfg: IsoTpConfig,
+        clock: C,
+        local_addr: u8,
+        bufs: &'a mut [[u8; L]; MAX_PEERS],
+    ) -> Result<Self, IsoTpError<()>> {
+        let storages = rx_storages_from_buffers(bufs);
+        Self::new(tx, rx, base_cfg, clock, local_addr, storages)
+    }
+
     /// Enable reception of functional-addressing frames (`0x18DB_TA_SA`) for `functional_addr`.
     pub fn with_functional_addr(mut self, functional_addr: u8) -> Self {
         self.functional_addr = Some(functional_addr);
@@ -218,6 +262,90 @@ where
         peer.rx_ready = false;
         deliver(reply_to, data);
         Some(())
+    }
+
+    async fn pump_rx<R: AsyncRuntime>(
+        &mut self,
+        rt: &R,
+        global_start: C::Instant,
+        global_timeout: Duration,
+        max_frames: usize,
+    ) -> Result<(), IsoTpError<Tx::Error>> {
+        for _ in 0..max_frames {
+            let _remaining = remaining(global_timeout, self.clock.elapsed(global_start))
+                .ok_or(IsoTpError::Timeout(TimeoutKind::NAs))?;
+            match self
+                .recv_frame_with_timeout(rt, Duration::from_micros(1))
+                .await
+            {
+                Ok(Some(frame)) => {
+                    if let Some((remote, status, bs, st)) = self.ingest_frame(&frame)? {
+                        let _ = self
+                            .send_flow_control(rt, global_start, global_timeout, remote, status, bs, st)
+                            .await;
+                    }
+                }
+                Ok(None) => break,
+                Err(IsoTpError::LinkError(err)) => {
+                    warn!("isotp rx link-error kind=N_Ar");
+                    return Err(IsoTpError::LinkError(err));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_with_rx<R: AsyncRuntime>(
+        &mut self,
+        rt: &R,
+        global_start: C::Instant,
+        global_timeout: Duration,
+        kind: TimeoutKind,
+        duration: Duration,
+    ) -> Result<(), IsoTpError<Tx::Error>> {
+        if duration.is_zero() {
+            return Ok(());
+        }
+
+        let wait_start = self.clock.now();
+        loop {
+            let elapsed_wait = self.clock.elapsed(wait_start);
+            if elapsed_wait >= duration {
+                return Ok(());
+            }
+            let remaining_wait = duration - elapsed_wait;
+            let remaining_global = remaining(global_timeout, self.clock.elapsed(global_start))
+                .ok_or(IsoTpError::Timeout(kind))?;
+            let global_tighter = remaining_global <= remaining_wait;
+            let wait_for = if global_tighter {
+                remaining_global
+            } else {
+                remaining_wait
+            };
+
+            match self.recv_frame_with_timeout(rt, wait_for).await {
+                Ok(Some(frame)) => {
+                    if let Some((remote, status, bs, st)) = self.ingest_frame(&frame)? {
+                        let _ = self
+                            .send_flow_control(rt, global_start, global_timeout, remote, status, bs, st)
+                            .await;
+                    }
+                }
+                Ok(None) => {
+                    if global_tighter {
+                        warn!("isotp rx timeout kind={}", timeout_kind_str(kind));
+                        return Err(IsoTpError::Timeout(kind));
+                    }
+                    return Ok(());
+                }
+                Err(IsoTpError::LinkError(err)) => {
+                    warn!("isotp rx link-error kind={}", timeout_kind_str(kind));
+                    return Err(IsoTpError::LinkError(err));
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn ingest_frame(
@@ -288,6 +416,9 @@ where
 
         let pdu = decode_with_offset(frame.data(), cfg.rx_pci_offset())
             .map_err(|_| IsoTpError::InvalidFrame)?;
+        if let Pdu::FirstFrame { len, .. } = pdu {
+            debug!("isotp rx ff remote={} len={}", source, len);
+        }
 
         if kind == Uds29Kind::Functional && !matches!(pdu, Pdu::SingleFrame { .. }) {
             return Ok(None);
@@ -309,16 +440,36 @@ where
             _ => {
                 let outcome = match peer.rx_machine.on_pdu(&cfg, &self.rx_flow_control, pdu) {
                     Ok(o) => o,
-                    Err(IsoTpError::Overflow) => return Err(IsoTpError::RxOverflow),
+                    Err(IsoTpError::Overflow) => {
+                        peer.rx_machine.reset();
+                        peer.rx_ready = false;
+                        return Err(IsoTpError::RxOverflow);
+                    }
                     Err(IsoTpError::UnexpectedPdu) => return Ok(None),
-                    Err(IsoTpError::BadSequence) => return Err(IsoTpError::BadSequence),
-                    Err(IsoTpError::InvalidFrame) => return Err(IsoTpError::InvalidFrame),
+                    Err(IsoTpError::BadSequence) => {
+                        peer.rx_machine.reset();
+                        peer.rx_ready = false;
+                        return Err(IsoTpError::BadSequence);
+                    }
+                    Err(IsoTpError::InvalidFrame) => {
+                        peer.rx_machine.reset();
+                        peer.rx_ready = false;
+                        return Err(IsoTpError::InvalidFrame);
+                    }
                     Err(IsoTpError::InvalidConfig) => return Err(IsoTpError::InvalidConfig),
                     Err(IsoTpError::Timeout(kind)) => return Err(IsoTpError::Timeout(kind)),
                     Err(IsoTpError::WouldBlock) => return Err(IsoTpError::WouldBlock),
-                    Err(IsoTpError::RxOverflow) => return Err(IsoTpError::RxOverflow),
+                    Err(IsoTpError::RxOverflow) => {
+                        peer.rx_machine.reset();
+                        peer.rx_ready = false;
+                        return Err(IsoTpError::RxOverflow);
+                    }
                     Err(IsoTpError::NotIdle) => return Err(IsoTpError::NotIdle),
-                    Err(IsoTpError::LinkError(_)) => return Err(IsoTpError::InvalidFrame),
+                    Err(IsoTpError::LinkError(_)) => {
+                        peer.rx_machine.reset();
+                        peer.rx_ready = false;
+                        return Err(IsoTpError::InvalidFrame);
+                    }
                 };
 
                 match outcome {
@@ -350,6 +501,13 @@ where
         block_size: u8,
         st_min: u8,
     ) -> Result<(), IsoTpError<Tx::Error>> {
+        debug!(
+            "isotp fc tx remote={} status={} bs={} st_min=0x{:02x}",
+            remote,
+            flow_status_str(status),
+            block_size,
+            st_min
+        );
         let cfg = self.cfg_for_peer(remote);
         let fc = Pdu::FlowControl {
             status,
@@ -394,8 +552,14 @@ where
             remaining(timeout, self.clock.elapsed(start)).ok_or(IsoTpError::Timeout(kind))?;
         match rt.timeout(remaining, self.tx.send(frame)).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(IsoTpError::LinkError(err)),
-            Err(_) => Err(IsoTpError::Timeout(kind)),
+            Ok(Err(err)) => {
+                warn!("isotp tx link-error kind={}", timeout_kind_str(kind));
+                Err(IsoTpError::LinkError(err))
+            }
+            Err(_) => {
+                warn!("isotp tx timeout kind={}", timeout_kind_str(kind));
+                Err(IsoTpError::Timeout(kind))
+            }
         }
     }
 
@@ -408,10 +572,21 @@ where
     ) -> Result<F, IsoTpError<Tx::Error>> {
         let remaining =
             remaining(timeout, self.clock.elapsed(start)).ok_or(IsoTpError::Timeout(kind))?;
-        match rt.timeout(remaining, self.rx.recv()).await {
-            Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(err)) => Err(IsoTpError::LinkError(err)),
-            Err(_) => Err(IsoTpError::Timeout(kind)),
+        match self.recv_frame_with_timeout(rt, remaining).await {
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => {
+                if kind != TimeoutKind::NAr {
+                    warn!("isotp rx timeout kind={}", timeout_kind_str(kind));
+                }
+                Err(IsoTpError::Timeout(kind))
+            }
+            Err(IsoTpError::LinkError(err)) => {
+                if kind != TimeoutKind::NAr {
+                    warn!("isotp rx link-error kind={}", timeout_kind_str(kind));
+                }
+                Err(IsoTpError::LinkError(err))
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -426,6 +601,7 @@ where
     ) -> Result<(u8, Duration, u8), IsoTpError<Tx::Error>> {
         loop {
             if self.clock.elapsed(fc_start) >= self.base_cfg.n_bs {
+                warn!("isotp fc timeout kind=N_Bs remote={}", remote);
                 return Err(IsoTpError::Timeout(TimeoutKind::NBs));
             }
 
@@ -433,6 +609,13 @@ where
                 if let Some(peer) = self.peers[peer_idx].as_mut()
                     && let Some(fc) = peer.pending_fc.take()
                 {
+                    debug!(
+                        "isotp fc rx remote={} status={} bs={} st_min=0x{:02x}",
+                        remote,
+                        flow_status_str(fc.status),
+                        fc.block_size,
+                        fc.st_min
+                    );
                     match fc.status {
                         FlowStatus::ClearToSend => {
                             let cfg = self.cfg_for_peer(remote);
@@ -447,12 +630,20 @@ where
                         FlowStatus::Wait => {
                             wait_count = wait_count.saturating_add(1);
                             if wait_count > self.base_cfg.wft_max {
+                                warn!(
+                                    "isotp fc wait overflow remote={} count={}",
+                                    remote,
+                                    wait_count
+                                );
                                 return Err(IsoTpError::Timeout(TimeoutKind::NBs));
                             }
                             fc_start = self.clock.now();
                             continue;
                         }
-                        FlowStatus::Overflow => return Err(IsoTpError::Overflow),
+                        FlowStatus::Overflow => {
+                            warn!("isotp fc overflow remote={}", remote);
+                            return Err(IsoTpError::Overflow);
+                        }
                     }
                 }
             }
@@ -462,15 +653,21 @@ where
                 .ok_or(IsoTpError::Timeout(TimeoutKind::NAs))?;
             let wait_for = fc_remaining.min(global_remaining);
 
-            let frame = match rt.timeout(wait_for, self.rx.recv()).await {
-                Ok(Ok(f)) => f,
-                Ok(Err(err)) => return Err(IsoTpError::LinkError(err)),
-                Err(_) => {
+            let frame = match self.recv_frame_with_timeout(rt, wait_for).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
                     if global_remaining <= fc_remaining {
+                        warn!("isotp fc timeout kind=N_As remote={}", remote);
                         return Err(IsoTpError::Timeout(TimeoutKind::NAs));
                     }
+                    warn!("isotp fc timeout kind=N_Bs remote={}", remote);
                     return Err(IsoTpError::Timeout(TimeoutKind::NBs));
                 }
+                Err(IsoTpError::LinkError(err)) => {
+                    warn!("isotp fc rx link-error remote={}", remote);
+                    return Err(IsoTpError::LinkError(err));
+                }
+                Err(err) => return Err(err),
             };
 
             if let Some((remote, status, bs, st)) = self.ingest_frame(&frame)? {
@@ -478,6 +675,18 @@ where
                     .send_flow_control(rt, global_start, global_timeout, remote, status, bs, st)
                     .await;
             }
+        }
+    }
+
+    async fn recv_frame_with_timeout<R: AsyncRuntime>(
+        &mut self,
+        rt: &R,
+        wait_for: Duration,
+    ) -> Result<Option<F>, IsoTpError<Tx::Error>> {
+        match rt.timeout(wait_for, self.rx.recv()).await {
+            Ok(Ok(frame)) => Ok(Some(frame)),
+            Ok(Err(err)) => Err(IsoTpError::LinkError(err)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -524,17 +733,31 @@ where
         let frame =
             encode_with_prefix_sized(cfg.tx_id, &pdu, cfg.padding, cfg.tx_addr, cfg.frame_len)
                 .map_err(|_| IsoTpError::InvalidFrame)?;
+        debug!("isotp tx ff start remote={} len={}", remote, payload.len());
         self.send_frame(rt, start, timeout, TimeoutKind::NAs, &frame)
             .await?;
+        debug!("isotp tx ff remote={} len={}", remote, payload.len());
 
         let fc_start = self.clock.now();
         let (mut block_size, mut st_min, mut wait_count) = self
             .wait_for_flow_control(rt, start, timeout, remote, fc_start, 0)
             .await?;
+        debug!(
+            "isotp tx fc remote={} bs={} st_min_us={}",
+            remote,
+            block_size,
+            st_min.as_micros().min(u128::from(u64::MAX)) as u64
+        );
         let mut block_remaining = block_size;
 
         let mut last_cf_sent: Option<C::Instant> = None;
         while offset < payload.len() {
+            // Opportunistically drain pending RX frames so FC responses don't stall.
+            // If `st_min` enforces pacing, `wait_with_rx` will service RX during that delay.
+            if st_min.is_zero() {
+                self.pump_rx(rt, start, timeout, 4).await?;
+            }
+
             if block_size > 0 && block_remaining == 0 {
                 let fc_start = self.clock.now();
                 let (new_bs, new_st_min, new_wait_count) = self
@@ -551,8 +774,14 @@ where
                 let elapsed = self.clock.elapsed(sent_at);
                 if elapsed < st_min {
                     let wait_for = st_min - elapsed;
-                    sleep_or_timeout(&self.clock, rt, start, timeout, TimeoutKind::NAs, wait_for)
-                        .await?;
+                    self.wait_with_rx(
+                        rt,
+                        start,
+                        timeout,
+                        TimeoutKind::NAs,
+                        wait_for,
+                    )
+                    .await?;
                 }
             }
 
@@ -567,6 +796,12 @@ where
                     .map_err(|_| IsoTpError::InvalidFrame)?;
             self.send_frame(rt, start, timeout, TimeoutKind::NAs, &frame)
                 .await?;
+
+            // Drain pending frames after each CF only when block-sized pacing is active to
+            // avoid throttling sustained transfers with redundant RX polls.
+            if block_size > 0 {
+                self.pump_rx(rt, start, timeout, 2).await?;
+            }
 
             last_cf_sent = Some(self.clock.now());
             offset += chunk;

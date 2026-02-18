@@ -105,7 +105,7 @@
 //!
 //! # Feature flags
 //! - `std` (default): enables `std::error::Error` and `Display` for [`Error`].
-//! - `capnp`: enables Cap'n Proto decode helpers (`Capnp` / `CapnpTyped`).
+//! - `capnp`: enables Cap'n Proto helpers (`Capnp` / `CapnpTyped`) and builder wrappers.
 //! - `isotp-uds`: enables UDS 29-bit ISO-TP demux transport helpers (reply-to metadata).
 //!
 //! # More examples
@@ -120,6 +120,9 @@
 #![doc = "```"]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(async_fn_in_trait)]
+
+#[cfg(feature = "capnp")]
+pub mod capnp;
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -277,11 +280,11 @@ impl<'a, Schema> CapnpTyped<'a, Schema> {
     /// Read the typed root with the provided reader options.
     pub fn with_root<R>(
         &self,
-        options: capnp::message::ReaderOptions,
-        f: impl FnOnce(<Schema as capnp::traits::Owned>::Reader<'_>) -> R,
-    ) -> Result<R, capnp::Error>
+        options: ::capnp::message::ReaderOptions,
+        f: impl FnOnce(<Schema as ::capnp::traits::Owned>::Reader<'_>) -> R,
+    ) -> Result<R, ::capnp::Error>
     where
-        Schema: capnp::traits::Owned,
+        Schema: ::capnp::traits::Owned,
     {
         self.0.with_root::<Schema, R>(options, f)
     }
@@ -297,11 +300,11 @@ impl<'a> Capnp<'a> {
     /// Construct a `capnp::message::Reader` over a single segment.
     pub fn with_reader<R>(
         &self,
-        options: capnp::message::ReaderOptions,
-        f: impl FnOnce(capnp::message::Reader<&[&[u8]]>) -> R,
+        options: ::capnp::message::ReaderOptions,
+        f: impl FnOnce(::capnp::message::Reader<&[&[u8]]>) -> R,
     ) -> R {
         let segments: [&[u8]; 1] = [self.bytes];
-        let reader = capnp::message::Reader::new(&segments[..], options);
+        let reader = ::capnp::message::Reader::new(&segments[..], options);
         f(reader)
     }
 
@@ -309,14 +312,14 @@ impl<'a> Capnp<'a> {
     /// Read the typed root with the provided reader options.
     pub fn with_root<O, R>(
         &self,
-        options: capnp::message::ReaderOptions,
-        f: impl FnOnce(<O as capnp::traits::Owned>::Reader<'_>) -> R,
-    ) -> Result<R, capnp::Error>
+        options: ::capnp::message::ReaderOptions,
+        f: impl FnOnce(<O as ::capnp::traits::Owned>::Reader<'_>) -> R,
+    ) -> Result<R, ::capnp::Error>
     where
-        O: capnp::traits::Owned,
+        O: ::capnp::traits::Owned,
     {
         self.with_reader(options, |reader| {
-            let typed = capnp::message::TypedReader::<_, O>::new(reader);
+            let typed = ::capnp::message::TypedReader::<_, O>::new(reader);
             let root = typed.get()?;
             Ok(f(root))
         })
@@ -591,6 +594,137 @@ pub enum RecvDispatchKind {
     Unknown,
 }
 
+/// Outbound bus work participant that can opportunistically send queued messages before a receive.
+///
+/// Implement this for bundle-specific outbound drains (for example: file-transfer acks, log
+/// forwarding) so application bus loops can compose multiple bundles without owning their transport
+/// internals.
+pub trait BusParticipant<Iface> {
+    async fn drain_outbound(&mut self, iface: &mut Iface) -> Result<(), Error>;
+}
+
+impl<Iface> BusParticipant<Iface> for () {
+    async fn drain_outbound(&mut self, _iface: &mut Iface) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Bundle handler hook for exposing outbound bus work to maplet runtimes.
+///
+/// Bundle handlers that have no outbound work should return `()`.
+pub trait BundleOutbound<Iface> {
+    type Outbound;
+
+    fn take_outbound(&mut self) -> Self::Outbound;
+}
+
+impl<Iface> BundleOutbound<Iface> for () {
+    type Outbound = ();
+
+    fn take_outbound(&mut self) -> Self::Outbound {}
+}
+
+/// Internal helper trait for draining one or more [`BusParticipant`] values.
+pub trait BusParticipants<Iface> {
+    async fn drain_all(&mut self, iface: &mut Iface) -> Result<(), Error>;
+}
+
+impl<Iface> BusParticipants<Iface> for () {
+    async fn drain_all(&mut self, _iface: &mut Iface) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+macro_rules! impl_bus_participants_tuple {
+    ($($name:ident),+) => {
+        impl<Iface, $($name),+> BusParticipants<Iface> for ($($name,)+)
+        where
+            $($name: BusParticipant<Iface>,)+
+        {
+            async fn drain_all(&mut self, iface: &mut Iface) -> Result<(), Error> {
+                #[allow(non_snake_case)]
+                let ($($name,)+) = self;
+                $(
+                    $name.drain_outbound(iface).await?;
+                )+
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_bus_participants_tuple!(A);
+impl_bus_participants_tuple!(A, B);
+impl_bus_participants_tuple!(A, B, C);
+impl_bus_participants_tuple!(A, B, C, D);
+impl_bus_participants_tuple!(A, B, C, D, E);
+impl_bus_participants_tuple!(A, B, C, D, E, F);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_bus_participants_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+
+/// Source of actor commands for [`BusActor`].
+///
+/// Implementations are expected to be non-blocking: `try_recv` should return `Err(())` when no
+/// command is currently available.
+pub trait BusCommandSource {
+    type Command;
+
+    fn try_recv(&mut self) -> Result<Self::Command, ()>;
+}
+
+impl BusCommandSource for () {
+    type Command = core::convert::Infallible;
+
+    fn try_recv(&mut self) -> Result<Self::Command, ()> {
+        Err(())
+    }
+}
+
+/// Handler for commands consumed by [`BusActor`].
+pub trait BusCommandHandler<Iface, Handlers, Command> {
+    async fn handle_command(
+        &mut self,
+        iface: &mut Iface,
+        handlers: &mut Handlers,
+        command: Command,
+    ) -> Result<(), Error>;
+}
+
+/// No-op command source used when a bus actor has no external command ingress.
+pub struct NoopBusCommandSource;
+
+impl BusCommandSource for NoopBusCommandSource {
+    type Command = core::convert::Infallible;
+
+    fn try_recv(&mut self) -> Result<Self::Command, ()> {
+        Err(())
+    }
+}
+
+/// No-op command handler used when a bus actor has no external command ingress.
+pub struct NoopBusCommandHandler;
+
+impl<Iface, Handlers> BusCommandHandler<Iface, Handlers, core::convert::Infallible>
+    for NoopBusCommandHandler
+{
+    async fn handle_command(
+        &mut self,
+        _iface: &mut Iface,
+        _handlers: &mut Handlers,
+        command: core::convert::Infallible,
+    ) -> Result<(), Error> {
+        match command {}
+    }
+}
+
 /// High-level interface that couples a transport node and a generated maplet router.
 ///
 /// This interface is designed to be allocation-free: callers supply a TX scratch buffer and
@@ -801,6 +935,159 @@ where
     }
 }
 
+/// Run one composed bus step:
+/// 1) drain outbound work,
+/// 2) receive+dispatch one inbound frame.
+#[cfg(feature = "isotp-uds")]
+pub async fn run_composed_bus_step_with_meta<
+    Node,
+    Router,
+    TxBuf,
+    Handlers,
+    Parts,
+    const RX: usize,
+>(
+    iface: &mut Interface<Node, Router, TxBuf>,
+    handlers: &mut Handlers,
+    timeout: Duration,
+    rx_buf: &mut [u8; RX],
+    outbound: &mut Parts,
+) -> Result<RecvDispatch, Error>
+where
+    Node: can_isotp_interface::IsoTpAsyncEndpointMeta
+        + can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+            ReplyTo = <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        >,
+    Router:
+        RouterDispatch<Handlers, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
+    TxBuf: AsMut<[u8]>,
+    Parts: BusParticipants<Interface<Node, Router, TxBuf>>,
+{
+    outbound.drain_all(iface).await?;
+    iface
+        .recv_one_dispatch_with_meta_async(handlers, timeout, rx_buf, |_| Ok(()))
+        .await
+}
+
+/// Stateful bus runtime helper that owns receive scratch and outbound-drain state.
+///
+/// This keeps bus loops concise by avoiding repeated `rx_buf` / outbound-work arguments on every
+/// step.
+pub struct BusRuntime<Outbound, const RX: usize> {
+    rx_buf: [u8; RX],
+    outbound: Outbound,
+}
+
+impl<Outbound, const RX: usize> BusRuntime<Outbound, RX> {
+    pub const fn new(rx_buf: [u8; RX], outbound: Outbound) -> Self {
+        Self { rx_buf, outbound }
+    }
+
+    pub fn rx_buf_mut(&mut self) -> &mut [u8; RX] {
+        &mut self.rx_buf
+    }
+
+    pub fn outbound_mut(&mut self) -> &mut Outbound {
+        &mut self.outbound
+    }
+
+    #[cfg(feature = "isotp-uds")]
+    pub async fn step_with_meta<Node, Router, TxBuf, Handlers>(
+        &mut self,
+        iface: &mut Interface<Node, Router, TxBuf>,
+        handlers: &mut Handlers,
+        timeout: Duration,
+    ) -> Result<RecvDispatch, Error>
+    where
+        Node: can_isotp_interface::IsoTpAsyncEndpointMeta
+            + can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                ReplyTo = <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+            >,
+        Router: RouterDispatch<Handlers, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
+        TxBuf: AsMut<[u8]>,
+        Outbound: BusParticipants<Interface<Node, Router, TxBuf>>,
+    {
+        run_composed_bus_step_with_meta(
+            iface,
+            handlers,
+            timeout,
+            &mut self.rx_buf,
+            &mut self.outbound,
+        )
+        .await
+    }
+}
+
+/// Single-owner bus actor.
+///
+/// The actor owns:
+/// - receive scratch + outbound participants via [`BusRuntime`],
+/// - a command source (`Commands`), and
+/// - a command handler (`CommandHandler`).
+///
+/// `step_with_meta` always drains all pending commands before performing one recv+dispatch step.
+pub struct BusActor<Outbound, Commands, CommandHandler, const RX: usize> {
+    runtime: BusRuntime<Outbound, RX>,
+    commands: Commands,
+    command_handler: CommandHandler,
+}
+
+impl<Outbound, Commands, CommandHandler, const RX: usize>
+    BusActor<Outbound, Commands, CommandHandler, RX>
+{
+    pub const fn new(
+        runtime: BusRuntime<Outbound, RX>,
+        commands: Commands,
+        command_handler: CommandHandler,
+    ) -> Self {
+        Self {
+            runtime,
+            commands,
+            command_handler,
+        }
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut BusRuntime<Outbound, RX> {
+        &mut self.runtime
+    }
+
+    pub fn commands_mut(&mut self) -> &mut Commands {
+        &mut self.commands
+    }
+
+    pub fn command_handler_mut(&mut self) -> &mut CommandHandler {
+        &mut self.command_handler
+    }
+
+    #[cfg(feature = "isotp-uds")]
+    pub async fn step_with_meta<Node, Router, TxBuf, Handlers>(
+        &mut self,
+        iface: &mut Interface<Node, Router, TxBuf>,
+        handlers: &mut Handlers,
+        timeout: Duration,
+    ) -> Result<RecvDispatch, Error>
+    where
+        Node: can_isotp_interface::IsoTpAsyncEndpointMeta
+            + can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                ReplyTo = <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+            >,
+        Router:
+            RouterDispatch<Handlers, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
+        TxBuf: AsMut<[u8]>,
+        Outbound: BusParticipants<Interface<Node, Router, TxBuf>>,
+        Commands: BusCommandSource,
+        CommandHandler:
+            BusCommandHandler<Interface<Node, Router, TxBuf>, Handlers, Commands::Command>,
+    {
+        while let Ok(command) = self.commands.try_recv() {
+            self.command_handler
+                .handle_command(iface, handlers, command)
+                .await?;
+        }
+        self.runtime.step_with_meta(iface, handlers, timeout).await
+    }
+}
+
 impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
     Node: can_isotp_interface::IsoTpAsyncEndpoint + can_isotp_interface::IsoTpAsyncEndpointRecvInto,
@@ -919,10 +1206,7 @@ where
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<
-            Handlers,
-            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
-        >,
+        Router: RouterDispatch<Handlers, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
         Ev: for<'a> FnMut(
             DispatchEventMeta<'a, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
         ) -> Result<(), Error>,
@@ -970,10 +1254,7 @@ where
         rx: &mut [u8],
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<
-            Handlers,
-            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
-        >,
+        Router: RouterDispatch<Handlers, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
     {
         self.recv_one_dispatch_with_meta_async(handlers, timeout, rx, |_| Ok(()))
             .await
@@ -1511,6 +1792,70 @@ macro_rules! bus_maplet {
                     #[doc = concat!("Handlers for bundle `", stringify!($bundle), "`.")]
                     pub $bundle: $bundle,
                 )*
+            }
+
+            impl<App, $($bundle),*> HandlersImpl<App, $($bundle),*> {
+                /// Move outbound bus work out of bundle handlers.
+                ///
+                /// Bundle handlers with no outbound bus work yield `()`.
+                pub fn take_bundle_outbound<Iface>(
+                    &mut self,
+                ) -> (
+                    $(<$bundle as $crate::BundleOutbound<Iface>>::Outbound,)*
+                )
+                where
+                    $($bundle: $crate::BundleOutbound<Iface>,)*
+                {
+                    (
+                        $($crate::BundleOutbound::take_outbound(&mut self.$bundle),)*
+                    )
+                }
+
+                /// Build a [`$crate::BusRuntime`] from this maplet's bundle handlers.
+                ///
+                /// This collects outbound bus work from all bundles once and stores it in the
+                /// runtime, so app loops only provide `iface`, `handlers`, and a timeout.
+                pub fn bus_runtime<Iface, const RX: usize>(
+                    &mut self,
+                    rx_buf: [u8; RX],
+                ) -> $crate::BusRuntime<
+                    (
+                        $(<$bundle as $crate::BundleOutbound<Iface>>::Outbound,)*
+                    ),
+                    RX,
+                >
+                where
+                    $($bundle: $crate::BundleOutbound<Iface>,)*
+                {
+                    $crate::BusRuntime::new(rx_buf, self.take_bundle_outbound::<Iface>())
+                }
+
+                /// Build a [`$crate::BusActor`] from this maplet's bundle handlers.
+                ///
+                /// This stores outbound work, command ingress, and command handling state in one
+                /// object while preserving single-owner access to the interface.
+                pub fn bus_actor<Iface, Commands, CommandHandler, const RX: usize>(
+                    &mut self,
+                    rx_buf: [u8; RX],
+                    commands: Commands,
+                    command_handler: CommandHandler,
+                ) -> $crate::BusActor<
+                    (
+                        $(<$bundle as $crate::BundleOutbound<Iface>>::Outbound,)*
+                    ),
+                    Commands,
+                    CommandHandler,
+                    RX,
+                >
+                where
+                    $($bundle: $crate::BundleOutbound<Iface>,)*
+                {
+                    $crate::BusActor::new(
+                        self.bus_runtime::<Iface, RX>(rx_buf),
+                        commands,
+                        command_handler,
+                    )
+                }
             }
 
             impl<'a, App, $($bundle),*> Handlers<'a> for HandlersImpl<App, $($bundle),*>

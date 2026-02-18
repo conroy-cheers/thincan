@@ -222,6 +222,7 @@ async fn receiver_cumulative_ack_only_advances_when_contiguous() {
     receiver.set_config(thincan_file_transfer::ReceiverNoAllocConfig {
         receiver: ReceiverConfig {
             max_chunk_size: MAX_CHUNK as u32,
+            ack_every_bytes: 0,
         },
     });
 

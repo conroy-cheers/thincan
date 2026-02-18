@@ -152,7 +152,8 @@ impl<'a> RxMachine<'a> {
         data: &[u8],
     ) -> Result<RxOutcome, IsoTpError<()>> {
         if self.state != RxState::Idle {
-            return Err(IsoTpError::UnexpectedPdu);
+            // Resync on a new single-frame message.
+            self.reset();
         }
         let len = len as usize;
         if len > cfg.max_payload_len || len > data.len() || len > self.buffer.capacity() {
@@ -171,7 +172,8 @@ impl<'a> RxMachine<'a> {
         data: &[u8],
     ) -> Result<RxOutcome, IsoTpError<()>> {
         if self.state != RxState::Idle {
-            return Err(IsoTpError::UnexpectedPdu);
+            // Sender restarted mid-transfer; drop the partial and accept the new FF.
+            self.reset();
         }
         let len = len as usize;
         if len > cfg.max_payload_len || len > self.buffer.capacity() {

@@ -88,6 +88,8 @@ pub mod async_node;
 pub mod config;
 #[cfg(feature = "uds")]
 pub mod demux;
+#[cfg(feature = "uds")]
+pub mod helpers;
 pub mod errors;
 #[cfg(feature = "isotp-interface")]
 mod interface_impl;
@@ -104,6 +106,8 @@ pub use async_node::IsoTpAsyncNode;
 pub use config::IsoTpConfig;
 #[cfg(feature = "uds")]
 pub use demux::{IsoTpDemux, rx_storages_from_buffers};
+#[cfg(feature = "uds")]
+pub use helpers::Uds29AsyncDemuxBuilder;
 pub use errors::{IsoTpError, TimeoutKind};
 #[cfg(feature = "isotp-interface")]
 pub use interface_impl::AsyncWithRt;

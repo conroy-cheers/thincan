@@ -44,19 +44,20 @@ fn rx_machine_reports_errors_for_unexpected_or_overflow_pdus() {
     let mut buf = [0u8; 2];
     let mut rx = RxMachine::new(RxStorage::Borrowed(&mut buf));
 
-    // SingleFrame while not idle.
+    // SingleFrame while not idle should resync and accept the new single frame.
     rx.state = RxState::Receiving;
-    assert!(matches!(
-        rx.on_pdu(
+    let out = rx
+        .on_pdu(
             &cfg,
             &rx_fc,
             Pdu::SingleFrame {
                 len: 1,
-                data: &[0x00]
-            }
-        ),
-        Err(IsoTpError::UnexpectedPdu)
-    ));
+                data: &[0x00],
+            },
+        )
+        .unwrap();
+    assert!(matches!(out, RxOutcome::Completed(1)));
+    assert_eq!(rx.take_completed(), &[0x00]);
 
     // SingleFrame overflow (len > capacity).
     rx.state = RxState::Idle;
@@ -72,19 +73,19 @@ fn rx_machine_reports_errors_for_unexpected_or_overflow_pdus() {
         Err(IsoTpError::Overflow)
     ));
 
-    // FirstFrame while not idle.
+    // FirstFrame while not idle should resync and accept the new transfer.
     rx.state = RxState::Receiving;
-    assert!(matches!(
-        rx.on_pdu(
+    let out = rx
+        .on_pdu(
             &cfg,
             &rx_fc,
             Pdu::FirstFrame {
                 len: 2,
-                data: &[0x00; 6]
-            }
-        ),
-        Err(IsoTpError::UnexpectedPdu)
-    ));
+                data: &[0x00; 6],
+            },
+        )
+        .unwrap();
+    assert!(matches!(out, RxOutcome::SendFlowControl { .. }));
 
     // ConsecutiveFrame while not receiving.
     rx.state = RxState::Idle;

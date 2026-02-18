@@ -9,6 +9,7 @@ members = [
   "embedded-can/embedded-can-unix-socket",
   "iso-tp/linux-socketcan-iso-tp",
   "thincan",
+  "thincan-log",
   "examples/thincan-example",
   "thincan-file-transfer",
 ]

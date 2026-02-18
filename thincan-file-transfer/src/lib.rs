@@ -50,7 +50,7 @@
 //! // ft::file_transfer_bundle! { pub mod file_transfer(atlas) {} }
 //! // thincan::bus_maplet! { pub mod maplet: atlas { reply_to: ReplyTo; bundles [file_transfer]; parser: thincan::DefaultParser; use msgs [FileReq, FileChunk, FileAck]; handles {} unhandled_by_default = true; ignore []; } }
 //! // let mut handlers = maplet::HandlersImpl { app: MyApp, file_transfer: file_transfer::ReceiverIngressHandlers::new(&INBOUND) };
-//! 
+//!
 //! // Worker task: do async storage I/O and emit acks after writes complete.
 //! let mut rx = ft::ReceiverNoAlloc::<MyAtlas, MyStore, NoopRawMutex, ReplyTo, MAX_METADATA, 32, MAX_CHUNK, IN_DEPTH, ACK_DEPTH>::new(
 //!     MyStore::new(),
@@ -77,22 +77,22 @@
 //! outbound ack queue, and your application is responsible for encoding and sending those acks
 //! to the correct `reply_to` address.
 //!
-//! With `--features heapless` you can encode Cap'n Proto bodies without allocation:
+//! With `thincan`'s `capnp` feature you can encode Cap'n Proto bodies without allocation:
 //! ```rust,ignore
-//! # use thincan_file_transfer as ft;
-//! # let mut scratch = ft::CapnpScratch::<8>::new();
-//! # let mut out = [0u8; ft::file_ack_max_encoded_len()];
-//! # let ack: ft::AckToSend<u8> = todo!();
-//! let used = ft::encode_file_ack_into(
-//!     &mut scratch,
-//!     ack.ack.transfer_id,
-//!     ack.ack.kind,
-//!     ack.ack.next_offset,
-//!     ack.ack.chunk_size,
-//!     ack.ack.error,
-//!     &mut out,
-//! )?;
-//! // Send `&out[..used]` as the body of your bus's `FileAck` message to `ack.reply_to`.
+//! use thincan_file_transfer as ft;
+//! # use my_bus::atlas;
+//! let mut scratch_buf = [0u8; ft::capnp_scratch_words_for_bytes(ft::file_ack_max_encoded_len()) * 8];
+//! let mut scratch = thincan::capnp::CapnpScratchRef::new(&mut scratch_buf);
+//! let ack: ft::AckToSend<u8> = todo!();
+//! let value = scratch.builder_value::<atlas::FileAck, ft::schema::file_ack::Owned, _>(|root| {
+//!     root.set_transfer_id(ack.ack.transfer_id);
+//!     root.set_kind(ack.ack.kind);
+//!     root.set_next_offset(ack.ack.next_offset);
+//!     root.set_chunk_size(ack.ack.chunk_size);
+//!     root.set_error(ack.ack.error);
+//!     Ok(())
+//! });
+//! // Send `value` as the body of your bus's `FileAck` message to `ack.reply_to`.
 //! # Ok::<(), thincan::Error>(())
 //! ```
 //!
@@ -114,13 +114,80 @@ extern crate alloc;
 #[doc(hidden)]
 pub use capnp;
 
+#[cfg(feature = "embassy")]
+#[doc(hidden)]
+pub use can_isotp_interface;
 /// Re-exported for use by macros (`file_transfer_bundle!`) without requiring downstream crates to
 /// depend on `embassy-sync` directly.
 #[cfg(feature = "embassy")]
 #[doc(hidden)]
 pub use embassy_sync;
 
-use core::marker::PhantomData;
+#[cfg(feature = "embassy")]
+impl<'a, M, T, const DEPTH: usize> AsyncEnqueue<T>
+    for &'a embassy_sync::channel::Channel<M, T, DEPTH>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    async fn send(&self, msg: T) {
+        embassy_sync::channel::Channel::send(*self, msg).await;
+    }
+
+    fn try_send(&self, msg: T) -> Result<(), ()> {
+        embassy_sync::channel::Channel::try_send(*self, msg).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<'a, M, T, const DEPTH: usize> AsyncDequeue<T>
+    for &'a embassy_sync::channel::Channel<M, T, DEPTH>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    async fn recv(&mut self) -> T {
+        embassy_sync::channel::Channel::receive(*self).await
+    }
+
+    fn try_recv(&mut self) -> Result<T, ()> {
+        embassy_sync::channel::Channel::try_receive(*self).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<Node, Router, TxBuf, ReplyTo> FileTransferTx<ReplyTo>
+    for thincan::Interface<Node, Router, TxBuf>
+where
+    Node: can_isotp_interface::IsoTpAsyncEndpointMeta<ReplyTo = ReplyTo>,
+    TxBuf: AsMut<[u8]>,
+{
+    async fn send_encoded<M: thincan::Message, V: thincan::Encode<M>>(
+        &mut self,
+        to: ReplyTo,
+        value: &V,
+        timeout: core::time::Duration,
+    ) -> Result<(), thincan::Error> {
+        self.send_encoded_to_async(to, value, timeout).await
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<'a, Mtx, Node, Router, TxBuf, ReplyTo> FileTransferTx<ReplyTo>
+    for &'a embassy_sync::mutex::Mutex<Mtx, thincan::Interface<Node, Router, TxBuf>>
+where
+    Mtx: embassy_sync::blocking_mutex::raw::RawMutex,
+    Node: can_isotp_interface::IsoTpAsyncEndpointMeta<ReplyTo = ReplyTo>,
+    TxBuf: AsMut<[u8]>,
+{
+    async fn send_encoded<M: thincan::Message, V: thincan::Encode<M>>(
+        &mut self,
+        to: ReplyTo,
+        value: &V,
+        timeout: core::time::Duration,
+    ) -> Result<(), thincan::Error> {
+        let mut guard = self.lock().await;
+        guard.send_encoded_to_async(to, value, timeout).await
+    }
+}
 
 capnp::generated_code!(pub mod file_transfer_capnp);
 pub use file_transfer_capnp as schema;
@@ -148,6 +215,51 @@ pub const fn file_chunk_max_encoded_len(data_len: usize) -> usize {
     32 + capnp_padded_len(data_len)
 }
 
+/// Build an encoded `FileReq` body (tokio/alloc helper).
+#[cfg(feature = "tokio")]
+pub fn file_offer<A: Atlas>(
+    transfer_id: u32,
+    total_len: u32,
+    sender_max_chunk_size: u32,
+    metadata: &[u8],
+) -> alloc::vec::Vec<u8> {
+    let _ = core::marker::PhantomData::<A>;
+    build_single_segment_vec(file_offer_max_encoded_len(metadata.len()), |message| {
+        let mut root: schema::file_req::Builder<'_> = message.init_root();
+        root.set_transfer_id(transfer_id);
+        root.set_total_len(total_len);
+        root.set_sender_max_chunk_size(sender_max_chunk_size);
+        root.set_file_metadata(metadata);
+    })
+}
+
+/// Build an encoded `FileChunk` body (tokio/alloc helper).
+#[cfg(feature = "tokio")]
+pub fn file_chunk<A: Atlas>(transfer_id: u32, offset: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
+    let _ = core::marker::PhantomData::<A>;
+    build_single_segment_vec(file_chunk_max_encoded_len(data.len()), |message| {
+        let mut root: schema::file_chunk::Builder<'_> = message.init_root();
+        root.set_transfer_id(transfer_id);
+        root.set_offset(offset);
+        root.set_data(data);
+    })
+}
+
+#[cfg(feature = "tokio")]
+fn build_single_segment_vec(
+    max_len_bytes: usize,
+    build: impl FnOnce(&mut capnp::message::Builder<capnp::message::HeapAllocator>),
+) -> alloc::vec::Vec<u8> {
+    let words = capnp_scratch_words_for_bytes(max_len_bytes);
+    let mut message = capnp::message::Builder::new(
+        capnp::message::HeapAllocator::new().first_segment_words(words as u32),
+    );
+    build(&mut message);
+    let segments = message.get_segments_for_output();
+    debug_assert_eq!(segments.len(), 1);
+    segments[0].to_vec()
+}
+
 /// Upper bound for an encoded `FileAck` body (bytes).
 pub const fn file_ack_max_encoded_len() -> usize {
     24
@@ -166,11 +278,192 @@ pub struct ReceiverConfig {
     /// - `0` means "no limit / accept any size" (back-compat default).
     /// - Non-zero values cause oversize chunks to be rejected as a protocol error.
     pub max_chunk_size: u32,
+    /// Minimum number of bytes between consecutive `FileAck` updates.
+    ///
+    /// - `0` means "ack every processed chunk" (back-compat default).
+    /// - Non-zero values batch acknowledgements, reducing ack traffic.
+    pub ack_every_bytes: u32,
 }
 
 impl Default for ReceiverConfig {
     fn default() -> Self {
-        Self { max_chunk_size: 0 }
+        Self {
+            max_chunk_size: 0,
+            ack_every_bytes: 0,
+        }
+    }
+}
+
+/// Compile-time resource limits for no-alloc file transfer integration.
+///
+/// This bundles the key capacities into one type so applications can avoid scattering loose
+/// constants across queue declarations and helper invocations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Caps<
+    const MAX_METADATA: usize,
+    const MAX_CHUNK: usize,
+    const IN_DEPTH: usize,
+    const ACK_DEPTH: usize,
+    const WINDOW_CHUNKS: usize,
+    const MAX_RANGES: usize,
+>;
+
+impl<
+    const MAX_METADATA: usize,
+    const MAX_CHUNK: usize,
+    const IN_DEPTH: usize,
+    const ACK_DEPTH: usize,
+    const WINDOW_CHUNKS: usize,
+    const MAX_RANGES: usize,
+> Caps<MAX_METADATA, MAX_CHUNK, IN_DEPTH, ACK_DEPTH, WINDOW_CHUNKS, MAX_RANGES>
+{
+    pub const MAX_METADATA: usize = MAX_METADATA;
+    pub const MAX_CHUNK: usize = MAX_CHUNK;
+    pub const IN_DEPTH: usize = IN_DEPTH;
+    pub const ACK_DEPTH: usize = ACK_DEPTH;
+    pub const WINDOW_CHUNKS: usize = WINDOW_CHUNKS;
+    pub const MAX_RANGES: usize = MAX_RANGES;
+
+    pub const FILE_OFFER_MAX_BODY: usize = file_offer_max_encoded_len(0);
+    pub const FILE_CHUNK_MAX_BODY: usize = file_chunk_max_encoded_len(MAX_CHUNK);
+    pub const SENDER_SCRATCH_WORDS: usize = {
+        let max_body = if Self::FILE_CHUNK_MAX_BODY > Self::FILE_OFFER_MAX_BODY {
+            Self::FILE_CHUNK_MAX_BODY
+        } else {
+            Self::FILE_OFFER_MAX_BODY
+        };
+        capnp_scratch_words_for_bytes(max_body)
+    };
+    pub const SENDER_SCRATCH_BYTES: usize = Self::SENDER_SCRATCH_WORDS * 8;
+}
+
+/// Sender-side transport policy.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderPolicy {
+    pub send_timeout: core::time::Duration,
+    pub ack_timeout: core::time::Duration,
+    pub max_retries: usize,
+    pub sender_max_chunk_size: Option<usize>,
+}
+
+#[cfg(feature = "embassy")]
+impl Default for SenderPolicy {
+    fn default() -> Self {
+        let cfg = SenderNoAllocConfig::default();
+        Self {
+            send_timeout: cfg.send_timeout,
+            ack_timeout: cfg.ack_timeout,
+            max_retries: cfg.max_retries,
+            sender_max_chunk_size: None,
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl SenderPolicy {
+    pub fn apply_to(&self, mut config: SenderNoAllocConfig) -> SenderNoAllocConfig {
+        config.send_timeout = self.send_timeout;
+        config.ack_timeout = self.ack_timeout;
+        config.max_retries = self.max_retries;
+        config
+    }
+
+    pub fn sender_config(&self) -> SenderNoAllocConfig {
+        self.apply_to(SenderNoAllocConfig::default())
+    }
+}
+
+/// Receiver-side transport policy.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverPolicy {
+    pub receiver_max_chunk_size: u32,
+    pub ack_every_bytes: u32,
+    pub bus_recv_timeout: core::time::Duration,
+    pub ack_send_timeout: core::time::Duration,
+}
+
+#[cfg(feature = "embassy")]
+impl Default for ReceiverPolicy {
+    fn default() -> Self {
+        Self {
+            receiver_max_chunk_size: 0,
+            ack_every_bytes: 0,
+            bus_recv_timeout: core::time::Duration::from_millis(200),
+            ack_send_timeout: core::time::Duration::from_millis(200),
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl ReceiverPolicy {
+    pub fn apply_to(&self, mut config: ReceiverNoAllocConfig) -> ReceiverNoAllocConfig {
+        config.receiver.max_chunk_size = self.receiver_max_chunk_size;
+        config.receiver.ack_every_bytes = self.ack_every_bytes;
+        config
+    }
+
+    pub fn receiver_config(&self) -> ReceiverNoAllocConfig {
+        self.apply_to(ReceiverNoAllocConfig::default())
+    }
+}
+
+/// Full file-transfer profile for embedded applications.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileTransferProfile {
+    pub sender: SenderPolicy,
+    pub receiver: ReceiverPolicy,
+}
+
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileError {
+    SenderChunkSizeZero,
+    SenderChunkTooLarge { max_allowed: usize, got: usize },
+    ReceiverChunkTooLarge { max_allowed: usize, got: u32 },
+}
+
+#[cfg(feature = "embassy")]
+#[derive(Debug)]
+pub enum SenderFromProfileError {
+    Profile(ProfileError),
+    Thincan(thincan::Error),
+}
+
+#[cfg(feature = "embassy")]
+impl From<thincan::Error> for SenderFromProfileError {
+    fn from(value: thincan::Error) -> Self {
+        Self::Thincan(value)
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl FileTransferProfile {
+    pub fn validate<const MAX_CHUNK: usize>(&self) -> Result<(), ProfileError> {
+        if let Some(sender_chunk) = self.sender.sender_max_chunk_size {
+            if sender_chunk == 0 {
+                return Err(ProfileError::SenderChunkSizeZero);
+            }
+            if sender_chunk > MAX_CHUNK {
+                return Err(ProfileError::SenderChunkTooLarge {
+                    max_allowed: MAX_CHUNK,
+                    got: sender_chunk,
+                });
+            }
+        }
+
+        if self.receiver.receiver_max_chunk_size > MAX_CHUNK as u32
+            && self.receiver.receiver_max_chunk_size != 0
+        {
+            return Err(ProfileError::ReceiverChunkTooLarge {
+                max_allowed: MAX_CHUNK,
+                got: self.receiver.receiver_max_chunk_size,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -179,6 +472,425 @@ pub trait Atlas {
     type FileReq: thincan::Message;
     type FileChunk: thincan::Message;
     type FileAck: thincan::Message;
+}
+
+/// Async enqueue helper used by bundle handlers (runtime-agnostic).
+pub trait AsyncEnqueue<T> {
+    async fn send(&self, msg: T);
+    fn try_send(&self, msg: T) -> Result<(), ()>;
+}
+
+/// Async dequeue helper used by bus tasks (runtime-agnostic).
+pub trait AsyncDequeue<T> {
+    async fn recv(&mut self) -> T;
+    fn try_recv(&mut self) -> Result<T, ()>;
+}
+
+/// Async send helper for file-transfer senders (embassy-style).
+#[cfg(feature = "embassy")]
+pub trait FileTransferTx<ReplyTo> {
+    async fn send_encoded<M: thincan::Message, V: thincan::Encode<M>>(
+        &mut self,
+        to: ReplyTo,
+        value: &V,
+        timeout: core::time::Duration,
+    ) -> Result<(), thincan::Error>;
+}
+
+/// Sender-side file-transfer handlers (ack-only).
+pub trait FileTransferSenderHandlers<'a, ReplyTo> {
+    type Error;
+
+    async fn on_file_ack(
+        &mut self,
+        meta: thincan::RecvMeta<ReplyTo>,
+        msg: thincan::CapnpTyped<'a, schema::file_ack::Owned>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Receiver-side file-transfer handlers (req + chunk only).
+pub trait FileTransferReceiverHandlers<'a, ReplyTo> {
+    type Error;
+
+    async fn on_file_req(
+        &mut self,
+        meta: thincan::RecvMeta<ReplyTo>,
+        msg: thincan::CapnpTyped<'a, schema::file_req::Owned>,
+    ) -> Result<(), Self::Error>;
+
+    async fn on_file_chunk(
+        &mut self,
+        meta: thincan::RecvMeta<ReplyTo>,
+        msg: thincan::CapnpTyped<'a, schema::file_chunk::Owned>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Sender-side state access for file-transfer (ack inbox only).
+#[cfg(any(feature = "embassy", feature = "tokio"))]
+pub trait FileTransferSenderState {
+    type AckInboxQueue: AsyncEnqueue<Ack> + Clone;
+
+    fn ack_inbox_queue(&self) -> Self::AckInboxQueue;
+}
+
+/// Shared file-transfer queue state (runtime-agnostic).
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone)]
+pub struct FileTransferState<I, O, A> {
+    inbound: I,
+    ack_outbound: O,
+    ack_inbox: A,
+}
+
+#[cfg(feature = "embassy")]
+impl<I, O, A> FileTransferState<I, O, A> {
+    pub const fn new(inbound: I, ack_outbound: O, ack_inbox: A) -> Self {
+        Self {
+            inbound,
+            ack_outbound,
+            ack_inbox,
+        }
+    }
+
+    pub fn inbound_queue(&self) -> I
+    where
+        I: Clone,
+    {
+        self.inbound.clone()
+    }
+
+    pub fn ack_outbound_queue(&self) -> O
+    where
+        O: Clone,
+    {
+        self.ack_outbound.clone()
+    }
+
+    pub fn ack_inbox_queue(&self) -> A
+    where
+        A: Clone,
+    {
+        self.ack_inbox.clone()
+    }
+}
+
+/// File-transfer state access for apps (Embassy only).
+#[cfg(feature = "embassy")]
+pub trait HasFileTransferState<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize> {
+    type InboundQueue: AsyncEnqueue<InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>> + Clone;
+    type AckOutboundQueue: AsyncEnqueue<AckToSend<ReplyTo>> + Clone;
+    type AckInboxQueue: AsyncEnqueue<Ack> + Clone;
+
+    fn file_transfer_state(
+        &self,
+    ) -> &FileTransferState<Self::InboundQueue, Self::AckOutboundQueue, Self::AckInboxQueue>;
+}
+
+/// Receiver-side state access for file-transfer (inbound events + outbound acks).
+#[cfg(feature = "embassy")]
+pub trait FileTransferReceiverState<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize> {
+    type InboundQueue: AsyncEnqueue<InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>> + Clone;
+    type AckOutboundQueue: AsyncEnqueue<AckToSend<ReplyTo>> + Clone;
+
+    fn inbound_queue(&self) -> Self::InboundQueue;
+    fn ack_outbound_queue(&self) -> Self::AckOutboundQueue;
+}
+
+#[cfg(feature = "embassy")]
+impl<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize, I, O, A>
+    HasFileTransferState<ReplyTo, MAX_METADATA, MAX_CHUNK> for FileTransferState<I, O, A>
+where
+    I: AsyncEnqueue<InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>> + Clone,
+    O: AsyncEnqueue<AckToSend<ReplyTo>> + Clone,
+    A: AsyncEnqueue<Ack> + Clone,
+{
+    type InboundQueue = I;
+    type AckOutboundQueue = O;
+    type AckInboxQueue = A;
+
+    fn file_transfer_state(
+        &self,
+    ) -> &FileTransferState<Self::InboundQueue, Self::AckOutboundQueue, Self::AckInboxQueue> {
+        self
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<I, O, A> FileTransferSenderState for FileTransferState<I, O, A>
+where
+    A: AsyncEnqueue<Ack> + Clone,
+{
+    type AckInboxQueue = A;
+
+    fn ack_inbox_queue(&self) -> Self::AckInboxQueue {
+        FileTransferState::ack_inbox_queue(self)
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize, I, O, A>
+    FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK> for FileTransferState<I, O, A>
+where
+    I: AsyncEnqueue<InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>> + Clone,
+    O: AsyncEnqueue<AckToSend<ReplyTo>> + Clone,
+{
+    type InboundQueue = I;
+    type AckOutboundQueue = O;
+
+    fn inbound_queue(&self) -> Self::InboundQueue {
+        FileTransferState::inbound_queue(self)
+    }
+
+    fn ack_outbound_queue(&self) -> Self::AckOutboundQueue {
+        FileTransferState::ack_outbound_queue(self)
+    }
+}
+
+/// Convenience sender-side state wrapper.
+#[cfg(any(feature = "embassy", feature = "tokio"))]
+#[derive(Debug, Clone, Copy)]
+pub struct SenderQueues<Q> {
+    ack_inbox: Q,
+}
+
+#[cfg(any(feature = "embassy", feature = "tokio"))]
+impl<Q> SenderQueues<Q> {
+    pub const fn new(ack_inbox: Q) -> Self {
+        Self { ack_inbox }
+    }
+}
+
+#[cfg(any(feature = "embassy", feature = "tokio"))]
+impl<Q> FileTransferSenderState for SenderQueues<Q>
+where
+    Q: AsyncEnqueue<Ack> + Clone,
+{
+    type AckInboxQueue = Q;
+
+    fn ack_inbox_queue(&self) -> Self::AckInboxQueue {
+        self.ack_inbox.clone()
+    }
+}
+
+/// Convenience receiver-side state wrapper.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiverQueues<I, O> {
+    inbound: I,
+    ack_outbound: O,
+}
+
+#[cfg(feature = "embassy")]
+impl<I, O> ReceiverQueues<I, O> {
+    pub const fn new(inbound: I, ack_outbound: O) -> Self {
+        Self {
+            inbound,
+            ack_outbound,
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize, I, O>
+    FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK> for ReceiverQueues<I, O>
+where
+    I: AsyncEnqueue<InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>> + Clone,
+    O: AsyncEnqueue<AckToSend<ReplyTo>> + Clone,
+{
+    type InboundQueue = I;
+    type AckOutboundQueue = O;
+
+    fn inbound_queue(&self) -> Self::InboundQueue {
+        self.inbound.clone()
+    }
+
+    fn ack_outbound_queue(&self) -> Self::AckOutboundQueue {
+        self.ack_outbound.clone()
+    }
+}
+
+/// Embassy resources owned by the sender-side file-transfer bundle.
+///
+/// This keeps `AckInboxQueue` allocation inside the bundle crate so applications can hold one
+/// typed resource object instead of declaring queue statics directly.
+#[cfg(feature = "embassy")]
+pub struct SenderBundleResources<M, const ACK_DEPTH: usize>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    ack_inbox: AckInboxQueue<M, ACK_DEPTH>,
+}
+
+#[cfg(feature = "embassy")]
+impl<M, const ACK_DEPTH: usize> SenderBundleResources<M, ACK_DEPTH>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    pub const fn new() -> Self {
+        Self {
+            ack_inbox: embassy_sync::channel::Channel::new(),
+        }
+    }
+
+    pub fn ack_inbox_queue(&self) -> &AckInboxQueue<M, ACK_DEPTH> {
+        &self.ack_inbox
+    }
+
+    pub fn sender_state(&self) -> SenderQueues<&AckInboxQueue<M, ACK_DEPTH>> {
+        SenderQueues::new(self.ack_inbox_queue())
+    }
+}
+
+/// Embassy resources owned by the receiver-side file-transfer bundle.
+///
+/// This keeps inbound and ack-outbound queue allocation inside the bundle crate so applications
+/// can hold one typed resource object instead of declaring queue statics directly.
+#[cfg(feature = "embassy")]
+pub struct ReceiverBundleResources<
+    M,
+    ReplyTo,
+    const MAX_METADATA: usize,
+    const MAX_CHUNK: usize,
+    const IN_DEPTH: usize,
+    const ACK_DEPTH: usize,
+> where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+    ReplyTo: Copy,
+{
+    inbound: InboundQueue<M, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH>,
+    ack_outbound: OutboundAckQueue<M, ReplyTo, ACK_DEPTH>,
+}
+
+#[cfg(feature = "embassy")]
+impl<
+    M,
+    ReplyTo,
+    const MAX_METADATA: usize,
+    const MAX_CHUNK: usize,
+    const IN_DEPTH: usize,
+    const ACK_DEPTH: usize,
+> ReceiverBundleResources<M, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH, ACK_DEPTH>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+    ReplyTo: Copy,
+{
+    pub const fn new() -> Self {
+        Self {
+            inbound: embassy_sync::channel::Channel::new(),
+            ack_outbound: embassy_sync::channel::Channel::new(),
+        }
+    }
+
+    pub fn inbound_queue(
+        &self,
+    ) -> &InboundQueue<M, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH> {
+        &self.inbound
+    }
+
+    pub fn ack_outbound_queue(&self) -> &OutboundAckQueue<M, ReplyTo, ACK_DEPTH> {
+        &self.ack_outbound
+    }
+
+    pub fn receiver_state(
+        &self,
+    ) -> ReceiverQueues<
+        &InboundQueue<M, ReplyTo, MAX_METADATA, MAX_CHUNK, IN_DEPTH>,
+        &OutboundAckQueue<M, ReplyTo, ACK_DEPTH>,
+    > {
+        ReceiverQueues::new(self.inbound_queue(), self.ack_outbound_queue())
+    }
+}
+
+/// Concrete receiver runtime state: receiver queues + async store + receiver config.
+///
+/// This removes per-app trait boilerplate for the common case where an application only needs to
+/// provide state and optional hooks.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Clone)]
+pub struct ReceiverRuntimeState<Q, S, const MAX_RANGES: usize> {
+    queues: Q,
+    store: S,
+    receiver_cfg: ReceiverNoAllocConfig,
+}
+
+#[cfg(feature = "embassy")]
+impl<Q, S, const MAX_RANGES: usize> ReceiverRuntimeState<Q, S, MAX_RANGES> {
+    pub const MAX_RANGES: usize = MAX_RANGES;
+
+    pub const fn new(queues: Q, store: S, receiver_cfg: ReceiverNoAllocConfig) -> Self {
+        Self {
+            queues,
+            store,
+            receiver_cfg,
+        }
+    }
+
+    pub fn with_profile(
+        queues: Q,
+        store: S,
+        base_cfg: ReceiverNoAllocConfig,
+        profile: &FileTransferProfile,
+    ) -> Self {
+        Self {
+            queues,
+            store,
+            receiver_cfg: profile.receiver.apply_to(base_cfg),
+        }
+    }
+
+    pub fn queues(&self) -> Q
+    where
+        Q: Clone,
+    {
+        self.queues.clone()
+    }
+
+    pub fn store(&self) -> S
+    where
+        S: Clone,
+    {
+        self.store.clone()
+    }
+
+    pub const fn receiver_cfg(&self) -> ReceiverNoAllocConfig {
+        self.receiver_cfg
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize, Q, S, const MAX_RANGES: usize>
+    FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK>
+    for ReceiverRuntimeState<Q, S, MAX_RANGES>
+where
+    Q: FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+{
+    type InboundQueue = Q::InboundQueue;
+    type AckOutboundQueue = Q::AckOutboundQueue;
+
+    fn inbound_queue(&self) -> Self::InboundQueue {
+        self.queues.inbound_queue()
+    }
+
+    fn ack_outbound_queue(&self) -> Self::AckOutboundQueue {
+        self.queues.ack_outbound_queue()
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<Q, S, const MAX_RANGES: usize> FileTransferReceiverApp
+    for ReceiverRuntimeState<Q, S, MAX_RANGES>
+where
+    S: AsyncFileStore + Clone,
+{
+    type Store = S;
+
+    fn receiver_store(&self) -> Self::Store {
+        self.store.clone()
+    }
+
+    fn receiver_config(&self) -> ReceiverNoAllocConfig {
+        self.receiver_cfg
+    }
 }
 
 /// Async dependency required by the file-transfer bundle: a byte-addressable file store.
@@ -207,12 +919,183 @@ pub trait AsyncFileStore {
     async fn abort(&mut self, handle: Self::WriteHandle);
 }
 
+/// Sender-side application hooks (Embassy, no-alloc).
+#[cfg(feature = "embassy")]
+pub trait FileTransferSenderApp {
+    fn alloc_transfer_id(&mut self) -> u32;
+
+    fn sender_config(&self) -> SenderNoAllocConfig {
+        SenderNoAllocConfig::default()
+    }
+
+    fn sender_max_chunk_size(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Sender-side configuration hooks.
+#[cfg(feature = "embassy")]
+pub trait FileTransferSenderConfig {
+    fn sender_config(&self) -> SenderNoAllocConfig {
+        SenderNoAllocConfig::default()
+    }
+
+    fn sender_max_chunk_size(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<T> FileTransferSenderConfig for T
+where
+    T: FileTransferSenderApp,
+{
+    fn sender_config(&self) -> SenderNoAllocConfig {
+        <T as FileTransferSenderApp>::sender_config(self)
+    }
+
+    fn sender_max_chunk_size(&self) -> Option<usize> {
+        <T as FileTransferSenderApp>::sender_max_chunk_size(self)
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<I, O, A> FileTransferSenderConfig for FileTransferState<I, O, A> {}
+
+#[cfg(feature = "embassy")]
+impl FileTransferSenderConfig for SenderPolicy {
+    fn sender_config(&self) -> SenderNoAllocConfig {
+        SenderPolicy::sender_config(self)
+    }
+
+    fn sender_max_chunk_size(&self) -> Option<usize> {
+        self.sender_max_chunk_size
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl FileTransferSenderConfig for FileTransferProfile {
+    fn sender_config(&self) -> SenderNoAllocConfig {
+        self.sender.sender_config()
+    }
+
+    fn sender_max_chunk_size(&self) -> Option<usize> {
+        self.sender.sender_max_chunk_size
+    }
+}
+
+/// Receiver-side application hooks (Embassy, no-alloc).
+#[cfg(feature = "embassy")]
+pub trait FileTransferReceiverApp {
+    type Store: AsyncFileStore + Clone;
+
+    fn receiver_store(&self) -> Self::Store;
+
+    fn receiver_config(&self) -> ReceiverNoAllocConfig {
+        ReceiverNoAllocConfig::default()
+    }
+
+    fn on_receive_complete(&mut self, _transfer_id: u32, _total_len: u32) {}
+
+    fn on_receive_error(
+        &mut self,
+        _transfer_id: u32,
+        _err: Error<<Self::Store as AsyncFileStore>::Error>,
+    ) {
+    }
+}
+
 /// Errors produced by the file-transfer state machine.
 #[derive(Debug)]
 pub enum Error<E> {
     Store(E),
     Protocol,
     Capnp(capnp::Error),
+}
+
+#[cfg(feature = "embassy")]
+pub struct StoreRef<'a, S> {
+    store: &'a mut S,
+}
+
+#[cfg(feature = "embassy")]
+impl<'a, S> StoreRef<'a, S> {
+    pub fn new(store: &'a mut S) -> Self {
+        Self { store }
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<'a, S> AsyncFileStore for StoreRef<'a, S>
+where
+    S: AsyncFileStore,
+{
+    type Error = S::Error;
+    type WriteHandle = S::WriteHandle;
+
+    async fn begin_write(
+        &mut self,
+        transfer_id: u32,
+        total_len: u32,
+    ) -> Result<Self::WriteHandle, Self::Error> {
+        self.store.begin_write(transfer_id, total_len).await
+    }
+
+    async fn write_at(
+        &mut self,
+        handle: &mut Self::WriteHandle,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.store.write_at(handle, offset, bytes).await
+    }
+
+    async fn commit(&mut self, handle: Self::WriteHandle) -> Result<(), Self::Error> {
+        self.store.commit(handle).await
+    }
+
+    async fn abort(&mut self, handle: Self::WriteHandle) {
+        self.store.abort(handle).await
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl<'a, M, S> AsyncFileStore for &'a embassy_sync::mutex::Mutex<M, S>
+where
+    M: embassy_sync::blocking_mutex::raw::RawMutex,
+    S: AsyncFileStore,
+{
+    type Error = S::Error;
+    type WriteHandle = S::WriteHandle;
+
+    async fn begin_write(
+        &mut self,
+        transfer_id: u32,
+        total_len: u32,
+    ) -> Result<Self::WriteHandle, Self::Error> {
+        let mut guard = self.lock().await;
+        guard.begin_write(transfer_id, total_len).await
+    }
+
+    async fn write_at(
+        &mut self,
+        handle: &mut Self::WriteHandle,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        let mut guard = self.lock().await;
+        guard.write_at(handle, offset, bytes).await
+    }
+
+    async fn commit(&mut self, handle: Self::WriteHandle) -> Result<(), Self::Error> {
+        let mut guard = self.lock().await;
+        guard.commit(handle).await
+    }
+
+    async fn abort(&mut self, handle: Self::WriteHandle) {
+        let mut guard = self.lock().await;
+        guard.abort(handle).await
+    }
 }
 
 /// Ack message that the receiver side would like to emit.
@@ -225,158 +1108,32 @@ pub struct PendingAck {
     pub error: schema::FileAckError,
 }
 
-/// Value type used to encode a `FileReq` message for a specific atlas marker type `A`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileReqValue<A> {
-    pub transfer_id: u32,
-    pub total_len: u32,
-    _atlas: PhantomData<A>,
+/// Decode a `FileAck` body into `(transfer_id, kind, next_offset, chunk_size, error)`.
+pub fn decode_file_ack_fields<'a>(
+    msg: thincan::CapnpTyped<'a, schema::file_ack::Owned>,
+) -> Result<(u32, schema::FileAckKind, u32, u32, schema::FileAckError), thincan::Error> {
+    let (transfer_id, kind, next_offset, chunk_size, error) = msg
+        .with_root(capnp::message::ReaderOptions::default(), |root| {
+            (
+                root.get_transfer_id(),
+                root.get_kind(),
+                root.get_next_offset(),
+                root.get_chunk_size(),
+                root.get_error(),
+            )
+        })
+        .map_err(|_| thincan::Error {
+            kind: thincan::ErrorKind::Other,
+        })?;
+
+    let kind = kind.map_err(|_| thincan::Error {
+        kind: thincan::ErrorKind::Other,
+    })?;
+    let error = error.map_err(|_| thincan::Error {
+        kind: thincan::ErrorKind::Other,
+    })?;
+    Ok((transfer_id, kind, next_offset, chunk_size, error))
 }
-
-/// Value type used to encode a `FileReq` message including metadata and chunk negotiation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileOfferValue<'a, A> {
-    pub transfer_id: u32,
-    pub total_len: u32,
-    pub file_metadata: &'a [u8],
-    pub sender_max_chunk_size: u32,
-    _atlas: PhantomData<A>,
-}
-
-/// Value type used to encode a `FileChunk` message for a specific atlas marker type `A`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileChunkValue<'a, A> {
-    pub transfer_id: u32,
-    pub offset: u32,
-    pub data: &'a [u8],
-    _atlas: PhantomData<A>,
-}
-
-impl<A> FileReqValue<A> {
-    /// Construct a `FileReq` value.
-    pub fn new(transfer_id: u32, total_len: u32) -> Self {
-        Self {
-            transfer_id,
-            total_len,
-            _atlas: PhantomData,
-        }
-    }
-}
-
-/// Convenience constructor for [`FileReqValue`].
-pub fn file_req<A>(transfer_id: u32, total_len: u32) -> FileReqValue<A> {
-    FileReqValue::new(transfer_id, total_len)
-}
-
-impl<'a, A> FileOfferValue<'a, A> {
-    /// Construct a `FileReq` offer value.
-    pub fn new(
-        transfer_id: u32,
-        total_len: u32,
-        sender_max_chunk_size: u32,
-        file_metadata: &'a [u8],
-    ) -> Self {
-        Self {
-            transfer_id,
-            total_len,
-            file_metadata,
-            sender_max_chunk_size,
-            _atlas: PhantomData,
-        }
-    }
-}
-
-/// Convenience constructor for [`FileOfferValue`].
-pub fn file_offer<'a, A>(
-    transfer_id: u32,
-    total_len: u32,
-    sender_max_chunk_size: u32,
-    file_metadata: &'a [u8],
-) -> FileOfferValue<'a, A> {
-    FileOfferValue::new(transfer_id, total_len, sender_max_chunk_size, file_metadata)
-}
-
-impl<'a, A> FileChunkValue<'a, A> {
-    /// Construct a `FileChunk` value.
-    pub fn new(transfer_id: u32, offset: u32, data: &'a [u8]) -> Self {
-        Self {
-            transfer_id,
-            offset,
-            data,
-            _atlas: PhantomData,
-        }
-    }
-}
-
-/// Convenience constructor for [`FileChunkValue`].
-pub fn file_chunk<'a, A>(transfer_id: u32, offset: u32, data: &'a [u8]) -> FileChunkValue<'a, A> {
-    FileChunkValue::new(transfer_id, offset, data)
-}
-
-/// Value type used to encode a `FileAck` message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileAckValue<A> {
-    pub transfer_id: u32,
-    pub kind: schema::FileAckKind,
-    pub next_offset: u32,
-    pub chunk_size: u32,
-    pub error: schema::FileAckError,
-    _atlas: PhantomData<A>,
-}
-
-impl<A> FileAckValue<A> {
-    pub fn new(
-        transfer_id: u32,
-        kind: schema::FileAckKind,
-        next_offset: u32,
-        chunk_size: u32,
-        error: schema::FileAckError,
-    ) -> Self {
-        Self {
-            transfer_id,
-            kind,
-            next_offset,
-            chunk_size,
-            error,
-            _atlas: PhantomData,
-        }
-    }
-}
-
-pub fn file_ack_accept<A>(transfer_id: u32, chunk_size: u32) -> FileAckValue<A> {
-    FileAckValue::new(
-        transfer_id,
-        schema::FileAckKind::Accept,
-        0,
-        chunk_size,
-        schema::FileAckError::None,
-    )
-}
-
-pub fn file_ack_progress<A>(transfer_id: u32, next_offset: u32) -> FileAckValue<A> {
-    FileAckValue::new(
-        transfer_id,
-        schema::FileAckKind::Ack,
-        next_offset,
-        0,
-        schema::FileAckError::None,
-    )
-}
-
-pub fn file_ack_reject<A>(transfer_id: u32, error: schema::FileAckError) -> FileAckValue<A> {
-    FileAckValue::new(transfer_id, schema::FileAckKind::Reject, 0, 0, error)
-}
-
-#[cfg(feature = "alloc")]
-mod alloc_encode;
-
-#[cfg(feature = "heapless")]
-mod heapless_encode;
-#[cfg(feature = "heapless")]
-pub use heapless_encode::{
-    CapnpScratch, decode_file_ack_fields, encode_file_ack_into, encode_file_chunk_into,
-    encode_file_offer_into,
-};
 
 #[cfg(feature = "tokio")]
 mod tokio_impl;
@@ -385,13 +1142,177 @@ pub use tokio_impl::{
     Ack, AckInbox, AckStream, AsyncSendResult, AsyncSender, ack_channel, decode_file_ack,
 };
 
+#[cfg(feature = "tokio")]
+impl AsyncEnqueue<Ack> for AckInbox {
+    async fn send(&self, msg: Ack) {
+        self.push(msg);
+    }
+
+    fn try_send(&self, msg: Ack) -> Result<(), ()> {
+        self.push(msg);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T> AsyncEnqueue<T> for tokio::sync::mpsc::Sender<T> {
+    async fn send(&self, msg: T) {
+        let _ = tokio::sync::mpsc::Sender::send(self, msg).await;
+    }
+
+    fn try_send(&self, msg: T) -> Result<(), ()> {
+        tokio::sync::mpsc::Sender::try_send(self, msg).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T> AsyncEnqueue<T> for tokio::sync::mpsc::UnboundedSender<T> {
+    async fn send(&self, msg: T) {
+        let _ = tokio::sync::mpsc::UnboundedSender::send(self, msg);
+    }
+
+    fn try_send(&self, msg: T) -> Result<(), ()> {
+        tokio::sync::mpsc::UnboundedSender::send(self, msg).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T> AsyncDequeue<T> for tokio::sync::mpsc::Receiver<T> {
+    async fn recv(&mut self) -> T {
+        tokio::sync::mpsc::Receiver::recv(self)
+            .await
+            .expect("channel closed")
+    }
+
+    fn try_recv(&mut self) -> Result<T, ()> {
+        tokio::sync::mpsc::Receiver::try_recv(self).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T> AsyncDequeue<T> for tokio::sync::mpsc::UnboundedReceiver<T> {
+    async fn recv(&mut self) -> T {
+        tokio::sync::mpsc::UnboundedReceiver::recv(self)
+            .await
+            .expect("channel closed")
+    }
+
+    fn try_recv(&mut self) -> Result<T, ()> {
+        tokio::sync::mpsc::UnboundedReceiver::try_recv(self).map_err(|_| ())
+    }
+}
+
+#[cfg(feature = "embassy")]
+mod embassy_bus;
+#[cfg(feature = "embassy")]
+pub use embassy_bus::{
+    AckBusParticipant, run_bus_task, run_bus_task_with_acks, run_bus_task_with_acks_and_events,
+    run_file_transfer_bus_task, run_file_transfer_bus_task_with_events,
+};
 #[cfg(feature = "embassy")]
 mod embassy_receiver;
 #[cfg(feature = "embassy")]
 pub use embassy_receiver::{
-    AckToSend, InboundEvent, InboundQueue, OutboundAckQueue, ReceiverIngress, ReceiverNoAlloc,
-    ReceiverNoAllocConfig,
+    AckToSend, InboundEvent, InboundQueue, OutboundAckQueue, ReceiverError, ReceiverIngress,
+    ReceiverNoAlloc, ReceiverNoAllocConfig, ReceiverOutcome, run_receiver_task_from_app,
 };
+#[cfg(feature = "embassy")]
+mod embassy_sender;
+#[cfg(feature = "embassy")]
+pub use embassy_sender::{
+    Ack as EmbassyAck, AckInboxQueue, AckSender, AckStream as EmbassyAckStream, AsyncChunkSource,
+    MutexInterfaceTx, SendResult, SenderNoAlloc, SenderNoAllocConfig, send_file,
+    send_file_with_dispatch,
+};
+#[cfg(all(feature = "embassy", not(feature = "tokio")))]
+pub use embassy_sender::{Ack, AckStream};
+
+/// Build a sender from a profile using a single caps type.
+#[cfg(feature = "embassy")]
+#[macro_export]
+macro_rules! sender_from_profile_caps {
+    ($bundle:path, $scratch:expr, $profile:expr, $caps:ty) => {
+        <$bundle>::sender_from_profile::<{ <$caps>::MAX_CHUNK }, { <$caps>::WINDOW_CHUNKS }>(
+            $scratch, $profile,
+        )
+    };
+}
+
+/// Build a sender facade from app state and a profile using a single caps type.
+#[cfg(feature = "embassy")]
+#[macro_export]
+macro_rules! sender_facade_from_profile_caps {
+    ($bundle:path, $app:expr, $scratch:expr, $profile:expr, $mutex:ty, $caps:ty) => {
+        <$bundle>::sender_facade_from_profile::<
+            _,
+            _,
+            $mutex,
+            { <$caps>::ACK_DEPTH },
+            { <$caps>::MAX_CHUNK },
+            { <$caps>::WINDOW_CHUNKS },
+        >($app, $scratch, $profile)
+    };
+}
+
+/// Run the receiver task from an app using a single caps type.
+#[cfg(feature = "embassy")]
+#[macro_export]
+macro_rules! run_receiver_task_from_app_caps {
+    ($atlas:ty, $app:expr, $mutex:ty, $reply_to:ty, $caps:ty) => {
+        $crate::run_receiver_task_from_app::<
+            $atlas,
+            _,
+            $mutex,
+            $reply_to,
+            { <$caps>::MAX_METADATA },
+            { <$caps>::MAX_RANGES },
+            { <$caps>::MAX_CHUNK },
+            { <$caps>::IN_DEPTH },
+            { <$caps>::ACK_DEPTH },
+        >($app)
+        .await
+    };
+}
+
+/// Run the file-transfer bus task from a profile using a single caps type.
+#[cfg(feature = "embassy")]
+#[macro_export]
+macro_rules! run_bus_task_from_profile_caps {
+    ($bundle:path, $iface:expr, $handlers:expr, $profile:expr, $rx_buf:expr, $caps:ty, $rx:expr) => {
+        <$bundle>::run_bus_task_from_profile::<
+            _,
+            _,
+            _,
+            _,
+            _,
+            { <$caps>::MAX_METADATA },
+            { <$caps>::MAX_CHUNK },
+            { $rx },
+        >($iface, $handlers, $profile, $rx_buf)
+        .await
+    };
+}
+
+/// Run the file-transfer bus task with dispatch-event callback from a profile using a single
+/// caps type.
+#[cfg(feature = "embassy")]
+#[macro_export]
+macro_rules! run_bus_task_from_profile_caps_with_events {
+    ($bundle:path, $iface:expr, $handlers:expr, $profile:expr, $rx_buf:expr, $caps:ty, $rx:expr, $on_event:expr) => {
+        <$bundle>::run_bus_task_from_profile_with_events::<
+            _,
+            _,
+            _,
+            _,
+            _,
+            { <$caps>::MAX_METADATA },
+            { <$caps>::MAX_CHUNK },
+            _,
+            { $rx },
+        >($iface, $handlers, $profile, $rx_buf, $on_event)
+        .await
+    };
+}
 
 /// Define a `thincan` bundle for the standard file-transfer messages (`FileReq`, `FileChunk`,
 /// `FileAck`) in your atlas.
@@ -409,6 +1330,8 @@ pub use embassy_receiver::{
 ///   embassy channel using `send().await` for backpressure.
 /// - `AckInboxHandlers` (requires `--features tokio`): decodes `FileAck` and pushes into
 ///   [`AckInbox`].
+/// - `AckInboxHandlers` (requires `--features embassy` and **not** `tokio`): decodes `FileAck`
+///   and pushes into an [`AckInboxQueue`].
 #[macro_export]
 macro_rules! file_transfer_bundle {
     ($vis:vis mod $bundle:ident ($atlas:ident) $( { $($tt:tt)* } )? ) => {
@@ -422,61 +1345,69 @@ macro_rules! file_transfer_bundle {
                     FileAck => on_file_ack,
                 }
                 items {
+                    #[allow(dead_code)]
+                    struct _AssertAtlas
+                    where
+                        super::$atlas::Atlas: $crate::Atlas;
+
+                    pub type Atlas = super::$atlas::Atlas;
+
+                    #[derive(Debug, Clone, Copy, Default)]
+                    pub struct FileTransferBundle;
+
                     #[cfg(feature = "embassy")]
-                    #[derive(Clone, Copy)]
+                    #[derive(Clone)]
                     pub struct ReceiverIngressHandlers<
-                        'q,
-                        M,
+                        Q,
                         ReplyTo,
                         const MAX_METADATA: usize,
                         const MAX_CHUNK: usize,
-                        const DEPTH: usize,
-                    >
-                    where
-                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
-                        ReplyTo: Copy,
-                    {
-                        inbound: &'q $crate::InboundQueue<M, ReplyTo, MAX_METADATA, MAX_CHUNK, DEPTH>,
+                    > {
+                        inbound: Q,
+                        _reply_to: core::marker::PhantomData<ReplyTo>,
                     }
 
                     #[cfg(feature = "embassy")]
                     impl<
-                        'q,
-                        M,
+                        Q,
                         ReplyTo,
                         const MAX_METADATA: usize,
                         const MAX_CHUNK: usize,
-                        const DEPTH: usize,
-                    > ReceiverIngressHandlers<'q, M, ReplyTo, MAX_METADATA, MAX_CHUNK, DEPTH>
+                    > ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
                     where
-                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>>,
                         ReplyTo: Copy,
                     {
-                        pub fn new(
-                            inbound: &'q $crate::InboundQueue<
-                                M,
+                        pub fn new(inbound: Q) -> Self {
+                            Self {
+                                inbound,
+                                _reply_to: core::marker::PhantomData,
+                            }
+                        }
+
+                        pub fn from_app<S>(app: &S) -> Self
+                        where
+                            S: $crate::FileTransferReceiverState<
                                 ReplyTo,
                                 MAX_METADATA,
                                 MAX_CHUNK,
-                                DEPTH,
+                                InboundQueue = Q,
                             >,
-                        ) -> Self {
-                            Self { inbound }
+                        {
+                            Self::new(app.inbound_queue())
                         }
                     }
 
                     #[cfg(feature = "embassy")]
                     impl<
                         'a,
-                        'q,
-                        M,
+                        Q,
                         ReplyTo,
                         const MAX_METADATA: usize,
                         const MAX_CHUNK: usize,
-                        const DEPTH: usize,
-                    > Handlers<'a, ReplyTo> for ReceiverIngressHandlers<'q, M, ReplyTo, MAX_METADATA, MAX_CHUNK, DEPTH>
+                    > Handlers<'a, ReplyTo> for ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
                     where
-                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>>,
                         ReplyTo: Copy,
                     {
                         type Error = core::convert::Infallible;
@@ -558,22 +1489,390 @@ macro_rules! file_transfer_bundle {
                         }
                     }
 
-                    #[cfg(feature = "tokio")]
-                    #[derive(Debug, Clone)]
-                    pub struct AckInboxHandlers {
-                        inbox: $crate::AckInbox,
+                    #[cfg(feature = "embassy")]
+                    impl<
+                        'a,
+                        Q,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    > $crate::FileTransferReceiverHandlers<'a, ReplyTo>
+                        for ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_req(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_req::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            <Self as Handlers<'a, ReplyTo>>::on_file_req(self, meta, msg).await
+                        }
+
+                        async fn on_file_chunk(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_chunk::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            <Self as Handlers<'a, ReplyTo>>::on_file_chunk(self, meta, msg).await
+                        }
                     }
 
-                    #[cfg(feature = "tokio")]
-                    impl AckInboxHandlers {
-                        pub fn new(inbox: $crate::AckInbox) -> Self {
+                    #[cfg(feature = "embassy")]
+                    impl<Iface, Q, ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize>
+                        ::thincan::BundleOutbound<Iface>
+                        for ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                    where
+                        Q: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        ReplyTo: Copy,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    #[derive(Clone)]
+                    pub struct AckInboxHandlers<Q> {
+                        inbox: Q,
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<Q> AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                    {
+                        pub fn new(inbox: Q) -> Self {
                             Self { inbox }
+                        }
+
+                        pub fn from_app<S>(app: &S) -> Self
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>,
+                        {
+                            Self::new(app.ack_inbox_queue())
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<'a, Q, ReplyTo> Handlers<'a, ReplyTo> for AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_req(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            _msg: ::thincan::CapnpTyped<'a, $crate::schema::file_req::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            Ok(())
+                        }
+
+                        async fn on_file_chunk(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            _msg: ::thincan::CapnpTyped<'a, $crate::schema::file_chunk::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            Ok(())
+                        }
+
+                        async fn on_file_ack(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            if let Ok((transfer_id, kind, next_offset, chunk_size, error)) =
+                                $crate::decode_file_ack_fields(msg)
+                            {
+                                let ack = $crate::Ack {
+                                    transfer_id,
+                                    kind,
+                                    next_offset,
+                                    chunk_size,
+                                    error,
+                                };
+                                self.inbox.send(ack).await;
+                            }
+                            Ok(())
                         }
                     }
 
                     #[cfg(feature = "tokio")]
-                    impl<'a, ReplyTo> Handlers<'a, ReplyTo> for AckInboxHandlers
+                    impl<Iface, Q> ::thincan::BundleOutbound<Iface> for AckInboxHandlers<Q>
                     where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<Iface, Q> ::thincan::BundleOutbound<Iface> for AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(feature = "tokio")]
+                    impl<'a, Q, ReplyTo> $crate::FileTransferSenderHandlers<'a, ReplyTo>
+                        for AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_ack(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            <Self as Handlers<'a, ReplyTo>>::on_file_ack(self, meta, msg).await
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<'a, Q, ReplyTo> $crate::FileTransferSenderHandlers<'a, ReplyTo>
+                        for AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_ack(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            <Self as Handlers<'a, ReplyTo>>::on_file_ack(self, meta, msg).await
+                        }
+                    }
+
+                    /// Sender-side bundle facade: handles inbound `FileAck` messages and exposes
+                    /// interactive file-send methods.
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    pub struct SenderFacade<
+                        's,
+                        Q,
+                        M,
+                        const ACK_DEPTH: usize,
+                        const MAX_CHUNK: usize,
+                        const WINDOW_CHUNKS: usize,
+                    >
+                    where
+                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::Ack>
+                            + Clone
+                            + core::ops::Deref<Target = $crate::AckInboxQueue<M, ACK_DEPTH>>,
+                    {
+                        inbox: Q,
+                        sender: $crate::SenderNoAlloc<
+                            's,
+                            super::$atlas::Atlas,
+                            MAX_CHUNK,
+                            WINDOW_CHUNKS,
+                        >,
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<
+                        's,
+                        Q,
+                        M,
+                        const ACK_DEPTH: usize,
+                        const MAX_CHUNK: usize,
+                        const WINDOW_CHUNKS: usize,
+                    > SenderFacade<'s, Q, M, ACK_DEPTH, MAX_CHUNK, WINDOW_CHUNKS>
+                    where
+                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::Ack>
+                            + Clone
+                            + core::ops::Deref<Target = $crate::AckInboxQueue<M, ACK_DEPTH>>,
+                    {
+                        pub fn new(
+                            inbox: Q,
+                            sender: $crate::SenderNoAlloc<
+                                's,
+                                super::$atlas::Atlas,
+                                MAX_CHUNK,
+                                WINDOW_CHUNKS,
+                            >,
+                        ) -> Self {
+                            Self { inbox, sender }
+                        }
+
+                        pub async fn send_file<
+                            Node,
+                            Router,
+                            TxBuf,
+                            Mtx,
+                            S,
+                            ReplyTo,
+                        >(
+                            &mut self,
+                            iface: &$crate::embassy_sync::mutex::Mutex<
+                                Mtx,
+                                ::thincan::Interface<Node, Router, TxBuf>,
+                            >,
+                            to: ReplyTo,
+                            total_len: usize,
+                            source: &mut S,
+                        ) -> Result<$crate::SendResult, ::thincan::Error>
+                        where
+                            Mtx: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Node: $crate::can_isotp_interface::IsoTpAsyncEndpointMeta<
+                                ReplyTo = ReplyTo,
+                            >,
+                            TxBuf: AsMut<[u8]>,
+                            S: $crate::AsyncChunkSource,
+                            ReplyTo: Copy,
+                        {
+                            let mut tx = $crate::MutexInterfaceTx::new(iface);
+                            let mut acks = $crate::AckStream::new(&*self.inbox);
+                            let transfer_id = self.sender.next_transfer_id();
+                            self.sender
+                                .send_from_with_acks(
+                                    &mut tx,
+                                    &mut acks,
+                                    to,
+                                    transfer_id,
+                                    total_len,
+                                    source,
+                                )
+                                .await
+                        }
+
+                        pub fn sender_mut(
+                            &mut self,
+                        ) -> &mut $crate::SenderNoAlloc<
+                            's,
+                            super::$atlas::Atlas,
+                            MAX_CHUNK,
+                            WINDOW_CHUNKS,
+                        > {
+                            &mut self.sender
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<
+                        'a,
+                        's,
+                        Q,
+                        M,
+                        ReplyTo,
+                        const ACK_DEPTH: usize,
+                        const MAX_CHUNK: usize,
+                        const WINDOW_CHUNKS: usize,
+                    > Handlers<'a, ReplyTo>
+                        for SenderFacade<'s, Q, M, ACK_DEPTH, MAX_CHUNK, WINDOW_CHUNKS>
+                    where
+                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::Ack>
+                            + Clone
+                            + core::ops::Deref<Target = $crate::AckInboxQueue<M, ACK_DEPTH>>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_req(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            _msg: ::thincan::CapnpTyped<'a, $crate::schema::file_req::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            Ok(())
+                        }
+
+                        async fn on_file_chunk(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            _msg: ::thincan::CapnpTyped<'a, $crate::schema::file_chunk::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            Ok(())
+                        }
+
+                        async fn on_file_ack(
+                            &mut self,
+                            _meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            if let Ok((transfer_id, kind, next_offset, chunk_size, error)) =
+                                $crate::decode_file_ack_fields(msg)
+                            {
+                                let ack = $crate::Ack {
+                                    transfer_id,
+                                    kind,
+                                    next_offset,
+                                    chunk_size,
+                                    error,
+                                };
+                                self.inbox.send(ack).await;
+                            }
+                            Ok(())
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<
+                        's,
+                        Iface,
+                        Q,
+                        M,
+                        const ACK_DEPTH: usize,
+                        const MAX_CHUNK: usize,
+                        const WINDOW_CHUNKS: usize,
+                    > ::thincan::BundleOutbound<Iface>
+                        for SenderFacade<'s, Q, M, ACK_DEPTH, MAX_CHUNK, WINDOW_CHUNKS>
+                    where
+                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        Q: $crate::AsyncEnqueue<$crate::Ack>
+                            + Clone
+                            + core::ops::Deref<Target = $crate::AckInboxQueue<M, ACK_DEPTH>>,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(feature = "tokio")]
+                    #[derive(Debug, Clone)]
+                    pub struct AckInboxHandlers<Q> {
+                        inbox: Q,
+                    }
+
+                    #[cfg(feature = "tokio")]
+                    impl<Q> AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
+                    {
+                        pub fn new(inbox: Q) -> Self {
+                            Self { inbox }
+                        }
+
+                        pub fn from_app<S>(app: &S) -> Self
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>,
+                        {
+                            Self::new(app.ack_inbox_queue())
+                        }
+                    }
+
+                    #[cfg(feature = "tokio")]
+                    impl<'a, Q, ReplyTo> Handlers<'a, ReplyTo> for AckInboxHandlers<Q>
+                    where
+                        Q: $crate::AsyncEnqueue<$crate::Ack>,
                         ReplyTo: Copy,
                     {
                         type Error = core::convert::Infallible;
@@ -600,42 +1899,42 @@ macro_rules! file_transfer_bundle {
                             msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
                         ) -> Result<(), Self::Error> {
                             if let Ok(ack) = $crate::decode_file_ack(msg) {
-                                self.inbox.push(ack);
+                                self.inbox.send(ack).await;
                             }
                             Ok(())
                         }
                     }
 
-                    #[cfg(all(feature = "embassy", feature = "tokio"))]
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
                     #[derive(Clone)]
                     pub struct CombinedHandlers<
-                        'q,
-                        M,
+                        QIn,
+                        QAck,
                         ReplyTo,
                         const MAX_METADATA: usize,
                         const MAX_CHUNK: usize,
-                        const DEPTH: usize,
                     >
                     where
-                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
                         ReplyTo: Copy,
                     {
-                        pub ingress: ReceiverIngressHandlers<'q, M, ReplyTo, MAX_METADATA, MAX_CHUNK, DEPTH>,
-                        pub inbox: AckInboxHandlers,
+                        pub ingress: ReceiverIngressHandlers<QIn, ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        pub inbox: AckInboxHandlers<QAck>,
                     }
 
-                    #[cfg(all(feature = "embassy", feature = "tokio"))]
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
                     impl<
                         'a,
-                        'q,
-                        M,
+                        QIn,
+                        QAck,
                         ReplyTo,
                         const MAX_METADATA: usize,
                         const MAX_CHUNK: usize,
-                        const DEPTH: usize,
-                    > Handlers<'a, ReplyTo> for CombinedHandlers<'q, M, ReplyTo, MAX_METADATA, MAX_CHUNK, DEPTH>
+                    > Handlers<'a, ReplyTo> for CombinedHandlers<QIn, QAck, ReplyTo, MAX_METADATA, MAX_CHUNK>
                     where
-                        M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                        QIn: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        QAck: $crate::AsyncEnqueue<$crate::Ack>,
                         ReplyTo: Copy,
                     {
                         type Error = core::convert::Infallible;
@@ -662,6 +1961,795 @@ macro_rules! file_transfer_bundle {
                             msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
                         ) -> Result<(), Self::Error> {
                             self.inbox.on_file_ack(meta, msg).await
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<Iface, QIn, QAck, ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize>
+                        ::thincan::BundleOutbound<Iface>
+                        for CombinedHandlers<QIn, QAck, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                    where
+                        QIn: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        QAck: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(all(feature = "embassy", feature = "tokio"))]
+                    #[derive(Clone)]
+                    pub struct CombinedHandlers<
+                        QIn,
+                        QAck,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    >
+                    where
+                        ReplyTo: Copy,
+                    {
+                        pub ingress: ReceiverIngressHandlers<QIn, ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        pub inbox: AckInboxHandlers<QAck>,
+                    }
+
+                    #[cfg(all(feature = "embassy", feature = "tokio"))]
+                    impl<
+                        'a,
+                        QIn,
+                        QAck,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    > Handlers<'a, ReplyTo> for CombinedHandlers<QIn, QAck, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                    where
+                        QIn: $crate::AsyncEnqueue<$crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>>,
+                        QAck: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_req(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_req::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.ingress.on_file_req(meta, msg).await
+                        }
+
+                        async fn on_file_chunk(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_chunk::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.ingress.on_file_chunk(meta, msg).await
+                        }
+
+                        async fn on_file_ack(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'a, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.inbox.on_file_ack(meta, msg).await
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", feature = "tokio"))]
+                    impl<Iface, QIn, QAck, ReplyTo, const MAX_METADATA: usize, const MAX_CHUNK: usize>
+                        ::thincan::BundleOutbound<Iface>
+                        for CombinedHandlers<QIn, QAck, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                    where
+                        QIn: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        QAck: $crate::AsyncEnqueue<$crate::Ack>,
+                        ReplyTo: Copy,
+                    {
+                        type Outbound = ();
+
+                        fn take_outbound(&mut self) -> Self::Outbound {}
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    pub struct ReceiverHandlersWithAckOutbound<
+                        'a,
+                        QIn,
+                        QAck,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    >
+                    where
+                        ReplyTo: Copy,
+                    {
+                        ingress: ReceiverIngressHandlers<QIn, ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        ack_outbound: Option<$crate::AckBusParticipant<'a, super::$atlas::Atlas, QAck>>,
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<
+                        'msg,
+                        'state,
+                        QIn,
+                        QAck,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    > Handlers<'msg, ReplyTo>
+                        for ReceiverHandlersWithAckOutbound<
+                            'state,
+                            QIn,
+                            QAck,
+                            ReplyTo,
+                            MAX_METADATA,
+                            MAX_CHUNK,
+                        >
+                    where
+                        QIn: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        ReplyTo: Copy,
+                    {
+                        type Error = core::convert::Infallible;
+
+                        async fn on_file_req(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'msg, $crate::schema::file_req::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.ingress.on_file_req(meta, msg).await
+                        }
+
+                        async fn on_file_chunk(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'msg, $crate::schema::file_chunk::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.ingress.on_file_chunk(meta, msg).await
+                        }
+
+                        async fn on_file_ack(
+                            &mut self,
+                            meta: ::thincan::RecvMeta<ReplyTo>,
+                            msg: ::thincan::CapnpTyped<'msg, $crate::schema::file_ack::Owned>,
+                        ) -> Result<(), Self::Error> {
+                            self.ingress.on_file_ack(meta, msg).await
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl<
+                        'state,
+                        Iface,
+                        QIn,
+                        QAck,
+                        ReplyTo,
+                        const MAX_METADATA: usize,
+                        const MAX_CHUNK: usize,
+                    > ::thincan::BundleOutbound<Iface>
+                        for ReceiverHandlersWithAckOutbound<
+                            'state,
+                            QIn,
+                            QAck,
+                            ReplyTo,
+                            MAX_METADATA,
+                            MAX_CHUNK,
+                        >
+                    where
+                        QIn: $crate::AsyncEnqueue<
+                            $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                        >,
+                        ReplyTo: Copy,
+                    {
+                        type Outbound = $crate::AckBusParticipant<'state, super::$atlas::Atlas, QAck>;
+
+                        fn take_outbound(&mut self) -> Self::Outbound {
+                            self.ack_outbound.take().expect(
+                                "file-transfer outbound already taken; build a new maplet runtime",
+                            )
+                        }
+                    }
+
+                    #[cfg(feature = "embassy")]
+                    impl FileTransferBundle {
+                        pub fn receiver_handlers<
+                            S,
+                            Q,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            app: &S,
+                        ) -> ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                        where
+                            S: $crate::FileTransferReceiverState<
+                                ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                InboundQueue = Q,
+                            >,
+                            Q: $crate::AsyncEnqueue<
+                                $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            >,
+                            ReplyTo: Copy,
+                        {
+                            ReceiverIngressHandlers::from_app(app)
+                        }
+
+                        pub fn receiver_handlers_from_state<
+                            S,
+                            Q,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            state: &S,
+                        ) -> ReceiverIngressHandlers<Q, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                        where
+                            S: $crate::FileTransferReceiverState<
+                                ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                InboundQueue = Q,
+                            >,
+                            Q: $crate::AsyncEnqueue<
+                                $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            >,
+                            ReplyTo: Copy,
+                        {
+                            ReceiverIngressHandlers::from_app(state)
+                        }
+
+                        #[cfg(not(feature = "tokio"))]
+                        pub fn receiver_handlers_with_ack_from_state<
+                            'a,
+                            S,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            state: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            send_timeout: core::time::Duration,
+                        ) -> ReceiverHandlersWithAckOutbound<
+                            'a,
+                            S::InboundQueue,
+                            S::AckOutboundQueue,
+                            ReplyTo,
+                            MAX_METADATA,
+                            MAX_CHUNK,
+                        >
+                        where
+                            S: $crate::FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            S::InboundQueue: $crate::AsyncEnqueue<
+                                $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            >,
+                            ReplyTo: Copy,
+                        {
+                            ReceiverHandlersWithAckOutbound {
+                                ingress: ReceiverIngressHandlers::from_app(state),
+                                ack_outbound: Some(Self::ack_participant(
+                                    state.ack_outbound_queue(),
+                                    scratch,
+                                    send_timeout,
+                                )),
+                            }
+                        }
+
+                        #[cfg(not(feature = "tokio"))]
+                        pub fn receiver_handlers_with_ack<
+                            'a,
+                            S,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            app: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            send_timeout: core::time::Duration,
+                        ) -> ReceiverHandlersWithAckOutbound<
+                            'a,
+                            S::InboundQueue,
+                            S::AckOutboundQueue,
+                            ReplyTo,
+                            MAX_METADATA,
+                            MAX_CHUNK,
+                        >
+                        where
+                            S: $crate::FileTransferReceiverState<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            S::InboundQueue: $crate::AsyncEnqueue<
+                                $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            >,
+                            ReplyTo: Copy,
+                        {
+                            Self::receiver_handlers_with_ack_from_state::<
+                                S,
+                                ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >(app, scratch, send_timeout)
+                        }
+
+                        pub fn handlers<
+                            S,
+                            QIn,
+                            QAck,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            app: &S,
+                        ) -> CombinedHandlers<QIn, QAck, ReplyTo, MAX_METADATA, MAX_CHUNK>
+                        where
+                            S: $crate::FileTransferReceiverState<
+                                    ReplyTo,
+                                    MAX_METADATA,
+                                    MAX_CHUNK,
+                                    InboundQueue = QIn,
+                                > + $crate::FileTransferSenderState<AckInboxQueue = QAck>,
+                            QIn: $crate::AsyncEnqueue<
+                                $crate::InboundEvent<ReplyTo, MAX_METADATA, MAX_CHUNK>,
+                            >,
+                            QAck: $crate::AsyncEnqueue<$crate::Ack>,
+                            ReplyTo: Copy,
+                        {
+                            CombinedHandlers {
+                                ingress: ReceiverIngressHandlers::from_app(app),
+                                inbox: AckInboxHandlers::from_app(app),
+                            }
+                        }
+
+                        pub fn sender<'a, S, const MAX_CHUNK: usize, const WINDOW_CHUNKS: usize>(
+                            app: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                        ) -> Result<
+                            $crate::SenderNoAlloc<'a, super::$atlas::Atlas, MAX_CHUNK, WINDOW_CHUNKS>,
+                            ::thincan::Error,
+                        >
+                        where
+                            S: $crate::FileTransferSenderConfig,
+                        {
+                            let mut sender = $crate::SenderNoAlloc::<
+                                super::$atlas::Atlas,
+                                MAX_CHUNK,
+                                WINDOW_CHUNKS,
+                            >::new(scratch)?;
+                            sender.set_config(app.sender_config());
+                            if let Some(max) = app.sender_max_chunk_size() {
+                                sender.set_sender_max_chunk_size(max)?;
+                            }
+                            Ok(sender)
+                        }
+
+                        pub fn sender_from_profile<
+                            'a,
+                            const MAX_CHUNK: usize,
+                            const WINDOW_CHUNKS: usize,
+                        >(
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            profile: &$crate::FileTransferProfile,
+                        ) -> Result<
+                            $crate::SenderNoAlloc<'a, super::$atlas::Atlas, MAX_CHUNK, WINDOW_CHUNKS>,
+                            $crate::SenderFromProfileError,
+                        > {
+                            profile
+                                .validate::<MAX_CHUNK>()
+                                .map_err($crate::SenderFromProfileError::Profile)?;
+
+                            let mut sender = $crate::SenderNoAlloc::<
+                                super::$atlas::Atlas,
+                                MAX_CHUNK,
+                                WINDOW_CHUNKS,
+                            >::new(scratch)?;
+                            sender.set_config(profile.sender.sender_config());
+                            if let Some(max) = profile.sender.sender_max_chunk_size {
+                                sender.set_sender_max_chunk_size(max)?;
+                            }
+                            Ok(sender)
+                        }
+
+                        #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                        pub fn sender_facade<
+                            'a,
+                            S,
+                            Q,
+                            M,
+                            const ACK_DEPTH: usize,
+                            const MAX_CHUNK: usize,
+                            const WINDOW_CHUNKS: usize,
+                        >(
+                            app: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                        ) -> Result<
+                            SenderFacade<
+                                'a,
+                                Q,
+                                M,
+                                ACK_DEPTH,
+                                MAX_CHUNK,
+                                WINDOW_CHUNKS,
+                            >,
+                            ::thincan::Error,
+                        >
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>
+                                + $crate::FileTransferSenderConfig,
+                            M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Q: $crate::AsyncEnqueue<$crate::Ack>
+                                + Clone
+                                + core::ops::Deref<
+                                    Target = $crate::AckInboxQueue<M, ACK_DEPTH>,
+                                >,
+                        {
+                            let sender = Self::sender::<S, MAX_CHUNK, WINDOW_CHUNKS>(app, scratch)?;
+                            Ok(SenderFacade::new(app.ack_inbox_queue(), sender))
+                        }
+
+                        #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                        pub fn sender_facade_from_profile<
+                            'a,
+                            S,
+                            Q,
+                            M,
+                            const ACK_DEPTH: usize,
+                            const MAX_CHUNK: usize,
+                            const WINDOW_CHUNKS: usize,
+                        >(
+                            app: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            profile: &$crate::FileTransferProfile,
+                        ) -> Result<
+                            SenderFacade<
+                                'a,
+                                Q,
+                                M,
+                                ACK_DEPTH,
+                                MAX_CHUNK,
+                                WINDOW_CHUNKS,
+                            >,
+                            $crate::SenderFromProfileError,
+                        >
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>,
+                            M: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Q: $crate::AsyncEnqueue<$crate::Ack>
+                                + Clone
+                                + core::ops::Deref<
+                                    Target = $crate::AckInboxQueue<M, ACK_DEPTH>,
+                                >,
+                        {
+                            let sender =
+                                Self::sender_from_profile::<MAX_CHUNK, WINDOW_CHUNKS>(
+                                    scratch, profile,
+                                )?;
+                            Ok(SenderFacade::new(app.ack_inbox_queue(), sender))
+                        }
+
+                        pub fn ack_sender<'a>(
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            send_timeout: core::time::Duration,
+                        ) -> $crate::AckSender<'a, super::$atlas::Atlas> {
+                            let mut sender = $crate::AckSender::<super::$atlas::Atlas>::new(scratch);
+                            sender.set_send_timeout(send_timeout);
+                            sender
+                        }
+
+                        pub fn ack_participant<'a, Q>(
+                            ack_queue: Q,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            send_timeout: core::time::Duration,
+                        ) -> $crate::AckBusParticipant<'a, super::$atlas::Atlas, Q> {
+                            $crate::AckBusParticipant::<super::$atlas::Atlas, Q>::new(
+                                ack_queue,
+                                scratch,
+                                send_timeout,
+                            )
+                        }
+
+                        pub fn ack_participant_from_state<
+                            'a,
+                            S,
+                            ReplyTo,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                        >(
+                            state: &S,
+                            scratch: ::thincan::capnp::CapnpScratchRef<'a>,
+                            send_timeout: core::time::Duration,
+                        ) -> $crate::AckBusParticipant<
+                            'a,
+                            super::$atlas::Atlas,
+                            S::AckOutboundQueue,
+                        >
+                        where
+                            S: $crate::FileTransferReceiverState<
+                                ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >,
+                        {
+                            Self::ack_participant(state.ack_outbound_queue(), scratch, send_timeout)
+                        }
+
+                        pub async fn run_bus_task<
+                            Node,
+                            Router,
+                            TxBuf,
+                            Handlers,
+                            Mtx,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                            const RX: usize,
+                        >(
+                            iface: &$crate::embassy_sync::mutex::Mutex<Mtx, ::thincan::Interface<Node, Router, TxBuf>>,
+                            handlers: &mut Handlers,
+                            timeout: core::time::Duration,
+                            rx_buf: &mut [u8; RX],
+                            ack_send_timeout: core::time::Duration,
+                        ) -> !
+                        where
+                            Mtx: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Node: $crate::can_isotp_interface::IsoTpAsyncEndpointMeta
+                                + $crate::can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                                    ReplyTo = <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            Router: ::thincan::RouterDispatch<
+                                Handlers,
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                            >,
+                            TxBuf: AsMut<[u8]>,
+                            Handlers: $crate::FileTransferReceiverState<
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >,
+                            Handlers::AckOutboundQueue: $crate::AsyncDequeue<
+                                $crate::AckToSend<
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            >,
+                        {
+                            $crate::run_file_transfer_bus_task::<
+                                Node,
+                                Router,
+                                TxBuf,
+                                Handlers,
+                                Mtx,
+                                super::$atlas::Atlas,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                RX,
+                            >(
+                                iface,
+                                handlers,
+                                timeout,
+                                rx_buf,
+                                ack_send_timeout,
+                            )
+                            .await
+                        }
+
+                        pub async fn run_bus_task_with_events<
+                            Node,
+                            Router,
+                            TxBuf,
+                            Handlers,
+                            Mtx,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                            Ev,
+                            const RX: usize,
+                        >(
+                            iface: &$crate::embassy_sync::mutex::Mutex<Mtx, ::thincan::Interface<Node, Router, TxBuf>>,
+                            handlers: &mut Handlers,
+                            timeout: core::time::Duration,
+                            rx_buf: &mut [u8; RX],
+                            ack_send_timeout: core::time::Duration,
+                            on_event: Ev,
+                        ) -> !
+                        where
+                            Mtx: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Node: $crate::can_isotp_interface::IsoTpAsyncEndpointMeta
+                                + $crate::can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                                    ReplyTo = <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            Router: ::thincan::RouterDispatch<
+                                Handlers,
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                            >,
+                            TxBuf: AsMut<[u8]>,
+                            Handlers: $crate::FileTransferReceiverState<
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >,
+                            Handlers::AckOutboundQueue: $crate::AsyncDequeue<
+                                $crate::AckToSend<
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            >,
+                            Ev: for<'a> FnMut(
+                                ::thincan::DispatchEventMeta<
+                                    'a,
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            ) -> Result<(), ::thincan::Error>,
+                        {
+                            $crate::run_file_transfer_bus_task_with_events::<
+                                Node,
+                                Router,
+                                TxBuf,
+                                Handlers,
+                                Mtx,
+                                super::$atlas::Atlas,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                Ev,
+                                RX,
+                            >(
+                                iface,
+                                handlers,
+                                timeout,
+                                rx_buf,
+                                ack_send_timeout,
+                                on_event,
+                            )
+                            .await
+                        }
+
+                        pub async fn run_bus_task_from_profile<
+                            Node,
+                            Router,
+                            TxBuf,
+                            Handlers,
+                            Mtx,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                            const RX: usize,
+                        >(
+                            iface: &$crate::embassy_sync::mutex::Mutex<Mtx, ::thincan::Interface<Node, Router, TxBuf>>,
+                            handlers: &mut Handlers,
+                            profile: &$crate::FileTransferProfile,
+                            rx_buf: &mut [u8; RX],
+                        ) -> !
+                        where
+                            Mtx: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Node: $crate::can_isotp_interface::IsoTpAsyncEndpointMeta
+                                + $crate::can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                                    ReplyTo = <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            Router: ::thincan::RouterDispatch<
+                                Handlers,
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                            >,
+                            TxBuf: AsMut<[u8]>,
+                            Handlers: $crate::FileTransferReceiverState<
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >,
+                            Handlers::AckOutboundQueue: $crate::AsyncDequeue<
+                                $crate::AckToSend<
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            >,
+                        {
+                            if let Err(err) = profile.validate::<MAX_CHUNK>() {
+                                panic!("invalid file-transfer profile: {:?}", err);
+                            }
+                            $crate::run_file_transfer_bus_task::<
+                                Node,
+                                Router,
+                                TxBuf,
+                                Handlers,
+                                Mtx,
+                                super::$atlas::Atlas,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                RX,
+                            >(
+                                iface,
+                                handlers,
+                                profile.receiver.bus_recv_timeout,
+                                rx_buf,
+                                profile.receiver.ack_send_timeout,
+                            )
+                            .await
+                        }
+
+                        pub async fn run_bus_task_from_profile_with_events<
+                            Node,
+                            Router,
+                            TxBuf,
+                            Handlers,
+                            Mtx,
+                            const MAX_METADATA: usize,
+                            const MAX_CHUNK: usize,
+                            Ev,
+                            const RX: usize,
+                        >(
+                            iface: &$crate::embassy_sync::mutex::Mutex<Mtx, ::thincan::Interface<Node, Router, TxBuf>>,
+                            handlers: &mut Handlers,
+                            profile: &$crate::FileTransferProfile,
+                            rx_buf: &mut [u8; RX],
+                            on_event: Ev,
+                        ) -> !
+                        where
+                            Mtx: $crate::embassy_sync::blocking_mutex::raw::RawMutex,
+                            Node: $crate::can_isotp_interface::IsoTpAsyncEndpointMeta
+                                + $crate::can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
+                                    ReplyTo = <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            Router: ::thincan::RouterDispatch<
+                                Handlers,
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                            >,
+                            TxBuf: AsMut<[u8]>,
+                            Handlers: $crate::FileTransferReceiverState<
+                                <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                            >,
+                            Handlers::AckOutboundQueue: $crate::AsyncDequeue<
+                                $crate::AckToSend<
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            >,
+                            Ev: for<'a> FnMut(
+                                ::thincan::DispatchEventMeta<
+                                    'a,
+                                    <Node as $crate::can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+                                >,
+                            ) -> Result<(), ::thincan::Error>,
+                        {
+                            if let Err(err) = profile.validate::<MAX_CHUNK>() {
+                                panic!("invalid file-transfer profile: {:?}", err);
+                            }
+                            $crate::run_file_transfer_bus_task_with_events::<
+                                Node,
+                                Router,
+                                TxBuf,
+                                Handlers,
+                                Mtx,
+                                super::$atlas::Atlas,
+                                MAX_METADATA,
+                                MAX_CHUNK,
+                                Ev,
+                                RX,
+                            >(
+                                iface,
+                                handlers,
+                                profile.receiver.bus_recv_timeout,
+                                rx_buf,
+                                profile.receiver.ack_send_timeout,
+                                on_event,
+                            )
+                            .await
+                        }
+                    }
+
+                    #[cfg(feature = "tokio")]
+                    impl FileTransferBundle {
+                        pub fn sender_handlers<S, Q>(app: &S) -> AckInboxHandlers<Q>
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>,
+                            Q: $crate::AsyncEnqueue<$crate::Ack>,
+                        {
+                            AckInboxHandlers::from_app(app)
+                        }
+                    }
+
+                    #[cfg(all(feature = "embassy", not(feature = "tokio")))]
+                    impl FileTransferBundle {
+                        pub fn sender_handlers<S, Q>(app: &S) -> AckInboxHandlers<Q>
+                        where
+                            S: $crate::FileTransferSenderState<AckInboxQueue = Q>,
+                            Q: $crate::AsyncEnqueue<$crate::Ack>,
+                        {
+                            AckInboxHandlers::from_app(app)
                         }
                     }
                 }
