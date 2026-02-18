@@ -227,6 +227,7 @@ where
     pub async fn send_file<Node, Router, TxBuf>(
         &mut self,
         iface: &mut thincan::Interface<Node, Router, TxBuf>,
+        to: u8,
         acks: &mut AckStream,
         bytes: &[u8],
         timeout: Duration,
@@ -236,13 +237,14 @@ where
         TxBuf: AsMut<[u8]>,
     {
         let transfer_id = self.alloc_transfer_id();
-        self.send_file_with_id(iface, acks, transfer_id, bytes, timeout)
+        self.send_file_with_id(iface, to, acks, transfer_id, bytes, timeout)
             .await
     }
 
     pub async fn send_file_with_id<Node, Router, TxBuf>(
         &mut self,
         iface: &mut thincan::Interface<Node, Router, TxBuf>,
+        to: u8,
         acks: &mut AckStream,
         transfer_id: u32,
         bytes: &[u8],
@@ -266,7 +268,8 @@ where
             })?;
 
         iface
-            .send_encoded_async::<A::FileReq, _>(
+            .send_encoded_to_async::<A::FileReq, _>(
+                to,
                 &file_offer::<A>(transfer_id, total_len_u32, max_chunk_u32, &[]),
                 timeout,
             )
@@ -307,7 +310,8 @@ where
                 let end = (offset + chunk_size).min(total_len);
                 let data = &bytes[offset..end];
                 iface
-                    .send_encoded_async::<A::FileChunk, _>(
+                    .send_encoded_to_async::<A::FileChunk, _>(
+                        to,
                         &file_chunk::<A>(transfer_id, next_to_send, data),
                         timeout,
                     )

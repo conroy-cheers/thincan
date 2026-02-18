@@ -6,7 +6,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use can_isotp_interface::{IsoTpAsyncEndpoint, RecvControl, RecvError, RecvStatus, SendError};
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
+};
 use tokio::sync::mpsc;
 
 thincan::bus_atlas! {
@@ -53,8 +55,9 @@ impl SlowReceiverNode {
 impl IsoTpAsyncEndpoint for SlowReceiverNode {
     type Error = ();
 
-    async fn send(
+    async fn send_to(
         &mut self,
+        _to: u8,
         payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -112,7 +115,7 @@ impl IsoTpAsyncEndpoint for SlowReceiverNode {
         _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         Ok(RecvStatus::TimedOut)
     }
@@ -186,7 +189,7 @@ async fn async_sender_backpressures_when_receiver_is_slow() {
 
     let send_timeout = Duration::from_secs(2 * 60 * 60);
     let send_fut =
-        sender.send_file_with_id(&mut iface, &mut acks, transfer_id, &bytes, send_timeout);
+        sender.send_file_with_id(&mut iface, 0, &mut acks, transfer_id, &bytes, send_timeout);
 
     // Let the task run until it reaches the stall: chunk #3 takes a long time to "process", so
     // cumulative acks stop advancing at 3 chunks.

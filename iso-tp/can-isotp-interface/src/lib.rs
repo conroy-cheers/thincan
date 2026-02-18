@@ -1,8 +1,7 @@
-//! Shared ISO-TP transport traits.
+//! Shared UDS-over-ISO-TP transport traits.
 //!
-//! This crate defines thin, dependency-light interfaces so applications can
-//! use either a userspace ISO-TP implementation or the Linux kernel ISO-TP
-//! sockets without changing higher-level code.
+//! This crate defines dependency-light interfaces for 29-bit UDS-style ISO-TP transports where
+//! messages are always addressed to a peer (`u8` source/target addresses).
 
 #![no_std]
 #![allow(async_fn_in_trait)]
@@ -10,10 +9,6 @@
 use core::time::Duration;
 
 /// Receive-side ISO-TP flow-control parameters.
-///
-/// These values are advertised to the remote sender via ISO-TP FlowControl (FC) frames. Updating
-/// them at runtime allows an application to *shape* the sender's transmission rate based on
-/// backpressure (e.g. queue depth, CPU load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RxFlowControl {
     /// Block size (BS) to advertise (0 = unlimited).
@@ -23,9 +18,6 @@ pub struct RxFlowControl {
 }
 
 /// Optional extension trait: runtime-configurable RX flow-control.
-///
-/// Implementations should apply the provided parameters to subsequent FlowControl frames emitted
-/// in response to segmented transfers.
 pub trait IsoTpRxFlowControlConfig {
     /// Backend-specific error type.
     type Error;
@@ -54,9 +46,9 @@ pub enum RecvControl {
 
 /// Metadata accompanying a received payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecvMeta<T> {
-    /// Address to reply to, if applicable.
-    pub reply_to: T,
+pub struct RecvMeta {
+    /// Address to reply to.
+    pub reply_to: u8,
 }
 
 /// Error for a send attempt.
@@ -82,86 +74,69 @@ pub enum RecvError<E> {
     Backend(E),
 }
 
-/// Result of a receive-into attempt (point-to-point).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvIntoStatus {
-    /// No payload arrived before the timeout elapsed.
-    TimedOut,
-    /// One payload was delivered into the provided buffer.
-    DeliveredOne {
-        /// Number of payload bytes written into the output buffer.
-        len: usize,
-    },
-}
-
 /// Result of a receive-into attempt (multi-peer with reply-to metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvMetaIntoStatus<A>
-where
-    A: Copy,
-{
+pub enum RecvMetaIntoStatus {
     /// No payload arrived before the timeout elapsed.
     TimedOut,
     /// One payload was delivered into the provided buffer.
     DeliveredOne {
         /// Reply-to metadata (sender identity).
-        meta: RecvMeta<A>,
+        meta: RecvMeta,
         /// Number of payload bytes written into the output buffer.
         len: usize,
     },
 }
 
-/// Point-to-point ISO-TP endpoint.
+/// UDS-aware ISO-TP endpoint.
 ///
-/// This trait models a single ISO-TP channel with fixed addressing (e.g.
-/// one Linux kernel ISO-TP socket bound to specific RX/TX CAN IDs).
+/// This trait is addressed: sends target a peer address and receives report `reply_to` metadata.
 pub trait IsoTpEndpoint {
     /// Backend-specific error type.
     type Error;
 
-    /// Send a payload, blocking until completion or timeout.
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>>;
+    /// Send a payload to a specific peer address.
+    fn send_to(
+        &mut self,
+        to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>>;
 
-    /// Receive at most one payload and deliver it to the callback.
+    /// Receive at most one payload and deliver it with reply-to metadata.
     fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
         on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>;
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>;
 }
 
-/// Async point-to-point ISO-TP endpoint.
-///
-/// This is the async equivalent of [`IsoTpEndpoint`]. Implementations are expected to be
-/// runtime-native (e.g. tokio) or use an adapter that captures whatever runtime handle is needed.
+/// Async UDS-aware ISO-TP endpoint.
 pub trait IsoTpAsyncEndpoint {
     /// Backend-specific error type.
     type Error;
 
-    /// Send a payload, awaiting completion or timeout.
-    async fn send(
+    /// Send a payload to a specific peer address.
+    async fn send_to(
         &mut self,
+        to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>>;
 
-    /// Receive at most one payload and deliver it to the callback.
+    /// Receive at most one payload and deliver it with reply-to metadata.
     async fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
         on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>;
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>;
 }
 
-/// Async point-to-point ISO-TP endpoint (recv-into API).
-///
-/// This is an alternative to [`IsoTpAsyncEndpoint::recv_one`] that avoids callbacks by copying
-/// the received payload into a caller-provided buffer. This shape is required for higher-level
-/// protocols that need to `await` during dispatch/handling (e.g. async file I/O backpressure).
+/// Async UDS-aware ISO-TP endpoint (recv-into API).
 pub trait IsoTpAsyncEndpointRecvInto {
     /// Backend-specific error type.
     type Error;
@@ -171,129 +146,78 @@ pub trait IsoTpAsyncEndpointRecvInto {
         &mut self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<RecvIntoStatus, RecvError<Self::Error>>;
+    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>>;
 }
 
-/// Async multi-peer ISO-TP endpoint with reply-to metadata.
-///
-/// This is the async equivalent of [`IsoTpEndpointMeta`].
-pub trait IsoTpAsyncEndpointMeta {
-    /// Backend-specific error type.
-    type Error;
-    /// Reply-to address type.
-    type ReplyTo: Copy;
+/// Backward-compatible alias trait name for addressed sync endpoints.
+pub trait IsoTpEndpointMeta: IsoTpEndpoint {}
 
-    /// Send a payload to a specific peer address.
-    async fn send_to(
-        &mut self,
-        to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>>;
+impl<T> IsoTpEndpointMeta for T where T: IsoTpEndpoint {}
 
-    /// Receive at most one payload and deliver it with reply-to metadata.
-    async fn recv_one_meta<Cb>(
-        &mut self,
-        timeout: Duration,
-        on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Self::Error>;
-}
+/// Backward-compatible alias trait name for addressed async endpoints.
+pub trait IsoTpAsyncEndpointMeta: IsoTpAsyncEndpoint {}
 
-/// Async multi-peer ISO-TP endpoint with reply-to metadata (recv-into API).
-///
-/// This is an alternative to [`IsoTpAsyncEndpointMeta::recv_one_meta`] that avoids callbacks by
-/// copying the received payload into a caller-provided buffer.
-pub trait IsoTpAsyncEndpointMetaRecvInto {
-    /// Backend-specific error type.
-    type Error;
-    /// Reply-to address type.
-    type ReplyTo: Copy;
+impl<T> IsoTpAsyncEndpointMeta for T where T: IsoTpAsyncEndpoint {}
 
-    /// Receive at most one payload and copy it into `out`.
-    async fn recv_one_meta_into(
-        &mut self,
-        timeout: Duration,
-        out: &mut [u8],
-    ) -> Result<RecvMetaIntoStatus<Self::ReplyTo>, RecvError<Self::Error>>;
-}
+/// Backward-compatible alias trait name for addressed async recv-into endpoints.
+pub trait IsoTpAsyncEndpointMetaRecvInto: IsoTpAsyncEndpointRecvInto {}
 
-/// Multi-peer ISO-TP endpoint with reply-to metadata.
-///
-/// This is intended for UDS normal-fixed addressing, where multiple peers
-/// share the same CAN IDs and the source address identifies the sender.
-pub trait IsoTpEndpointMeta {
-    /// Backend-specific error type.
-    type Error;
-    /// Reply-to address type.
-    type ReplyTo: Copy;
-
-    /// Send a payload to a specific peer address.
-    fn send_to(
-        &mut self,
-        to: Self::ReplyTo,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>>;
-
-    /// Receive at most one payload and deliver it with reply-to metadata.
-    fn recv_one_meta<Cb>(
-        &mut self,
-        timeout: Duration,
-        on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Self::Error>;
-}
+impl<T> IsoTpAsyncEndpointMetaRecvInto for T where T: IsoTpAsyncEndpointRecvInto {}
 
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    use super::*;
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::vec;
     use std::vec::Vec;
 
-    use super::*;
-
     fn block_on<F: Future>(mut fut: F) -> F::Output {
-        // A tiny single-threaded executor for tests (no timers).
-        unsafe fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(core::ptr::null(), &VTABLE)
+        fn raw_waker() -> RawWaker {
+            fn clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            let vtable = &RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            RawWaker::new(core::ptr::null(), vtable)
         }
-        unsafe fn wake(_: *const ()) {}
-        unsafe fn wake_by_ref(_: *const ()) {}
-        unsafe fn drop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
 
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        // SAFETY: no-op waker is sufficient for these immediately-ready futures.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
-        // SAFETY: `fut` lives on the stack for the duration of this function.
+        // SAFETY: we do not move `fut` after pinning.
         let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
         loop {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(v) => return v,
-                Poll::Pending => std::thread::yield_now(),
+                Poll::Pending => {}
             }
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     struct Dummy {
-        next_recv: Option<Vec<u8>>,
-        last_sent: Option<Vec<u8>>,
+        sent_to: Vec<u8>,
+        sent_payloads: Vec<Vec<u8>>,
+        inbox: Vec<(u8, Vec<u8>)>,
     }
 
     impl IsoTpEndpoint for Dummy {
         type Error = ();
 
-        fn send(
+        fn send_to(
             &mut self,
+            to: u8,
             payload: &[u8],
             _timeout: Duration,
         ) -> Result<(), SendError<Self::Error>> {
-            self.last_sent = Some(payload.to_vec());
+            self.sent_to.push(to);
+            self.sent_payloads.push(payload.to_vec());
             Ok(())
         }
 
@@ -303,101 +227,91 @@ mod tests {
             mut on_payload: Cb,
         ) -> Result<RecvStatus, RecvError<Self::Error>>
         where
-            Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+            Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
         {
-            match self.next_recv.take() {
-                Some(data) => {
-                    let _ = on_payload(&data).map_err(RecvError::Backend)?;
-                    Ok(RecvStatus::DeliveredOne)
-                }
-                None => Ok(RecvStatus::TimedOut),
+            if let Some((reply_to, data)) = self.inbox.pop() {
+                let _ = on_payload(RecvMeta { reply_to }, &data)
+                    .map_err(RecvError::Backend)?;
+                return Ok(RecvStatus::DeliveredOne);
             }
+            Ok(RecvStatus::TimedOut)
         }
     }
 
-    #[test]
-    fn dummy_endpoint_round_trips_payload() {
-        let mut ep = Dummy::default();
-        ep.send(b"hello", Duration::from_millis(1)).unwrap();
-        assert_eq!(ep.last_sent.as_deref(), Some(b"hello".as_ref()));
-
-        ep.next_recv = Some(b"world".to_vec());
-        let mut got = Vec::new();
-        let status = ep
-            .recv_one(Duration::from_millis(1), |payload| {
-                got.extend_from_slice(payload);
-                Ok(RecvControl::Continue)
-            })
-            .unwrap();
-        assert_eq!(status, RecvStatus::DeliveredOne);
-        assert_eq!(got, b"world");
-    }
-
-    #[test]
-    fn dummy_endpoint_timeout() {
-        let mut ep = Dummy::default();
-        let status = ep
-            .recv_one(Duration::from_millis(1), |_payload| {
-                Ok(RecvControl::Continue)
-            })
-            .unwrap();
-        assert_eq!(status, RecvStatus::TimedOut);
-    }
-
-    #[derive(Debug, Default)]
-    struct DummyAsync {
-        next_recv: Option<Vec<u8>>,
-        last_sent: Option<Vec<u8>>,
-    }
-
-    impl IsoTpAsyncEndpoint for DummyAsync {
+    impl IsoTpAsyncEndpoint for Dummy {
         type Error = ();
 
-        async fn send(
+        async fn send_to(
             &mut self,
+            to: u8,
             payload: &[u8],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<(), SendError<Self::Error>> {
-            self.last_sent = Some(payload.to_vec());
-            Ok(())
+            IsoTpEndpoint::send_to(self, to, payload, timeout)
         }
 
         async fn recv_one<Cb>(
             &mut self,
-            _timeout: Duration,
-            mut on_payload: Cb,
+            timeout: Duration,
+            on_payload: Cb,
         ) -> Result<RecvStatus, RecvError<Self::Error>>
         where
-            Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+            Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
         {
-            match self.next_recv.take() {
-                Some(data) => {
-                    let _ = on_payload(&data).map_err(RecvError::Backend)?;
-                    Ok(RecvStatus::DeliveredOne)
+            IsoTpEndpoint::recv_one(self, timeout, on_payload)
+        }
+    }
+
+    impl IsoTpAsyncEndpointRecvInto for Dummy {
+        type Error = ();
+
+        async fn recv_one_into(
+            &mut self,
+            _timeout: Duration,
+            out: &mut [u8],
+        ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
+            if let Some((reply_to, data)) = self.inbox.pop() {
+                if data.len() > out.len() {
+                    return Err(RecvError::BufferTooSmall {
+                        needed: data.len(),
+                        got: out.len(),
+                    });
                 }
-                None => Ok(RecvStatus::TimedOut),
+                out[..data.len()].copy_from_slice(&data);
+                return Ok(RecvMetaIntoStatus::DeliveredOne {
+                    meta: RecvMeta { reply_to },
+                    len: data.len(),
+                });
             }
+            Ok(RecvMetaIntoStatus::TimedOut)
         }
     }
 
     #[test]
-    fn dummy_async_endpoint_round_trips_payload() {
-        block_on(async {
-            let mut ep = DummyAsync::default();
-            ep.send(b"hello", Duration::from_millis(1)).await.unwrap();
-            assert_eq!(ep.last_sent.as_deref(), Some(b"hello".as_ref()));
+    fn sync_trait_is_addressed() {
+        let mut d = Dummy::default();
+        IsoTpEndpoint::send_to(
+            &mut d,
+            0x33,
+            b"abc",
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(d.sent_to, vec![0x33]);
+        assert_eq!(d.sent_payloads, vec![b"abc".to_vec()]);
+    }
 
-            ep.next_recv = Some(b"world".to_vec());
-            let mut got = Vec::new();
-            let status = ep
-                .recv_one(Duration::from_millis(1), |payload| {
-                    got.extend_from_slice(payload);
-                    Ok(RecvControl::Continue)
-                })
-                .await
-                .unwrap();
-            assert_eq!(status, RecvStatus::DeliveredOne);
-            assert_eq!(got, b"world");
-        })
+    #[test]
+    fn async_trait_is_addressed() {
+        let mut d = Dummy::default();
+        block_on(IsoTpAsyncEndpoint::send_to(
+            &mut d,
+            0x44,
+            b"xyz",
+            Duration::from_millis(1),
+        ))
+        .unwrap();
+        assert_eq!(d.sent_to, vec![0x44]);
+        assert_eq!(d.sent_payloads, vec![b"xyz".to_vec()]);
     }
 }

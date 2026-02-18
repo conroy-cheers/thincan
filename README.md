@@ -1,6 +1,6 @@
 # thincan
 
-An application-layer comms protocol, intended to be used on top of CAN transport(s) such as ISO-TP.
+An application-layer comms protocol intended for UDS 29-bit addressed ISO-TP transports.
 
 ## Workspace crates
 

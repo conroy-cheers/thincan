@@ -2,8 +2,8 @@
 
 use can_iso_tp::{IsoTpAsyncNode, IsoTpConfig};
 use can_isotp_interface::{
-    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvControl, RecvError, RecvIntoStatus,
-    RecvStatus, SendError,
+    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvControl, RecvError, RecvMeta,
+    RecvMetaIntoStatus, RecvStatus, SendError,
 };
 use embedded_can::StandardId;
 use embedded_can_interface::{AsyncRxFrameIo, AsyncTxFrameIo, Id};
@@ -412,6 +412,7 @@ thincan::bundle! {
 
 thincan::bus_maplet! {
     pub mod log_displayer_bus: atlas {
+        reply_to: u8;
         bundles [file_transfer, log_display];
         parser: thincan::DefaultParser;
         use msgs [FileReq, FileChunk, FileAck, LogLine];
@@ -423,6 +424,7 @@ thincan::bus_maplet! {
 
 thincan::bus_maplet! {
     pub mod log_sender_bus: atlas {
+        reply_to: u8;
         bundles [file_transfer, log_tx];
         parser: thincan::DefaultParser;
         use msgs [FileReq, FileChunk, FileAck, LogLine];
@@ -581,10 +583,14 @@ where
 {
     type Error = T::Error;
 
-    async fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>>
-    {
+    async fn send_to(
+        &mut self,
+        to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
         self.sent.lock().unwrap().push(payload.to_vec());
-        self.inner.send(payload, timeout).await
+        self.inner.send_to(to, payload, timeout).await
     }
 
     async fn recv_one<Cb>(
@@ -593,13 +599,13 @@ where
         mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         let received = self.received.clone();
         self.inner
-            .recv_one(timeout, |payload| {
+            .recv_one(timeout, |meta, payload| {
                 received.lock().unwrap().push(payload.to_vec());
-                on_payload(payload)
+                on_payload(meta, payload)
             })
             .await
     }
@@ -615,12 +621,12 @@ where
         &mut self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<RecvIntoStatus, RecvError<Self::Error>> {
+    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
         match self.inner.recv_one_into(timeout, out).await? {
-            RecvIntoStatus::TimedOut => Ok(RecvIntoStatus::TimedOut),
-            RecvIntoStatus::DeliveredOne { len } => {
+            RecvMetaIntoStatus::TimedOut => Ok(RecvMetaIntoStatus::TimedOut),
+            RecvMetaIntoStatus::DeliveredOne { meta, len } => {
                 self.received.lock().unwrap().push(out[..len].to_vec());
-                Ok(RecvIntoStatus::DeliveredOne { len })
+                Ok(RecvMetaIntoStatus::DeliveredOne { meta, len })
             }
         }
     }
@@ -755,7 +761,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                 });
             }
             match iface
-                .recv_one_dispatch_async(
+                .recv_one_dispatch_meta_async(
                     &mut handlers,
                     Duration::from_millis(50),
                     &mut rx_payload,
@@ -833,7 +839,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                 continue;
             }
             logs_sent += 1;
-            iface.send_msg_async::<atlas::LogLine>(
+            iface.send_msg_to_async::<atlas::LogLine>(0, 
                 &log_tx::encode_line(line),
                 Duration::from_millis(50),
             )
@@ -882,7 +888,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
         };
 
         iface
-            .send_msg_async::<atlas::FileReq>(
+            .send_msg_to_async::<atlas::FileReq>(0, 
                 &file_transfer::encode_req(transfer_id, file_for_displayer.len() as u32),
                 Duration::from_millis(50),
             )
@@ -894,7 +900,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                 &file_for_displayer[offset..],
             );
             iface
-                .send_msg_async::<atlas::FileChunk>(&body, Duration::from_millis(50))
+                .send_msg_to_async::<atlas::FileChunk>(0, &body, Duration::from_millis(50))
                 .await?;
         }
 
@@ -908,7 +914,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
                 });
             }
             match iface
-                .recv_one_dispatch_async(
+                .recv_one_dispatch_meta_async(
                     &mut handlers,
                     Duration::from_millis(50),
                     &mut rx_payload,
@@ -941,7 +947,7 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
 
         for _ in 0..3 {
             let r = iface
-                .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_payload)
+                .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(50), &mut rx_payload)
                 .await?;
             assert_eq!(r, thincan::RecvDispatch::TimedOut);
         }

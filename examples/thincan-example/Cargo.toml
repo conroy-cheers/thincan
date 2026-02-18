@@ -14,7 +14,6 @@ embedded-can-interface = "0.1.1"
 thincan = { path = "../../thincan", default-features = false, features = [
     "std",
     "capnp",
-    "isotp-uds",
 ] }
 
 embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", optional = true }

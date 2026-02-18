@@ -262,7 +262,12 @@ impl AsRawFd for SocketCanIsoTp {
 impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
     type Error = Error;
 
-    fn send(&mut self, payload: &[u8], timeout: Duration) -> Result<(), SendError<Self::Error>> {
+    fn send_to(
+        &mut self,
+        _to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
         let deadline = Instant::now() + timeout;
         loop {
             let sent = unsafe {
@@ -305,7 +310,7 @@ impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
         mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         let deadline = Instant::now() + timeout;
         loop {
@@ -326,7 +331,7 @@ impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
                 }
 
                 let payload = &self.rx_buf[..read as usize];
-                let _ = on_payload(payload).map_err(RecvError::Backend)?;
+                let _ = on_payload(RecvMeta { reply_to: 0 }, payload).map_err(RecvError::Backend)?;
                 return Ok(RecvStatus::DeliveredOne);
             }
 
@@ -411,8 +416,9 @@ impl IsoTpRxFlowControlConfig for TokioSocketCanIsoTp {
 impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
     type Error = Error;
 
-    async fn send(
+    async fn send_to(
         &mut self,
+        _to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -461,11 +467,15 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
         mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         let res = tokio::time::timeout(timeout, async {
             loop {
-                match self.io.get_mut().recv_one_ready(&mut on_payload) {
+                match self
+                    .io
+                    .get_mut()
+                    .recv_one_ready(|payload| on_payload(RecvMeta { reply_to: 0 }, payload))
+                {
                     Ok(RecvStatus::DeliveredOne) => return Ok(RecvStatus::DeliveredOne),
                     Ok(RecvStatus::TimedOut) => {
                         let mut guard = self
@@ -571,27 +581,26 @@ impl IsoTpRxFlowControlConfig for KernelUdsDemux {
     }
 }
 
-impl can_isotp_interface::IsoTpEndpointMeta for KernelUdsDemux {
+impl can_isotp_interface::IsoTpEndpoint for KernelUdsDemux {
     type Error = Error;
-    type ReplyTo = u8;
 
     fn send_to(
         &mut self,
-        to: Self::ReplyTo,
+        to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
         let socket = self.ensure_peer(to).map_err(SendError::Backend)?;
-        socket.send(payload, timeout)
+        socket.send_to(to, payload, timeout)
     }
 
-    fn recv_one_meta<Cb>(
+    fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
         mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         if self.peers.is_empty() {
             thread::sleep(timeout);

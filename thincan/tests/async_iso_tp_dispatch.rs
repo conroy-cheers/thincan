@@ -72,6 +72,7 @@ thincan::bundle! {
 
 thincan::bus_maplet! {
     pub mod maplet: atlas {
+        reply_to: u8;
         bundles [none];
         parser: thincan::DefaultParser;
         use msgs [A, B];
@@ -146,10 +147,10 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
     let mut iface_b = thincan::Interface::new(node_b, maplet::Router::new(), &mut tx_buf_b);
 
     iface_a
-        .send_msg_async::<atlas::A>(&[0xAA], Duration::from_millis(50))
+        .send_msg_to_async::<atlas::A>(0, &[0xAA], Duration::from_millis(50))
         .await?;
     iface_a
-        .send_msg_async::<atlas::B>(&[0xBB], Duration::from_millis(50))
+        .send_msg_to_async::<atlas::B>(0, &[0xBB], Duration::from_millis(50))
         .await?;
 
     let mut handlers = maplet::HandlersImpl {
@@ -160,7 +161,7 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
 
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
+            .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::A as thincan::Message>::ID,
@@ -169,7 +170,7 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
     );
     assert_eq!(
         iface_b
-            .recv_one_dispatch_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
+            .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(50), &mut rx_buf)
             .await?,
         thincan::RecvDispatch::Dispatched {
             id: <atlas::B as thincan::Message>::ID,

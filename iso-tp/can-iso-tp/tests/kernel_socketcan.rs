@@ -130,7 +130,7 @@ fn raw_socketcan_talks_to_kernel_isotp() {
 
         let mut got = Vec::new();
         let status = kernel
-            .recv_one(IO_TIMEOUT, |data| {
+            .recv_one(IO_TIMEOUT, |_meta, data| {
                 got.extend_from_slice(data);
                 Ok(RecvControl::Continue)
             })
@@ -140,7 +140,7 @@ fn raw_socketcan_talks_to_kernel_isotp() {
 
         let payload = make_payload((0xA5 ^ idx as u8).wrapping_add(3), size);
         kernel
-            .send(&payload, IO_TIMEOUT)
+            .send_to(client, &payload, IO_TIMEOUT)
             .expect("kernel ISO-TP send failed");
 
         let mut got = Vec::new();

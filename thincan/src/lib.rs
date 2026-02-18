@@ -10,10 +10,10 @@
 //! - Macros to group message handlers into reusable (**bundle**) modules via [`bundle!`].
 //! - Macros to compose bundles + application handlers into per-device (**maplet**) routers via
 //!   [`bus_maplet!`].
-//! - Optional send/receive helpers ([`Interface`]) that integrate with an ISO-TP node/transport.
+//! - Optional send/receive helpers ([`Interface`]) that integrate with addressed ISO-TP endpoints.
 //!
-//! `thincan` intentionally does **not** implement ISO-TP framing/flow-control. Any ISO-TP
-//! implementation (including the sibling `can-iso-tp` crate) can be used as the transport layer.
+//! `thincan` intentionally does **not** implement ISO-TP framing/flow-control. It expects an
+//! addressed ISO-TP endpoint (UDS-style `reply_to` metadata).
 //!
 //! # Concepts
 //! - **Atlas**: the global registry of message ids and names for a "bus".
@@ -42,6 +42,7 @@
 //!
 //! bus_maplet! {
 //!     pub mod demo_maplet: atlas {
+//!         reply_to: u8;
 //!         bundles [demo_bundle];
 //!         parser: thincan::DefaultParser;
 //!         use msgs [Ping, Pong];
@@ -87,7 +88,7 @@
 //!         id: <atlas::Ping as Message>::ID,
 //!         body: &[0u8; atlas::Ping::BODY_LEN],
 //!     };
-//!     let meta = thincan::RecvMeta { reply_to: () };
+//!     let meta = thincan::RecvMeta { reply_to: 0u8 };
 //!     assert_eq!(
 //!         router.dispatch(&mut handlers, meta, msg).await?,
 //!         DispatchOutcome::Handled
@@ -101,12 +102,12 @@
 //! - N bytes: message body (fixed-length or schema-encoded)
 //!
 //! The helper [`decode_wire()`] parses an incoming payload into a [`RawMessage`]. When sending,
-//! [`Interface::send_msg()`] and [`Interface::send_encoded()`] take care of writing the header.
+//! [`Interface::send_msg_to()`] and [`Interface::send_encoded_to()`] take care of writing
+//! the header.
 //!
 //! # Feature flags
 //! - `std` (default): enables `std::error::Error` and `Display` for [`Error`].
 //! - `capnp`: enables Cap'n Proto decode helpers (`Capnp` / `CapnpTyped`).
-//! - `isotp-uds`: enables UDS 29-bit ISO-TP demux transport helpers (reply-to metadata).
 //!
 //! # More examples
 //! ### `no_std` wiring example (from `tests/no_std_smoke.rs`)
@@ -709,39 +710,15 @@ where
         Self::encode_value_into_buf::<M, V>(self.tx.as_mut(), value)
     }
 
-    /// Send a raw body for message `M` (validates `BODY_LEN` if present).
-    pub fn send_msg<M: Message>(&mut self, body: &[u8], timeout: Duration) -> Result<(), Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpoint,
-    {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send(payload, timeout).map_err(map_isotp_send_error)
-    }
-
-    /// Encode and send a typed value for message `M`.
-    pub fn send_encoded<M: Message, V: Encode<M>>(
-        &mut self,
-        value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpoint,
-    {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send(payload, timeout).map_err(map_isotp_send_error)
-    }
-
     /// Send a raw body for message `M` to a specific transport address.
     pub fn send_msg_to<M: Message>(
         &mut self,
-        to: Node::ReplyTo,
+        to: u8,
         body: &[u8],
         timeout: Duration,
     ) -> Result<(), Error>
     where
-        Node: can_isotp_interface::IsoTpEndpointMeta,
+        Node: can_isotp_interface::IsoTpEndpoint,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
@@ -752,12 +729,12 @@ where
     /// Encode and send a typed value for message `M` to a specific transport address.
     pub fn send_encoded_to<M: Message, V: Encode<M>>(
         &mut self,
-        to: Node::ReplyTo,
+        to: u8,
         value: &V,
         timeout: Duration,
     ) -> Result<(), Error>
     where
-        Node: can_isotp_interface::IsoTpEndpointMeta,
+        Node: can_isotp_interface::IsoTpEndpoint,
     {
         let (node, tx) = (&mut self.node, &mut self.tx);
         let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
@@ -774,108 +751,10 @@ where
     Node: can_isotp_interface::IsoTpAsyncEndpoint,
     TxBuf: AsMut<[u8]>,
 {
-    /// Async send helper for ISO-TP async nodes.
-    pub async fn send_msg_async<M: Message>(
-        &mut self,
-        body: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send(payload, timeout)
-            .await
-            .map_err(map_isotp_send_error)
-    }
-
-    /// Async send-encoded helper for ISO-TP async nodes.
-    pub async fn send_encoded_async<M: Message, V: Encode<M>>(
-        &mut self,
-        value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send(payload, timeout)
-            .await
-            .map_err(map_isotp_send_error)
-    }
-}
-
-impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
-where
-    Node: can_isotp_interface::IsoTpAsyncEndpoint + can_isotp_interface::IsoTpAsyncEndpointRecvInto,
-    TxBuf: AsMut<[u8]>,
-{
-    /// Async receive+dispatch helper for ISO-TP async endpoints.
-    pub async fn recv_one_dispatch_async<Handlers>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        rx: &mut [u8],
-    ) -> Result<RecvDispatch, Error>
-    where
-        Router: RouterDispatch<Handlers, ()>,
-    {
-        self.recv_one_dispatch_with_async(handlers, timeout, rx, |_| Ok(()))
-            .await
-    }
-
-    /// Async receive+dispatch helper with event callback for ISO-TP async endpoints.
-    pub async fn recv_one_dispatch_with_async<Handlers, Ev>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        rx: &mut [u8],
-        mut on_event: Ev,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Router: RouterDispatch<Handlers, ()>,
-        Ev: for<'a> FnMut(DispatchEvent<'a>) -> Result<(), Error>,
-    {
-        let (node, router) = (&mut self.node, &mut self.router);
-
-        match node
-            .recv_one_into(timeout, rx)
-            .await
-            .map_err(map_isotp_recv_error)?
-        {
-            can_isotp_interface::RecvIntoStatus::TimedOut => Ok(RecvDispatch::TimedOut),
-            can_isotp_interface::RecvIntoStatus::DeliveredOne { len } => {
-                let payload = &rx[..len];
-                match decode_wire(payload) {
-                    Ok(raw) => {
-                        let meta = RecvMeta { reply_to: () };
-                        let outcome = router.dispatch(handlers, meta, raw).await?;
-                        on_event(DispatchEvent::Dispatched { raw, outcome })?;
-                        Ok(RecvDispatch::Dispatched {
-                            id: raw.id,
-                            kind: match outcome {
-                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                            },
-                        })
-                    }
-                    Err(_) => {
-                        on_event(DispatchEvent::MalformedPayload { payload })?;
-                        Ok(RecvDispatch::MalformedPayload)
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "isotp-uds")]
-impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
-where
-    Node: can_isotp_interface::IsoTpAsyncEndpointMeta,
-    TxBuf: AsMut<[u8]>,
-{
     /// Async send helper for ISO-TP async demux nodes (addressed send).
     pub async fn send_msg_to_async<M: Message>(
         &mut self,
-        to: <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        to: u8,
         body: &[u8],
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -889,7 +768,7 @@ where
     /// Async send-encoded helper for ISO-TP async demux nodes (addressed send).
     pub async fn send_encoded_to_async<M: Message, V: Encode<M>>(
         &mut self,
-        to: <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
+        to: u8,
         value: &V,
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -901,13 +780,9 @@ where
     }
 }
 
-#[cfg(feature = "isotp-uds")]
 impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
 where
-    Node: can_isotp_interface::IsoTpAsyncEndpointMeta
-        + can_isotp_interface::IsoTpAsyncEndpointMetaRecvInto<
-            ReplyTo = <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
-        >,
+    Node: can_isotp_interface::IsoTpAsyncEndpoint + can_isotp_interface::IsoTpAsyncEndpointRecvInto,
     TxBuf: AsMut<[u8]>,
 {
     /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
@@ -919,18 +794,13 @@ where
         mut on_event: Ev,
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<
-            Handlers,
-            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
-        >,
-        Ev: for<'a> FnMut(
-            DispatchEventMeta<'a, <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo>,
-        ) -> Result<(), Error>,
+        Router: RouterDispatch<Handlers, u8>,
+        Ev: for<'a> FnMut(DispatchEventMeta<'a, u8>) -> Result<(), Error>,
     {
         let (node, router) = (&mut self.node, &mut self.router);
 
         match node
-            .recv_one_meta_into(timeout, rx)
+            .recv_one_into(timeout, rx)
             .await
             .map_err(map_isotp_recv_error)?
         {
@@ -970,10 +840,7 @@ where
         rx: &mut [u8],
     ) -> Result<RecvDispatch, Error>
     where
-        Router: RouterDispatch<
-            Handlers,
-            <Node as can_isotp_interface::IsoTpAsyncEndpointMeta>::ReplyTo,
-        >,
+        Router: RouterDispatch<Handlers, u8>,
     {
         self.recv_one_dispatch_with_meta_async(handlers, timeout, rx, |_| Ok(()))
             .await

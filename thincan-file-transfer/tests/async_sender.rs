@@ -2,7 +2,9 @@
 
 use core::time::Duration;
 
-use can_isotp_interface::{IsoTpAsyncEndpoint, RecvControl, RecvError, RecvStatus, SendError};
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
+};
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -30,8 +32,9 @@ struct DummyNode {
 impl IsoTpAsyncEndpoint for DummyNode {
     type Error = ();
 
-    async fn send(
+    async fn send_to(
         &mut self,
+        _to: u8,
         payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -77,7 +80,7 @@ impl IsoTpAsyncEndpoint for DummyNode {
         _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         Ok(RecvStatus::TimedOut)
     }
@@ -106,6 +109,7 @@ async fn async_sender_completes_with_accept_and_progress_acks() {
     let out = sender
         .send_file_with_id(
             &mut iface,
+            0,
             &mut acks,
             transfer_id,
             &bytes,

@@ -8,7 +8,7 @@
 compile_error!("Enable either the 'uds' or 'socketcan' feature.");
 
 use anyhow::{Context, Result, bail};
-use can_isotp_interface::{IsoTpEndpointMeta as _, RecvControl};
+use can_isotp_interface::{IsoTpEndpoint as _, RecvControl};
 use clap::{Parser, Subcommand};
 use embedded_can_interface::{FilterConfig, RxFrameIo, TxFrameIo};
 use std::collections::VecDeque;
@@ -209,7 +209,7 @@ fn run_listen(cli: &Cli) -> Result<()> {
     loop {
         let _ = iface
             .node_mut()
-            .recv_one_meta(Duration::from_millis(1000), |meta, payload| {
+            .recv_one(Duration::from_millis(1000), |meta, payload| {
                 let raw = match thincan::decode_wire(payload) {
                     Ok(r) => r,
                     Err(_) => return Ok(RecvControl::Continue),
@@ -266,7 +266,7 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
         let mut got = false;
         let _ = iface
             .node_mut()
-            .recv_one_meta(Duration::from_millis(100), |meta, payload| {
+            .recv_one(Duration::from_millis(100), |meta, payload| {
                 if meta.reply_to != dest {
                     return Ok(RecvControl::Continue);
                 }

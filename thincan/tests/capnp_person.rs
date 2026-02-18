@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use can_isotp_interface::{
     IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, IsoTpEndpoint, RecvControl, RecvError,
-    RecvIntoStatus, RecvStatus, SendError,
+    RecvMeta, RecvMetaIntoStatus, RecvStatus, SendError,
 };
 use capnp::message::ReaderOptions;
 use capnp::message::SingleSegmentAllocator;
@@ -50,7 +50,12 @@ impl PipeEnd {
 impl IsoTpEndpoint for PipeEnd {
     type Error = thincan::Error;
 
-    fn send(&mut self, payload: &[u8], _timeout: Duration) -> Result<(), SendError<Self::Error>> {
+    fn send_to(
+        &mut self,
+        _to: u8,
+        payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
         let mut shared = self.shared.lock().unwrap();
         match self.dir {
             Direction::A => shared.a_to_b.push_back(payload.to_vec()),
@@ -65,7 +70,7 @@ impl IsoTpEndpoint for PipeEnd {
         mut on_payload: F,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        F: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        F: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         let mut shared = self.shared.lock().unwrap();
         let queue = match self.dir {
@@ -77,7 +82,7 @@ impl IsoTpEndpoint for PipeEnd {
             return Ok(RecvStatus::TimedOut);
         }
         let payload = queue.pop_front().unwrap();
-        let _ = on_payload(&payload).map_err(RecvError::Backend)?;
+        let _ = on_payload(RecvMeta { reply_to: 0 }, &payload).map_err(RecvError::Backend)?;
         Ok(RecvStatus::DeliveredOne)
     }
 }
@@ -85,12 +90,13 @@ impl IsoTpEndpoint for PipeEnd {
 impl IsoTpAsyncEndpoint for PipeEnd {
     type Error = thincan::Error;
 
-    async fn send(
+    async fn send_to(
         &mut self,
+        to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
-        IsoTpEndpoint::send(self, payload, timeout)
+        IsoTpEndpoint::send_to(self, to, payload, timeout)
     }
 
     async fn recv_one<Cb>(
@@ -99,7 +105,7 @@ impl IsoTpAsyncEndpoint for PipeEnd {
         mut on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         let _ = timeout;
         let mut shared = self.shared.lock().unwrap();
@@ -112,7 +118,7 @@ impl IsoTpAsyncEndpoint for PipeEnd {
             return Ok(RecvStatus::TimedOut);
         }
         let payload = queue.pop_front().unwrap();
-        let _ = on_payload(&payload).map_err(RecvError::Backend)?;
+        let _ = on_payload(RecvMeta { reply_to: 0 }, &payload).map_err(RecvError::Backend)?;
         Ok(RecvStatus::DeliveredOne)
     }
 }
@@ -124,7 +130,7 @@ impl IsoTpAsyncEndpointRecvInto for PipeEnd {
         &mut self,
         _timeout: Duration,
         out: &mut [u8],
-    ) -> Result<RecvIntoStatus, RecvError<Self::Error>> {
+    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
         let mut shared = self.shared.lock().unwrap();
         let queue = match self.dir {
             Direction::A => &mut shared.b_to_a,
@@ -132,7 +138,7 @@ impl IsoTpAsyncEndpointRecvInto for PipeEnd {
         };
 
         if queue.is_empty() {
-            return Ok(RecvIntoStatus::TimedOut);
+            return Ok(RecvMetaIntoStatus::TimedOut);
         }
         let payload = queue.pop_front().unwrap();
         if out.len() < payload.len() {
@@ -142,7 +148,10 @@ impl IsoTpAsyncEndpointRecvInto for PipeEnd {
             });
         }
         out[..payload.len()].copy_from_slice(&payload);
-        Ok(RecvIntoStatus::DeliveredOne { len: payload.len() })
+        Ok(RecvMetaIntoStatus::DeliveredOne {
+            meta: RecvMeta { reply_to: 0 },
+            len: payload.len(),
+        })
     }
 }
 
@@ -163,6 +172,7 @@ thincan::bundle! {
 
 thincan::bus_maplet! {
     pub mod maplet: atlas {
+        reply_to: u8;
         bundles [none];
         parser: thincan::DefaultParser;
         use msgs [Person];
@@ -245,7 +255,7 @@ async fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::E
     let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
     let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
 
-    iface_a.send_encoded::<atlas::Person, _>(
+    iface_a.send_encoded_to::<atlas::Person, _>(0, 
         &PersonValue {
             name: "Bob Jones",
             email: "bob@example.com",
@@ -261,7 +271,7 @@ async fn capnp_person_can_roundtrip_through_interface() -> Result<(), thincan::E
 
     let mut rx = [0u8; 2048];
     let _ = iface_b
-        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
         .await?;
 
     assert_eq!(

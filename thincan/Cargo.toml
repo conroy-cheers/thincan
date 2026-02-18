@@ -13,6 +13,7 @@ embedded-can-interface = "0.1.1"
 phf = { version = "0.13.1", default-features = false, features = ["macros"] }
 can-iso-tp = { path = "../iso-tp/can-iso-tp", version = "0.1.0", default-features = false, features = [
     "isotp-interface",
+    "uds",
 ] }
 can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0" }
 
@@ -22,7 +23,6 @@ capnp = ["dep:capnp"]
 capnp-gen = ["std", "dep:capnpc"]
 std = []
 async = []
-isotp-uds = ["can-iso-tp/uds"]
 
 [dev-dependencies]
 embedded-can-mock = "0.1.0"

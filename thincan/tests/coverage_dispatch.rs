@@ -21,6 +21,7 @@ thincan::bundle! {
 
 thincan::bus_maplet! {
     pub mod maplet_unhandled: atlas {
+        reply_to: u8;
         bundles [demo_bundle];
         parser: thincan::DefaultParser;
         use msgs [Ping, Pong, Nop, Ignored];
@@ -32,6 +33,7 @@ thincan::bus_maplet! {
 
 thincan::bus_maplet! {
     pub mod maplet_handled: atlas {
+        reply_to: u8;
         bundles [demo_bundle];
         parser: thincan::DefaultParser;
         use msgs [Ping, Pong, Nop, Ignored];
@@ -81,12 +83,15 @@ struct BundleHandlers {
     fail_ping: bool,
 }
 
-impl<'a> demo_bundle::Handlers<'a, ()> for BundleHandlers {
+impl<'a, ReplyTo> demo_bundle::Handlers<'a, ReplyTo> for BundleHandlers
+where
+    ReplyTo: Copy,
+{
     type Error = ();
 
     async fn on_ping(
         &mut self,
-        _meta: thincan::RecvMeta<()>,
+        _meta: thincan::RecvMeta<ReplyTo>,
         _msg: &'a [u8; atlas::Ping::BODY_LEN],
     ) -> Result<(), Self::Error> {
         if self.fail_ping {
@@ -162,7 +167,7 @@ fn assert_unique_u16_slices_accepts_unique_slices() {
 
 #[tokio::test]
 async fn dispatch_outcomes_and_error_paths_are_exercised() {
-    let meta = thincan::RecvMeta { reply_to: () };
+    let meta = thincan::RecvMeta { reply_to: 0u8 };
     // Bundle-handled Ping.
     {
         let mut router = maplet_unhandled::Router::new();
@@ -359,8 +364,9 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
     impl can_isotp_interface::IsoTpEndpoint for Sink {
         type Error = thincan::Error;
 
-        fn send(
+        fn send_to(
             &mut self,
+            _to: u8,
             _payload: &[u8],
             _timeout: Duration,
         ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
@@ -372,7 +378,8 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
             _on_payload: F,
         ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
         where
-            F: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
+            F: FnMut(can_isotp_interface::RecvMeta, &[u8])
+                -> Result<can_isotp_interface::RecvControl, Self::Error>,
         {
             Ok(can_isotp_interface::RecvStatus::TimedOut)
         }
@@ -381,7 +388,7 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
     let mut tx = [0u8; 64];
     let mut iface = thincan::Interface::new(Sink, maplet_unhandled::Router::new(), &mut tx);
     let err = iface
-        .send_encoded::<Msg, _>(&LyingValue, Duration::from_millis(1))
+        .send_encoded_to::<Msg, _>(0, &LyingValue, Duration::from_millis(1))
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
@@ -396,7 +403,7 @@ fn interface_send_encoded_rejects_encode_overflowing_max_len() {
     }
 
     let err = iface
-        .send_encoded::<atlas::Ping, _>(&WrongLen, Duration::from_millis(1))
+        .send_encoded_to::<atlas::Ping, _>(0, &WrongLen, Duration::from_millis(1))
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::InvalidBodyLen { .. }));
 }
@@ -455,7 +462,7 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
     let mut tx_buf = [0u8; 64];
     let mut iface = thincan::Interface::new(node, maplet_unhandled::Router::new(), &mut tx_buf);
     let err = iface
-        .send_msg::<atlas::Ping>(&[0x01], Duration::from_millis(10))
+        .send_msg_to::<atlas::Ping>(0, &[0x01], Duration::from_millis(10))
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
@@ -487,7 +494,7 @@ fn can_iso_tp_node_transport_impl_maps_timeout_and_other_errors() {
     let mut tx_buf2 = [0u8; 64];
     let mut iface2 = thincan::Interface::new(node2, maplet_unhandled::Router::new(), &mut tx_buf2);
     let err = iface2
-        .send_msg::<Big>(&[0u8; 6], Duration::from_millis(1))
+        .send_msg_to::<Big>(0, &[0u8; 6], Duration::from_millis(1))
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Timeout));
 }
@@ -501,8 +508,9 @@ async fn async_recv_timeout_maps_to_timedout_dispatch() {
     impl can_isotp_interface::IsoTpAsyncEndpoint for DummyAsync {
         type Error = thincan::Error;
 
-        async fn send(
+        async fn send_to(
             &mut self,
+            _to: u8,
             _payload: &[u8],
             _timeout: Duration,
         ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
@@ -515,7 +523,8 @@ async fn async_recv_timeout_maps_to_timedout_dispatch() {
             _on_payload: Cb,
         ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
         where
-            Cb: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
+            Cb: FnMut(can_isotp_interface::RecvMeta, &[u8])
+                -> Result<can_isotp_interface::RecvControl, Self::Error>,
         {
             Ok(can_isotp_interface::RecvStatus::TimedOut)
         }
@@ -528,9 +537,12 @@ async fn async_recv_timeout_maps_to_timedout_dispatch() {
             &mut self,
             _timeout: Duration,
             _out: &mut [u8],
-        ) -> Result<can_isotp_interface::RecvIntoStatus, can_isotp_interface::RecvError<Self::Error>>
+        ) -> Result<
+            can_isotp_interface::RecvMetaIntoStatus,
+            can_isotp_interface::RecvError<Self::Error>,
+        >
         {
-            Ok(can_isotp_interface::RecvIntoStatus::TimedOut)
+            Ok(can_isotp_interface::RecvMetaIntoStatus::TimedOut)
         }
     }
 
@@ -542,7 +554,7 @@ async fn async_recv_timeout_maps_to_timedout_dispatch() {
     };
     let mut rx = [0u8; 64];
     let st = iface
-        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
         .await
         .unwrap();
     assert_eq!(st, thincan::RecvDispatch::TimedOut);
@@ -557,8 +569,9 @@ async fn async_recv_buffer_too_small_maps_to_thincan_error_kind() {
     impl can_isotp_interface::IsoTpAsyncEndpoint for DummyAsync {
         type Error = thincan::Error;
 
-        async fn send(
+        async fn send_to(
             &mut self,
+            _to: u8,
             _payload: &[u8],
             _timeout: Duration,
         ) -> Result<(), can_isotp_interface::SendError<Self::Error>> {
@@ -571,7 +584,8 @@ async fn async_recv_buffer_too_small_maps_to_thincan_error_kind() {
             _on_payload: Cb,
         ) -> Result<can_isotp_interface::RecvStatus, can_isotp_interface::RecvError<Self::Error>>
         where
-            Cb: FnMut(&[u8]) -> Result<can_isotp_interface::RecvControl, Self::Error>,
+            Cb: FnMut(can_isotp_interface::RecvMeta, &[u8])
+                -> Result<can_isotp_interface::RecvControl, Self::Error>,
         {
             Ok(can_isotp_interface::RecvStatus::TimedOut)
         }
@@ -584,7 +598,10 @@ async fn async_recv_buffer_too_small_maps_to_thincan_error_kind() {
             &mut self,
             _timeout: Duration,
             out: &mut [u8],
-        ) -> Result<can_isotp_interface::RecvIntoStatus, can_isotp_interface::RecvError<Self::Error>>
+        ) -> Result<
+            can_isotp_interface::RecvMetaIntoStatus,
+            can_isotp_interface::RecvError<Self::Error>,
+        >
         {
             Err(can_isotp_interface::RecvError::BufferTooSmall {
                 needed: out.len() + 1,
@@ -601,7 +618,7 @@ async fn async_recv_buffer_too_small_maps_to_thincan_error_kind() {
     };
     let mut rx = [0u8; 8];
     let err = iface
-        .recv_one_dispatch_async(&mut handlers, Duration::from_millis(1), &mut rx)
+        .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::BufferTooSmall { .. }));
@@ -687,7 +704,7 @@ async fn async_helpers_validate_before_sending() {
 
     // send_msg length mismatch (validated before touching the transport).
     let err = iface
-        .send_msg_async::<atlas::Ping>(&[], Duration::from_millis(1))
+        .send_msg_to_async::<atlas::Ping>(0, &[], Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::InvalidBodyLen { .. }));
@@ -703,7 +720,7 @@ async fn async_helpers_validate_before_sending() {
         }
     }
     let err = iface
-        .send_encoded_async::<atlas::Ping, _>(&Lying, Duration::from_millis(1))
+        .send_encoded_to_async::<atlas::Ping, _>(0, &Lying, Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));

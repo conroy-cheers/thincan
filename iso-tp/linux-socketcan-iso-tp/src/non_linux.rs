@@ -4,9 +4,11 @@
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
 use can_isotp_interface::{
-    IsoTpAsyncEndpoint, IsoTpEndpoint, IsoTpEndpointMeta, IsoTpRxFlowControlConfig, RecvControl,
-    RecvError, RecvMeta, RecvStatus, RxFlowControl, SendError,
+    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
+    RxFlowControl, SendError,
 };
+#[cfg(feature = "tokio")]
+use can_isotp_interface::IsoTpAsyncEndpoint;
 use core::time::Duration;
 use embedded_can::Id;
 
@@ -127,7 +129,12 @@ impl SocketCanIsoTp {
 impl IsoTpEndpoint for SocketCanIsoTp {
     type Error = Error;
 
-    fn send(&mut self, _payload: &[u8], _timeout: Duration) -> Result<(), SendError<Self::Error>> {
+    fn send_to(
+        &mut self,
+        _to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
         Err(SendError::Backend(Error))
     }
 
@@ -137,7 +144,7 @@ impl IsoTpEndpoint for SocketCanIsoTp {
         _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         Err(RecvError::Backend(Error))
     }
@@ -172,8 +179,9 @@ impl TokioSocketCanIsoTp {
 impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
     type Error = Error;
 
-    async fn send(
+    async fn send_to(
         &mut self,
+        _to: u8,
         _payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -186,7 +194,7 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
         _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(&[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         Err(RecvError::Backend(Error))
     }
@@ -225,26 +233,25 @@ impl KernelUdsDemux {
     }
 }
 
-impl IsoTpEndpointMeta for KernelUdsDemux {
+impl IsoTpEndpoint for KernelUdsDemux {
     type Error = Error;
-    type ReplyTo = u8;
 
     fn send_to(
         &mut self,
-        _to: Self::ReplyTo,
+        _to: u8,
         _payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
         Err(SendError::Backend(Error))
     }
 
-    fn recv_one_meta<Cb>(
+    fn recv_one<Cb>(
         &mut self,
         _timeout: Duration,
         _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
-        Cb: FnMut(RecvMeta<Self::ReplyTo>, &[u8]) -> Result<RecvControl, Self::Error>,
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
         Err(RecvError::Backend(Error))
     }
