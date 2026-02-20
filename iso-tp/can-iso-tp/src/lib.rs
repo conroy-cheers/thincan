@@ -82,7 +82,7 @@ extern crate alloc;
 
 pub mod address;
 #[cfg(feature = "uds")]
-pub mod async_demux;
+mod async_demux;
 pub mod async_io;
 pub mod async_node;
 pub mod config;
@@ -98,7 +98,9 @@ pub mod tx;
 
 pub use address::{AsymmetricAddress, IsoTpAddress, RxAddress, TargetAddressType, TxAddress};
 #[cfg(feature = "uds")]
-pub use async_demux::IsoTpAsyncDemux;
+pub use async_demux::{
+    AppRecvIntoError, IsoTpAsyncDemux, IsoTpAsyncDemuxApp, IsoTpAsyncDemuxDriver,
+};
 pub use async_io::{AsyncRuntime, TimedOut};
 pub use async_node::IsoTpAsyncNode;
 pub use config::IsoTpConfig;

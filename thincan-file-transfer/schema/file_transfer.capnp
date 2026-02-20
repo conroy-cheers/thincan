@@ -7,7 +7,7 @@ struct FileReq {
   totalLen @1 :UInt32;
   # Opaque metadata bytes supplied by the sender (e.g. filename, MIME type, etc).
   #
-  # This bundle does not interpret these bytes; they are provided for downstream applications.
+  # This bundle does not interpret these bytes; they are provided for downstream consumers.
   fileMetadata @2 :Data;
 
   # Maximum chunk payload size (bytes) the sender is able/willing to emit for this transfer.

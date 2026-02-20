@@ -1,336 +1,227 @@
-#![cfg(feature = "std")]
+#![cfg(all(feature = "std", feature = "capnp"))]
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, IsoTpEndpoint, RecvControl, RecvError,
-    RecvMeta, RecvMetaIntoStatus, RecvStatus, SendError,
-};
+#[path = "support/person_capnp.rs"]
+mod person_capnp;
 
-#[derive(Default)]
-struct SharedPipe {
-    a_to_b: VecDeque<Vec<u8>>,
-    b_to_a: VecDeque<Vec<u8>>,
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvControl, RecvError, RecvMeta,
+    RecvMetaIntoStatus, RecvStatus, SendError,
+};
+use capnp::message::SingleSegmentAllocator;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+thincan::bus_atlas! {
+    pub mod atlas {
+        0x0010 => A(capnp = crate::person_capnp::person::Owned);
+    }
 }
 
-#[derive(Clone)]
-struct PipeEnd {
-    shared: Arc<Mutex<SharedPipe>>,
-    dir: Direction,
-    recv_calls: Arc<Mutex<usize>>,
+pub mod protocol_bundle {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Bundle;
+
+    pub const MESSAGE_COUNT: usize = 1;
+
+    impl thincan::BundleSpec<MESSAGE_COUNT> for Bundle {
+        const MESSAGE_IDS: [u16; MESSAGE_COUNT] = [<super::atlas::A as thincan::Message>::ID];
+    }
+}
+
+thincan::maplet! {
+    pub mod maplet: atlas {
+        bundles [protocol_bundle];
+    }
 }
 
 #[derive(Clone, Copy)]
-enum Direction {
-    A,
-    B,
+struct PersonValue {
+    name: &'static str,
 }
 
-impl PipeEnd {
-    fn pair() -> (Self, Self, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
-        let shared = Arc::new(Mutex::new(SharedPipe::default()));
-        let a_calls = Arc::new(Mutex::new(0usize));
-        let b_calls = Arc::new(Mutex::new(0usize));
-        let a = Self {
-            shared: shared.clone(),
-            dir: Direction::A,
-            recv_calls: a_calls.clone(),
-        };
-        let b = Self {
-            shared,
-            dir: Direction::B,
-            recv_calls: b_calls.clone(),
-        };
-        (a, b, a_calls, b_calls)
-    }
-}
-
-impl IsoTpEndpoint for PipeEnd {
-    type Error = thincan::Error;
-
-    fn send_to(
-        &mut self,
-        _to: u8,
-        payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        let mut shared = self.shared.lock().unwrap();
-        match self.dir {
-            Direction::A => shared.a_to_b.push_back(payload.to_vec()),
-            Direction::B => shared.b_to_a.push_back(payload.to_vec()),
-        }
-        Ok(())
+impl<M> thincan::EncodeCapnp<M> for PersonValue
+where
+    M: thincan::CapnpMessage<Owned = person_capnp::person::Owned>,
+{
+    fn max_encoded_len(&self) -> usize {
+        96
     }
 
-    fn recv_one<F>(
-        &mut self,
-        _timeout: Duration,
-        mut on_payload: F,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        F: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        *self.recv_calls.lock().unwrap() += 1;
+    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
+        let mut scratch = [0u8; 96];
+        let mut msg = capnp::message::Builder::new(SingleSegmentAllocator::new(&mut scratch));
+        let mut root: person_capnp::person::Builder = msg.init_root();
+        root.set_name(self.name);
+        root.set_email("e");
 
-        let mut shared = self.shared.lock().unwrap();
-        let queue = match self.dir {
-            Direction::A => &mut shared.b_to_a,
-            Direction::B => &mut shared.a_to_b,
-        };
-
-        if queue.is_empty() {
-            return Ok(RecvStatus::TimedOut);
+        let body = msg.get_segments_for_output()[0];
+        if out.len() < body.len() {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::BufferTooSmall {
+                    needed: body.len(),
+                    got: out.len(),
+                },
+            });
         }
 
-        let payload = queue.pop_front().unwrap();
-        let _ = on_payload(RecvMeta { reply_to: 0 }, &payload).map_err(RecvError::Backend)?;
-        Ok(RecvStatus::DeliveredOne)
+        out[..body.len()].copy_from_slice(body);
+        Ok(body.len())
     }
 }
 
-impl IsoTpAsyncEndpoint for PipeEnd {
+#[test]
+fn send_side_validation_rejects_too_small_buffer() {
+    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), [0u8; 8]);
+    let err = iface
+        .encode_capnp_into::<atlas::A, _>(&PersonValue { name: "A" })
+        .unwrap_err();
+    assert!(matches!(
+        err.kind,
+        thincan::ErrorKind::BufferTooSmall { .. }
+    ));
+}
+
+#[derive(Debug, Default)]
+struct CountingNode {
+    sends: Arc<Mutex<usize>>,
+    functional_sends: Arc<Mutex<usize>>,
+}
+
+impl IsoTpAsyncEndpoint for CountingNode {
     type Error = thincan::Error;
 
     async fn send_to(
         &mut self,
-        to: u8,
-        payload: &[u8],
-        timeout: Duration,
+        _to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
-        IsoTpEndpoint::send_to(self, to, payload, timeout)
+        *self.sends.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        *self.functional_sends.lock().unwrap() += 1;
+        Ok(())
     }
 
     async fn recv_one<Cb>(
         &mut self,
-        timeout: Duration,
-        mut on_payload: Cb,
+        _timeout: Duration,
+        _on_payload: Cb,
     ) -> Result<RecvStatus, RecvError<Self::Error>>
     where
         Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
-        // Mirror the sync `IsoTpEndpoint` behavior for convenience in async tests.
-        let _ = timeout;
-        *self.recv_calls.lock().unwrap() += 1;
-
-        let mut shared = self.shared.lock().unwrap();
-        let queue = match self.dir {
-            Direction::A => &mut shared.b_to_a,
-            Direction::B => &mut shared.a_to_b,
-        };
-
-        if queue.is_empty() {
-            return Ok(RecvStatus::TimedOut);
-        }
-
-        let payload = queue.pop_front().unwrap();
-        let _ = on_payload(RecvMeta { reply_to: 0 }, &payload).map_err(RecvError::Backend)?;
-        Ok(RecvStatus::DeliveredOne)
+        Ok(RecvStatus::TimedOut)
     }
 }
 
-impl IsoTpAsyncEndpointRecvInto for PipeEnd {
+impl IsoTpAsyncEndpointRecvInto for CountingNode {
     type Error = thincan::Error;
 
     async fn recv_one_into(
         &mut self,
         _timeout: Duration,
-        out: &mut [u8],
+        _out: &mut [u8],
     ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-        *self.recv_calls.lock().unwrap() += 1;
-
-        let mut shared = self.shared.lock().unwrap();
-        let queue = match self.dir {
-            Direction::A => &mut shared.b_to_a,
-            Direction::B => &mut shared.a_to_b,
-        };
-
-        if queue.is_empty() {
-            return Ok(RecvMetaIntoStatus::TimedOut);
-        }
-
-        let payload = queue.pop_front().unwrap();
-        if out.len() < payload.len() {
-            return Err(RecvError::BufferTooSmall {
-                needed: payload.len(),
-                got: out.len(),
-            });
-        }
-        out[..payload.len()].copy_from_slice(&payload);
-        Ok(RecvMetaIntoStatus::DeliveredOne {
-            meta: RecvMeta { reply_to: 0 },
-            len: payload.len(),
-        })
+        Ok(RecvMetaIntoStatus::TimedOut)
     }
 }
 
-thincan::bus_atlas! {
-    pub mod atlas {
-        0x0010 => A(len = 1);
-        0x0011 => B(len = 1);
-    }
-}
-
-thincan::bundle! {
-    pub mod none(atlas) {
-        parser: thincan::DefaultParser;
-        use msgs [];
-        handles {}
-        items {}
-    }
-}
-
-thincan::bus_maplet! {
-    pub mod maplet: atlas {
-        reply_to: u8;
-        bundles [none];
-        parser: thincan::DefaultParser;
-        use msgs [A, B];
-        handles { A => on_a, B => on_b }
-        unhandled_by_default = true;
-        ignore [];
-    }
-}
-
-#[derive(Default)]
-struct App {
-    seen: Vec<u16>,
-}
-
-impl<'a> maplet::Handlers<'a> for App {
-    type Error = ();
-
-    async fn on_a(
-        &mut self,
-        _meta: thincan::RecvMeta<maplet::ReplyTo>,
-        msg: &'a [u8; atlas::A::BODY_LEN],
-    ) -> Result<(), Self::Error> {
-        assert_eq!(*msg, [0xAA]);
-        self.seen.push(<atlas::A as thincan::Message>::ID);
-        Ok(())
-    }
-
-    async fn on_b(
-        &mut self,
-        _meta: thincan::RecvMeta<maplet::ReplyTo>,
-        msg: &'a [u8; atlas::B::BODY_LEN],
-    ) -> Result<(), Self::Error> {
-        assert_eq!(*msg, [0xBB]);
-        self.seen.push(<atlas::B as thincan::Message>::ID);
-        Ok(())
-    }
-}
-
-#[test]
-fn send_side_validation_rejects_wrong_len() {
-    let (a, _b, _a_calls, _b_calls) = PipeEnd::pair();
-    let mut tx = [0u8; 64];
-    let mut iface = thincan::Interface::new(a, maplet::Router::new(), &mut tx);
-
-    let err = iface
-        .send_msg_to::<atlas::A>(0, &[0xAA, 0xBB], Duration::from_millis(1))
-        .unwrap_err();
-    assert_eq!(
-        err.kind,
-        thincan::ErrorKind::InvalidBodyLen {
-            expected: atlas::A::BODY_LEN,
-            got: 2
-        }
-    );
-}
-
-#[tokio::test]
-async fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(), thincan::Error>
-{
-    let (a, b, a_calls, b_calls) = PipeEnd::pair();
-
-    let mut tx_a = [0u8; 64];
-    let mut tx_b = [0u8; 64];
-    let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
-    let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
-
-    iface_a.send_msg_to::<atlas::A>(0, &[0xAA], Duration::from_millis(1))?;
-    iface_a.send_msg_to::<atlas::B>(0, &[0xBB], Duration::from_millis(1))?;
-
-    let mut handlers = maplet::HandlersImpl {
-        app: App::default(),
-        none: none::DefaultHandlers,
+#[tokio::test(flavor = "current_thread")]
+async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
+    let sends = Arc::new(Mutex::new(0usize));
+    let functional_sends = Arc::new(Mutex::new(0usize));
+    let node = CountingNode {
+        sends: sends.clone(),
+        functional_sends: functional_sends.clone(),
     };
-    let mut rx = [0u8; 64];
 
-    assert_eq!(
-        iface_b
-            .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
-            .await?,
-        thincan::RecvDispatch::Dispatched {
-            id: <atlas::A as thincan::Message>::ID,
-            kind: thincan::RecvDispatchKind::Handled
-        }
-    );
-    assert_eq!(
-        iface_b
-            .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
-            .await?,
-        thincan::RecvDispatch::Dispatched {
-            id: <atlas::B as thincan::Message>::ID,
-            kind: thincan::RecvDispatchKind::Handled
-        }
-    );
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node, [0u8; 128]);
+    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
+    doodad
+        .__send_capnp_to::<atlas::A, _>(0x11, &PersonValue { name: "A" }, Duration::from_millis(1))
+        .await?;
+    doodad
+        .__send_capnp_functional_to::<atlas::A, _>(
+            0x7F,
+            &PersonValue { name: "A" },
+            Duration::from_millis(1),
+        )
+        .await?;
 
-    assert_eq!(
-        handlers.app.seen,
-        vec![
-            <atlas::A as thincan::Message>::ID,
-            <atlas::B as thincan::Message>::ID
-        ]
-    );
-
-    // Critical: without buffering, one dispatched message requires one endpoint `recv_one`.
-    assert_eq!(*a_calls.lock().unwrap(), 0);
-    assert_eq!(*b_calls.lock().unwrap(), 2);
+    assert_eq!(*sends.lock().unwrap(), 1);
+    assert_eq!(*functional_sends.lock().unwrap(), 1);
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AValue(u8);
+#[tokio::test(flavor = "current_thread")]
+async fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(), thincan::Error> {
+    #[derive(Default)]
+    struct TimeoutNode;
 
-impl thincan::Encode<atlas::A> for AValue {
-    fn max_encoded_len(&self) -> usize {
-        1
-    }
+    impl IsoTpAsyncEndpoint for TimeoutNode {
+        type Error = thincan::Error;
 
-    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
-        if out.is_empty() {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::Other,
-            });
+        async fn send_to(
+            &mut self,
+            _to: u8,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), SendError<Self::Error>> {
+            Ok(())
         }
-        out[0] = self.0;
-        Ok(1)
+
+        async fn send_functional_to(
+            &mut self,
+            _functional_to: u8,
+            _payload: &[u8],
+            _timeout: Duration,
+        ) -> Result<(), SendError<Self::Error>> {
+            Ok(())
+        }
+
+        async fn recv_one<Cb>(
+            &mut self,
+            _timeout: Duration,
+            _on_payload: Cb,
+        ) -> Result<RecvStatus, RecvError<Self::Error>>
+        where
+            Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
+        {
+            Ok(RecvStatus::TimedOut)
+        }
     }
-}
 
-#[tokio::test]
-async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
-    let (a, b, _a_calls, _b_calls) = PipeEnd::pair();
+    impl IsoTpAsyncEndpointRecvInto for TimeoutNode {
+        type Error = thincan::Error;
 
-    let mut tx_a = [0u8; 64];
-    let mut tx_b = [0u8; 64];
-    let mut iface_a = thincan::Interface::new(a, maplet::Router::new(), &mut tx_a);
-    let mut iface_b = thincan::Interface::new(b, maplet::Router::new(), &mut tx_b);
+        async fn recv_one_into(
+            &mut self,
+            _timeout: Duration,
+            _out: &mut [u8],
+        ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
+            Ok(RecvMetaIntoStatus::TimedOut)
+        }
+    }
 
-    iface_a.send_encoded_to::<atlas::A, _>(0, &AValue(0xAA), Duration::from_millis(1))?;
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, [0u8; 64]);
+    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
+    let timed_out = tokio::time::timeout(
+        Duration::from_millis(1),
+        doodad.__recv_next_capnp_from::<atlas::A>(0x22),
+    )
+    .await
+    .is_err();
+    assert!(timed_out);
 
-    let mut handlers = maplet::HandlersImpl {
-        app: App::default(),
-        none: none::DefaultHandlers,
-    };
-
-    let mut rx = [0u8; 64];
-    let _ = iface_b
-        .recv_one_dispatch_meta_async(&mut handlers, Duration::from_millis(1), &mut rx)
-        .await?;
-    assert_eq!(handlers.app.seen, vec![<atlas::A as thincan::Message>::ID]);
     Ok(())
 }

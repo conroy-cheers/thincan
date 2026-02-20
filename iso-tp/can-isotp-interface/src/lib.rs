@@ -103,6 +103,14 @@ pub trait IsoTpEndpoint {
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>>;
 
+    /// Send a functional-addressing payload to a target functional address.
+    fn send_functional_to(
+        &mut self,
+        functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>>;
+
     /// Receive at most one payload and deliver it with reply-to metadata.
     fn recv_one<Cb>(
         &mut self,
@@ -122,6 +130,14 @@ pub trait IsoTpAsyncEndpoint {
     async fn send_to(
         &mut self,
         to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>>;
+
+    /// Send a functional-addressing payload to a target functional address.
+    async fn send_functional_to(
+        &mut self,
+        functional_to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>>;
@@ -221,6 +237,15 @@ mod tests {
             Ok(())
         }
 
+        fn send_functional_to(
+            &mut self,
+            functional_to: u8,
+            payload: &[u8],
+            timeout: Duration,
+        ) -> Result<(), SendError<Self::Error>> {
+            IsoTpEndpoint::send_to(self, functional_to, payload, timeout)
+        }
+
         fn recv_one<Cb>(
             &mut self,
             _timeout: Duration,
@@ -230,8 +255,7 @@ mod tests {
             Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
         {
             if let Some((reply_to, data)) = self.inbox.pop() {
-                let _ = on_payload(RecvMeta { reply_to }, &data)
-                    .map_err(RecvError::Backend)?;
+                let _ = on_payload(RecvMeta { reply_to }, &data).map_err(RecvError::Backend)?;
                 return Ok(RecvStatus::DeliveredOne);
             }
             Ok(RecvStatus::TimedOut)
@@ -248,6 +272,15 @@ mod tests {
             timeout: Duration,
         ) -> Result<(), SendError<Self::Error>> {
             IsoTpEndpoint::send_to(self, to, payload, timeout)
+        }
+
+        async fn send_functional_to(
+            &mut self,
+            functional_to: u8,
+            payload: &[u8],
+            timeout: Duration,
+        ) -> Result<(), SendError<Self::Error>> {
+            IsoTpEndpoint::send_functional_to(self, functional_to, payload, timeout)
         }
 
         async fn recv_one<Cb>(
@@ -290,13 +323,7 @@ mod tests {
     #[test]
     fn sync_trait_is_addressed() {
         let mut d = Dummy::default();
-        IsoTpEndpoint::send_to(
-            &mut d,
-            0x33,
-            b"abc",
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        IsoTpEndpoint::send_to(&mut d, 0x33, b"abc", Duration::from_millis(1)).unwrap();
         assert_eq!(d.sent_to, vec![0x33]);
         assert_eq!(d.sent_payloads, vec![b"abc".to_vec()]);
     }

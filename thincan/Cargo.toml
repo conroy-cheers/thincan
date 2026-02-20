@@ -16,9 +16,10 @@ can-iso-tp = { path = "../iso-tp/can-iso-tp", version = "0.1.0", default-feature
     "uds",
 ] }
 can-isotp-interface = { path = "../iso-tp/can-isotp-interface", version = "0.1.0" }
+embassy-sync = { version = "0.6", default-features = false }
 
 [features]
-default = ["std"]
+default = ["std", "capnp"]
 capnp = ["dep:capnp"]
 capnp-gen = ["std", "dep:capnpc"]
 std = []

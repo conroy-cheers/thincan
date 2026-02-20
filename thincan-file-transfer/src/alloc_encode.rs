@@ -39,7 +39,7 @@ fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -
     }
 }
 
-impl<A> thincan::Encode<<A as Atlas>::FileReq> for FileReqValue<A>
+impl<A> thincan::EncodeCapnp<<A as Atlas>::FileReq> for FileReqValue<A>
 where
     A: Atlas,
 {
@@ -79,7 +79,7 @@ where
     }
 }
 
-impl<'a, A> thincan::Encode<<A as Atlas>::FileReq> for FileOfferValue<'a, A>
+impl<'a, A> thincan::EncodeCapnp<<A as Atlas>::FileReq> for FileOfferValue<'a, A>
 where
     A: Atlas,
 {
@@ -121,7 +121,7 @@ where
     }
 }
 
-impl<'a, A> thincan::Encode<<A as Atlas>::FileChunk> for FileChunkValue<'a, A>
+impl<'a, A> thincan::EncodeCapnp<<A as Atlas>::FileChunk> for FileChunkValue<'a, A>
 where
     A: Atlas,
 {
@@ -162,7 +162,7 @@ where
     }
 }
 
-impl<A> thincan::Encode<<A as Atlas>::FileAck> for FileAckValue<A>
+impl<A> thincan::EncodeCapnp<<A as Atlas>::FileAck> for FileAckValue<A>
 where
     A: Atlas,
 {

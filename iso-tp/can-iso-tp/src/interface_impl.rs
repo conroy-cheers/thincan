@@ -113,6 +113,18 @@ where
         })
     }
 
+    fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        IsoTpNode::send(self, payload, timeout).map_err(|e| match e {
+            IsoTpError::Timeout(TimeoutKind::NAs) => SendError::Timeout,
+            other => SendError::Backend(other),
+        })
+    }
+
     fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
@@ -164,6 +176,24 @@ where
     async fn send_to(
         &mut self,
         _to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        self.inner
+            .send(self.rt, payload, timeout)
+            .await
+            .map_err(|e| {
+                if matches!(e, IsoTpError::Timeout(TimeoutKind::NAs)) {
+                    SendError::Timeout
+                } else {
+                    SendError::Backend(e)
+                }
+            })
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -289,6 +319,20 @@ where
         })
     }
 
+    fn send_functional_to(
+        &mut self,
+        functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        crate::demux::IsoTpDemux::send_functional_to(self, functional_to, payload, timeout).map_err(
+            |e| match e {
+                IsoTpError::Timeout(TimeoutKind::NAs) => SendError::Timeout,
+                other => SendError::Backend(other),
+            },
+        )
+    }
+
     fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
@@ -346,26 +390,6 @@ where
 }
 
 #[cfg(all(feature = "isotp-interface", feature = "uds"))]
-impl<'a, Tx, Rx, F, C, const MAX: usize> IsoTpRxFlowControlConfig
-    for crate::async_demux::IsoTpAsyncDemux<'a, Tx, Rx, F, C, MAX>
-where
-    Tx: AsyncTxFrameIo<Frame = F>,
-    Rx: AsyncRxFrameIo<Frame = F, Error = Tx::Error>,
-    F: Frame,
-    C: Clock,
-{
-    type Error = IsoTpError<Tx::Error>;
-
-    fn set_rx_flow_control(&mut self, fc: IfaceRxFlowControl) -> Result<(), Self::Error> {
-        self.set_rx_flow_control(crate::RxFlowControl {
-            block_size: fc.block_size,
-            st_min: fc.st_min,
-        });
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "isotp-interface", feature = "uds"))]
 impl<'rt, 'buf, Rt, Tx, Rx, F, C, const MAX_PEERS: usize> IsoTpAsyncEndpoint
     for AsyncWithRt<'rt, Rt, crate::async_demux::IsoTpAsyncDemux<'buf, Tx, Rx, F, C, MAX_PEERS>>
 where
@@ -383,8 +407,26 @@ where
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
-        self.inner
-            .send_to(self.rt, to, payload, timeout)
+        let mut app = self.inner.app();
+        app.send_to(self.rt, to, payload, timeout)
+            .await
+            .map_err(|e| {
+                if matches!(e, IsoTpError::Timeout(TimeoutKind::NAs)) {
+                    SendError::Timeout
+                } else {
+                    SendError::Backend(e)
+                }
+            })
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        let mut app = self.inner.app();
+        app.send_functional_to(self.rt, functional_to, payload, timeout)
             .await
             .map_err(|e| {
                 if matches!(e, IsoTpError::Timeout(TimeoutKind::NAs)) {
@@ -403,28 +445,18 @@ where
     where
         Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
-        let mut cb_err: Option<Self::Error> = None;
-
-        let res = self
-            .inner
-            .recv(self.rt, timeout, &mut |reply_to, payload| {
-                if cb_err.is_some() {
-                    return;
-                }
-                if let Err(e) = on_payload(RecvMeta { reply_to }, payload) {
-                    cb_err = Some(e);
-                }
-            })
-            .await;
-
-        if let Some(e) = cb_err {
-            return Err(RecvError::Backend(e));
-        }
-
-        match res {
-            Ok(()) => Ok(RecvStatus::DeliveredOne),
-            Err(IsoTpError::Timeout(_)) => Ok(RecvStatus::TimedOut),
-            Err(e) => Err(RecvError::Backend(e)),
+        let mut app = self.inner.app();
+        let mut tmp = [0u8; 4095];
+        match app.recv_next_into(self.rt, timeout, &mut tmp).await {
+            Ok(None) => Ok(RecvStatus::TimedOut),
+            Ok(Some((reply_to, len))) => {
+                on_payload(RecvMeta { reply_to }, &tmp[..len]).map_err(RecvError::Backend)?;
+                Ok(RecvStatus::DeliveredOne)
+            }
+            Err(crate::async_demux::AppRecvIntoError::BufferTooSmall { needed, got }) => {
+                Err(RecvError::BufferTooSmall { needed, got })
+            }
+            Err(crate::async_demux::AppRecvIntoError::IsoTp(e)) => Err(RecvError::Backend(e)),
         }
     }
 }
@@ -446,41 +478,17 @@ where
         timeout: Duration,
         out: &mut [u8],
     ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-        let mut copied: Option<(u8, usize)> = None;
-        let mut cb_err: Option<RecvError<Self::Error>> = None;
-
-        let res = self
-            .inner
-            .recv(self.rt, timeout, &mut |reply_to, payload| {
-                if copied.is_some() || cb_err.is_some() {
-                    return;
-                }
-                if payload.len() > out.len() {
-                    cb_err = Some(RecvError::BufferTooSmall {
-                        needed: payload.len(),
-                        got: out.len(),
-                    });
-                    return;
-                }
-                out[..payload.len()].copy_from_slice(payload);
-                copied = Some((reply_to, payload.len()));
-            })
-            .await;
-
-        if let Some(e) = cb_err {
-            return Err(e);
-        }
-
-        match res {
-            Ok(()) => {
-                let (reply_to, len) = copied.unwrap_or((0, 0));
-                Ok(RecvMetaIntoStatus::DeliveredOne {
-                    meta: RecvMeta { reply_to },
-                    len,
-                })
+        let mut app = self.inner.app();
+        match app.recv_next_into(self.rt, timeout, out).await {
+            Ok(None) => Ok(RecvMetaIntoStatus::TimedOut),
+            Ok(Some((reply_to, len))) => Ok(RecvMetaIntoStatus::DeliveredOne {
+                meta: RecvMeta { reply_to },
+                len,
+            }),
+            Err(crate::async_demux::AppRecvIntoError::BufferTooSmall { needed, got }) => {
+                Err(RecvError::BufferTooSmall { needed, got })
             }
-            Err(IsoTpError::Timeout(_)) => Ok(RecvMetaIntoStatus::TimedOut),
-            Err(e) => Err(RecvError::Backend(e)),
+            Err(crate::async_demux::AppRecvIntoError::IsoTp(e)) => Err(RecvError::Backend(e)),
         }
     }
 }

@@ -9,6 +9,8 @@ compile_error!("Enable either the 'uds' or 'socketcan' feature.");
 
 use anyhow::{Context, Result, bail};
 use can_isotp_interface::{IsoTpEndpoint as _, RecvControl};
+use capnp::message::ReaderOptions;
+use capnp::message::SingleSegmentAllocator;
 use clap::{Parser, Subcommand};
 use embedded_can_interface::{FilterConfig, RxFrameIo, TxFrameIo};
 use std::collections::VecDeque;
@@ -16,13 +18,89 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "../../../thincan/tests/support/person_capnp.rs"]
+mod person_capnp;
+
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 thincan::bus_atlas! {
     pub mod atlas {
-        0x0100 => Ping(len = 4);
-        0x0101 => Pong(len = 4);
+        0x0100 => Ping(capnp = crate::person_capnp::person::Owned);
+        0x0101 => Pong(capnp = crate::person_capnp::person::Owned);
     }
+}
+
+pub mod protocol_bundle {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Bundle;
+
+    pub const MESSAGE_COUNT: usize = 2;
+
+    impl thincan::BundleSpec<MESSAGE_COUNT> for Bundle {
+        const MESSAGE_IDS: [u16; MESSAGE_COUNT] = [
+            <super::atlas::Ping as thincan::Message>::ID,
+            <super::atlas::Pong as thincan::Message>::ID,
+        ];
+    }
+}
+
+thincan::maplet! {
+    pub mod maplet: atlas {
+        bundles [protocol_bundle];
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PersonValue<'a> {
+    name: &'a str,
+    email: &'a str,
+}
+
+impl<'a, M> thincan::EncodeCapnp<M> for PersonValue<'a>
+where
+    M: thincan::CapnpMessage<Owned = person_capnp::person::Owned>,
+{
+    fn max_encoded_len(&self) -> usize {
+        256
+    }
+
+    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
+        let mut builder_buf = [0u8; 256];
+        let mut message =
+            capnp::message::Builder::new(SingleSegmentAllocator::new(&mut builder_buf));
+        let mut person: person_capnp::person::Builder = message.init_root();
+        person.set_name(self.name);
+        person.set_email(self.email);
+
+        let segments = message.get_segments_for_output();
+        if segments.len() != 1 {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::Other,
+            });
+        }
+
+        let bytes = segments[0];
+        if out.len() < bytes.len() {
+            return Err(thincan::Error {
+                kind: thincan::ErrorKind::BufferTooSmall {
+                    needed: bytes.len(),
+                    got: out.len(),
+                },
+            });
+        }
+
+        out[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+}
+
+fn decode_seq_capnp(body: &[u8]) -> Option<u32> {
+    let msg = thincan::CapnpTyped::<person_capnp::person::Owned>::new(body);
+    msg.with_root(ReaderOptions::default(), |root| {
+        root.get_name().ok()?.to_str().ok()?.parse::<u32>().ok()
+    })
+    .ok()
+    .flatten()
 }
 
 #[derive(Clone)]
@@ -202,7 +280,10 @@ fn run_listen(cli: &Cli) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
-    let mut iface = thincan::Interface::new(node, (), tx_buf.as_mut_slice());
+    let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
+        node,
+        tx_buf.as_mut_slice(),
+    );
 
     let mut pending_pongs: VecDeque<(u8, u32)> = VecDeque::new();
 
@@ -214,16 +295,25 @@ fn run_listen(cli: &Cli) -> Result<()> {
                     Ok(r) => r,
                     Err(_) => return Ok(RecvControl::Continue),
                 };
-                if raw.id == <atlas::Ping as thincan::Message>::ID && raw.body.len() == 4 {
-                    let seq = u32::from_le_bytes(raw.body.try_into().unwrap());
-                    pending_pongs.push_back((meta.reply_to, seq));
+                if raw.id == <atlas::Ping as thincan::Message>::ID {
+                    if let Some(seq) = decode_seq_capnp(raw.body) {
+                        pending_pongs.push_back((meta.reply_to, seq));
+                    }
                 }
                 Ok(RecvControl::Continue)
             })
             .map_err(|e| anyhow::anyhow!("recv error: {:?}", e))?;
 
         while let Some((to, seq)) = pending_pongs.pop_front() {
-            iface.send_msg_to::<atlas::Pong>(to, &seq.to_le_bytes(), IO_TIMEOUT)?;
+            let seq_text = seq.to_string();
+            iface.send_capnp_to::<atlas::Pong, _>(
+                to,
+                &PersonValue {
+                    name: &seq_text,
+                    email: "pong",
+                },
+                IO_TIMEOUT,
+            )?;
         }
     }
 }
@@ -248,14 +338,25 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
-    let mut iface = thincan::Interface::new(node, (), tx_buf.as_mut_slice());
+    let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
+        node,
+        tx_buf.as_mut_slice(),
+    );
 
     let seq = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
         & 0xFFFF_FFFF) as u32;
-    iface.send_msg_to::<atlas::Ping>(dest, &seq.to_le_bytes(), IO_TIMEOUT)?;
+    let seq_text = seq.to_string();
+    iface.send_capnp_to::<atlas::Ping, _>(
+        dest,
+        &PersonValue {
+            name: &seq_text,
+            email: "ping",
+        },
+        IO_TIMEOUT,
+    )?;
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -274,8 +375,10 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
                     Ok(r) => r,
                     Err(_) => return Ok(RecvControl::Continue),
                 };
-                if raw.id == <atlas::Pong as thincan::Message>::ID && raw.body.len() == 4 {
-                    let got_seq = u32::from_le_bytes(raw.body.try_into().unwrap());
+                if raw.id == <atlas::Pong as thincan::Message>::ID {
+                    let Some(got_seq) = decode_seq_capnp(raw.body) else {
+                        return Ok(RecvControl::Continue);
+                    };
                     if got_seq == seq {
                         got = true;
                         return Ok(RecvControl::Stop);

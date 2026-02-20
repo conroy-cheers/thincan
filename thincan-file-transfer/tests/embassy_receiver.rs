@@ -1,11 +1,11 @@
 #![cfg(all(feature = "embassy", feature = "tokio"))]
 
 use core::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::channel::Channel;
-
-use thincan_file_transfer::{AsyncFileStore, PendingAck, ReceiverConfig};
+use can_isotp_interface::{
+    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
+};
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -15,64 +15,93 @@ thincan::bus_atlas! {
     }
 }
 
+pub mod protocol_bundle {
+    pub type Bundle = thincan_file_transfer::FileTransferBundle<super::atlas::Atlas>;
+    pub const MESSAGE_COUNT: usize = thincan_file_transfer::FILE_TRANSFER_MESSAGE_COUNT;
+}
+
+thincan::maplet! {
+    pub mod maplet: atlas {
+        bundles [file_transfer = protocol_bundle];
+    }
+}
+
 impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileReq = atlas::FileReq;
     type FileChunk = atlas::FileChunk;
     type FileAck = atlas::FileAck;
 }
 
-thincan_file_transfer::file_transfer_bundle! {
-    pub mod ft_bundle(atlas) {}
+#[derive(Debug, Default)]
+struct AckSinkNode {
+    sent_ids: Arc<Mutex<Vec<u16>>>,
 }
 
-thincan::bus_maplet! {
-    pub mod ft_maplet: atlas {
-        reply_to: u8;
-        bundles [ft_bundle];
-        parser: thincan::DefaultParser;
-        use msgs [FileReq, FileChunk, FileAck];
-        handles {}
-        unhandled_by_default = true;
-        ignore [];
+impl IsoTpAsyncEndpoint for AckSinkNode {
+    type Error = ();
+
+    async fn send_to(
+        &mut self,
+        _to: u8,
+        payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        if payload.len() >= 2 {
+            let id = u16::from_le_bytes([payload[0], payload[1]]);
+            self.sent_ids.lock().unwrap().push(id);
+        }
+        Ok(())
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        self.send_to(0, payload, timeout).await
+    }
+
+    async fn recv_one<Cb>(
+        &mut self,
+        _timeout: Duration,
+        _on_payload: Cb,
+    ) -> Result<RecvStatus, RecvError<Self::Error>>
+    where
+        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
+    {
+        Ok(RecvStatus::TimedOut)
     }
 }
 
-#[derive(Default)]
-struct NoApp;
-
-impl<'a> ft_maplet::Handlers<'a> for NoApp {
-    type Error = core::convert::Infallible;
-}
-
 #[derive(Debug, Default)]
-struct MemStore {
-    slow_offset: Option<u32>,
+struct MemoryStore {
+    bytes: Vec<u8>,
 }
 
-impl AsyncFileStore for MemStore {
+impl thincan_file_transfer::AsyncFileStore for MemoryStore {
     type Error = ();
-    type WriteHandle = Vec<u8>;
+    type WriteHandle = ();
 
     async fn begin_write(
         &mut self,
         _transfer_id: u32,
         total_len: u32,
     ) -> Result<Self::WriteHandle, Self::Error> {
-        Ok(vec![0u8; total_len as usize])
+        self.bytes.clear();
+        self.bytes.resize(total_len as usize, 0);
+        Ok(())
     }
 
     async fn write_at(
         &mut self,
-        handle: &mut Self::WriteHandle,
+        _handle: &mut Self::WriteHandle,
         offset: u32,
         bytes: &[u8],
     ) -> Result<(), Self::Error> {
-        if self.slow_offset == Some(offset) {
-            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
-        }
-        let start = offset as usize;
-        let end = start + bytes.len();
-        handle[start..end].copy_from_slice(bytes);
+        let offset = offset as usize;
+        let end = offset + bytes.len();
+        self.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -83,384 +112,72 @@ impl AsyncFileStore for MemStore {
     async fn abort(&mut self, _handle: Self::WriteHandle) {}
 }
 
-fn encode_offer_into<'b>(
-    iface: &mut thincan::Interface<(), (), &'b mut [u8]>,
-    transfer_id: u32,
-    total_len: u32,
-    sender_max_chunk_size: u32,
-    metadata: &[u8],
-) -> Vec<u8> {
-    let payload = iface
-        .encode_value_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
-            transfer_id,
-            total_len,
-            sender_max_chunk_size,
-            metadata,
-        ))
-        .unwrap();
-    payload.to_vec()
-}
-
-fn encode_chunk_into<'b>(
-    iface: &mut thincan::Interface<(), (), &'b mut [u8]>,
-    transfer_id: u32,
-    offset: u32,
-    data: &[u8],
-) -> Vec<u8> {
-    let payload = iface
-        .encode_value_into::<atlas::FileChunk, _>(
-            &thincan_file_transfer::file_chunk::<atlas::Atlas>(transfer_id, offset, data),
-        )
-        .unwrap();
-    payload.to_vec()
-}
-
 #[tokio::test]
-async fn receiver_rejects_oversize_metadata() {
-    type ReplyTo = u8;
-    const MAX_METADATA: usize = 4;
-    const MAX_CHUNK: usize = 16;
-    const IN_DEPTH: usize = 8;
-    const ACK_DEPTH: usize = 8;
+async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
+    const MAX_METADATA: usize = 32;
+    const MAX_CHUNK: usize = 64;
 
-    let inbound: thincan_file_transfer::InboundQueue<
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    > = Channel::new();
-    let acks: thincan_file_transfer::OutboundAckQueue<NoopRawMutex, ReplyTo, ACK_DEPTH> =
-        Channel::new();
-
-    let ingestor = thincan_file_transfer::ReceiverIngress::<
-        atlas::Atlas,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    >::new(&inbound);
-
-    let mut receiver = thincan_file_transfer::ReceiverNoAlloc::<
-        atlas::Atlas,
-        MemStore,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        8,
-        MAX_CHUNK,
-        IN_DEPTH,
-        ACK_DEPTH,
-    >::new(MemStore::default(), &inbound, &acks);
-
-    let mut tx_buf = [0u8; 512];
-    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
-
-    let transfer_id = 1u32;
-    let reply_to = 7u8;
-    let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"toolong");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    assert_eq!(raw.id, <atlas::FileReq as thincan::Message>::ID);
-    assert!(ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap());
-
-    receiver.process_one().await.unwrap();
-    let got = acks.receive().await;
-
-    assert_eq!(got.reply_to, reply_to);
-    assert_eq!(
-        got.ack,
-        PendingAck {
-            transfer_id,
-            kind: thincan_file_transfer::schema::FileAckKind::Reject,
-            next_offset: 0,
-            chunk_size: 0,
-            error: thincan_file_transfer::schema::FileAckError::InvalidRequest,
-        }
-    );
-}
-
-#[tokio::test]
-async fn receiver_cumulative_ack_only_advances_when_contiguous() {
-    type ReplyTo = u8;
-    const MAX_METADATA: usize = 16;
-    const MAX_CHUNK: usize = 8;
-    const IN_DEPTH: usize = 8;
-    const ACK_DEPTH: usize = 8;
-
-    let inbound: thincan_file_transfer::InboundQueue<
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    > = Channel::new();
-    let acks: thincan_file_transfer::OutboundAckQueue<NoopRawMutex, ReplyTo, ACK_DEPTH> =
-        Channel::new();
-
-    let ingestor = thincan_file_transfer::ReceiverIngress::<
-        atlas::Atlas,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    >::new(&inbound);
-
-    let mut receiver = thincan_file_transfer::ReceiverNoAlloc::<
-        atlas::Atlas,
-        MemStore,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        8,
-        MAX_CHUNK,
-        IN_DEPTH,
-        ACK_DEPTH,
-    >::new(MemStore::default(), &inbound, &acks);
-
-    receiver.set_config(thincan_file_transfer::ReceiverNoAllocConfig {
-        receiver: ReceiverConfig {
-            max_chunk_size: MAX_CHUNK as u32,
-        },
-    });
-
-    let mut tx_buf = [0u8; 512];
-    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
-
-    let transfer_id = 1u32;
-    let reply_to = 3u8;
-
-    // Req -> Accept.
-    let payload = encode_offer_into(&mut enc, transfer_id, 16, MAX_CHUNK as u32, b"meta");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-    receiver.process_one().await.unwrap();
-    let accept = acks.receive().await;
-    assert_eq!(
-        accept.ack.kind,
-        thincan_file_transfer::schema::FileAckKind::Accept
-    );
-
-    // Chunk at offset=8 arrives first; cumulative ack must remain at 0.
-    let payload = encode_chunk_into(&mut enc, transfer_id, 8, b"ABCDEFGH");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-    receiver.process_one().await.unwrap();
-    let ack1 = acks.receive().await;
-    assert_eq!(
-        ack1.ack.kind,
-        thincan_file_transfer::schema::FileAckKind::Ack
-    );
-    assert_eq!(ack1.ack.next_offset, 0);
-
-    // Now offset=0 arrives; receiver can complete.
-    let payload = encode_chunk_into(&mut enc, transfer_id, 0, b"abcdefgh");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-    receiver.process_one().await.unwrap();
-    let done = acks.receive().await;
-    assert_eq!(
-        done.ack.kind,
-        thincan_file_transfer::schema::FileAckKind::Complete
-    );
-    assert_eq!(done.ack.next_offset, 16);
-}
-
-#[tokio::test(start_paused = true)]
-async fn receiver_delays_ack_until_slow_write_completes() {
-    type ReplyTo = u8;
-    const MAX_METADATA: usize = 16;
-    const MAX_CHUNK: usize = 8;
-    const IN_DEPTH: usize = 8;
-    const ACK_DEPTH: usize = 8;
-
-    let inbound: thincan_file_transfer::InboundQueue<
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    > = Channel::new();
-    let acks: thincan_file_transfer::OutboundAckQueue<NoopRawMutex, ReplyTo, ACK_DEPTH> =
-        Channel::new();
-
-    let ingestor = thincan_file_transfer::ReceiverIngress::<
-        atlas::Atlas,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    >::new(&inbound);
-
-    let mut store = MemStore::default();
-    store.slow_offset = Some(24);
-
-    let receiver = thincan_file_transfer::ReceiverNoAlloc::<
-        atlas::Atlas,
-        MemStore,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        16,
-        MAX_CHUNK,
-        IN_DEPTH,
-        ACK_DEPTH,
-    >::new(store, &inbound, &acks);
-
-    let mut tx_buf = [0u8; 512];
-    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
-
-    let transfer_id = 1u32;
-    let reply_to = 1u8;
-
-    // Req -> Accept (process in the same task).
-    let payload = encode_offer_into(&mut enc, transfer_id, 64, MAX_CHUNK as u32, b"");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-
-    let mut receiver = receiver;
-    receiver.process_one().await.unwrap();
-    let _ = acks.receive().await;
-
-    // Fast chunks 0..2.
-    for (i, data) in [b"00000000", b"11111111", b"22222222"]
-        .into_iter()
-        .enumerate()
-    {
-        let payload = encode_chunk_into(&mut enc, transfer_id, (i as u32) * 8, data);
-        let raw = thincan::decode_wire(&payload).unwrap();
-        ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-        receiver.process_one().await.unwrap();
-        let _ = acks.receive().await;
-    }
-
-    // Chunk #3 is slow; ack should not be emitted until time advances.
-    let payload = encode_chunk_into(&mut enc, transfer_id, 24, b"33333333");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap();
-
-    let mut process_fut = core::pin::pin!(receiver.process_one());
-    tokio::select! {
-        res = &mut process_fut => {
-            res.unwrap();
-            panic!("process_one unexpectedly completed without advancing time");
-        }
-        _ = tokio::task::yield_now() => {}
-    }
-
-    assert!(
-        tokio::time::timeout(Duration::ZERO, acks.receive())
-            .await
-            .is_err()
-    );
-
-    tokio::time::advance(Duration::from_secs(60 * 60)).await;
-    let (got, _) = tokio::join!(acks.receive(), async {
-        (&mut process_fut).await.unwrap();
-    });
-    assert_eq!(
-        got.ack.kind,
-        thincan_file_transfer::schema::FileAckKind::Ack
-    );
-    assert_eq!(got.ack.next_offset, 32);
-}
-
-#[tokio::test]
-async fn ingress_returns_err_when_queue_is_full() {
-    type ReplyTo = u8;
-    const MAX_METADATA: usize = 16;
-    const MAX_CHUNK: usize = 8;
-    const IN_DEPTH: usize = 1;
-
-    let inbound: thincan_file_transfer::InboundQueue<
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    > = Channel::new();
-
-    let ingestor = thincan_file_transfer::ReceiverIngress::<
-        atlas::Atlas,
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    >::new(&inbound);
-
-    let mut tx_buf = [0u8; 512];
-    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
-
-    let transfer_id = 1u32;
-    let reply_to = 1u8;
-
-    let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    assert!(ingestor.try_ingest_thincan_raw(reply_to, raw).unwrap());
-
-    let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    assert!(ingestor.try_ingest_thincan_raw(reply_to, raw).is_err());
-}
-
-#[tokio::test]
-async fn bundle_ingress_backpressures_when_queue_is_full() {
-    use thincan::RouterDispatch;
-
-    type ReplyTo = u8;
-    const MAX_METADATA: usize = 16;
-    const MAX_CHUNK: usize = 8;
-    const IN_DEPTH: usize = 1;
-
-    let inbound: thincan_file_transfer::InboundQueue<
-        NoopRawMutex,
-        ReplyTo,
-        MAX_METADATA,
-        MAX_CHUNK,
-        IN_DEPTH,
-    > = Channel::new();
-
-    let mut router = ft_maplet::Router::new();
-    let mut handlers = ft_maplet::HandlersImpl {
-        app: NoApp,
-        ft_bundle: ft_bundle::ReceiverIngressHandlers::new(&inbound),
+    let sent_ids = Arc::new(Mutex::new(Vec::new()));
+    let node = AckSinkNode {
+        sent_ids: sent_ids.clone(),
     };
 
-    let mut tx_buf = [0u8; 512];
-    let mut enc = thincan::Interface::new((), (), tx_buf.as_mut_slice());
+    let mut tx_buf = [0u8; 256];
+    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let bundles = maplet::Bundles::new(&iface);
+    let ingress = iface.handle();
 
-    let transfer_id = 1u32;
-    let reply_to = 1u8;
-    let meta = thincan::RecvMeta { reply_to };
-
-    // Fill the inbound queue (depth=1).
-    let payload = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"meta");
-    let raw = thincan::decode_wire(&payload).unwrap();
-    assert_eq!(
-        router.dispatch(&mut handlers, meta, raw).await.unwrap(),
-        thincan::DispatchOutcome::Handled
+    let mut enc_buf = [0u8; 256];
+    let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(
+        (),
+        enc_buf.as_mut_slice(),
     );
 
-    // Second dispatch must await on inbound queue send (backpressure).
-    let payload2 = encode_offer_into(&mut enc, transfer_id, 8, MAX_CHUNK as u32, b"meta");
-    let raw2 = thincan::decode_wire(&payload2).unwrap();
+    let req = enc
+        .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
+            7, 11, 16, b"meta",
+        ))
+        .unwrap()
+        .to_vec();
+    let chunk_a = enc
+        .encode_capnp_into::<atlas::FileChunk, _>(
+            &thincan_file_transfer::file_chunk::<atlas::Atlas>(7, 0, b"hello "),
+        )
+        .unwrap()
+        .to_vec();
+    let chunk_b = enc
+        .encode_capnp_into::<atlas::FileChunk, _>(
+            &thincan_file_transfer::file_chunk::<atlas::Atlas>(7, 6, b"world"),
+        )
+        .unwrap()
+        .to_vec();
 
-    let mut dispatch_fut = core::pin::pin!(router.dispatch(&mut handlers, meta, raw2));
-    tokio::select! {
-        r = &mut dispatch_fut => {
-            r.unwrap();
-            panic!("dispatch unexpectedly completed while inbound queue was full");
-        }
-        _ = tokio::task::yield_now() => {}
-    }
+    ingress.ingest(0x42, &req).await.unwrap();
+    ingress.ingest(0x42, &chunk_a).await.unwrap();
+    ingress.ingest(0x42, &chunk_b).await.unwrap();
 
-    // Drain one event; this should unblock the pending dispatch.
-    let _first = inbound.receive().await;
-    let _ = dispatch_fut.await.unwrap();
+    let mut store = MemoryStore::default();
+    let out = bundles
+        .file_transfer
+        .recv_file_no_alloc::<_, MAX_METADATA, MAX_CHUNK>(
+            0x42,
+            &mut store,
+            Duration::from_millis(50),
+            thincan_file_transfer::ReceiverConfig { max_chunk_size: 64 },
+        )
+        .await
+        .unwrap();
 
-    // And the second event should now be enqueued.
-    let _second = inbound.receive().await;
+    assert_eq!(out.transfer_id, 7);
+    assert_eq!(out.total_len, 11);
+    assert_eq!(out.received_len, 11);
+    assert_eq!(out.metadata.as_slice(), b"meta");
+    assert_eq!(store.bytes, b"hello world");
+
+    let sent = sent_ids.lock().unwrap();
+    let acks = sent
+        .iter()
+        .filter(|&&id| id == <atlas::FileAck as thincan::Message>::ID)
+        .count();
+    assert!(acks >= 2);
 }

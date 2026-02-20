@@ -1,104 +1,49 @@
-#![cfg(not(feature = "std"))]
+#![cfg(all(not(feature = "std"), feature = "capnp"))]
 #![no_std]
 
-// The test harness requires `std`, but we want this crate to be `#![no_std]` to mimic downstream.
-extern crate std;
-
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-fn block_on<F: Future>(mut fut: F) -> F::Output {
-    // A tiny single-threaded executor for tests (no timers).
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-    unsafe fn wake(_: *const ()) {}
-    unsafe fn wake_by_ref(_: *const ()) {}
-    unsafe fn drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-
-    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
-    // SAFETY: `fut` lives on the stack for the duration of this function.
-    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
+#[path = "support/person_capnp.rs"]
+mod person_capnp;
 
 thincan::bus_atlas! {
     pub mod atlas {
-        0x0100 => Ping(len = 1);
-        0x0101 => Pong(len = 2);
+        0x0100 => Ping(capnp = crate::person_capnp::person::Owned);
+        0x0101 => Pong(capnp = crate::person_capnp::person::Owned);
     }
 }
 
-thincan::bundle! {
-    pub mod demo_bundle(atlas) {
-        parser: thincan::DefaultParser;
-        use msgs [Ping, Pong];
-        handles { Ping => on_ping }
-        items {}
+pub mod protocol_bundle {
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Bundle;
+
+    pub const MESSAGE_COUNT: usize = 2;
+
+    impl thincan::BundleSpec<MESSAGE_COUNT> for Bundle {
+        const MESSAGE_IDS: [u16; MESSAGE_COUNT] = [
+            <super::atlas::Ping as thincan::Message>::ID,
+            <super::atlas::Pong as thincan::Message>::ID,
+        ];
     }
 }
 
-thincan::bus_maplet! {
-    pub mod demo_maplet: atlas {
-        bundles [demo_bundle];
-        parser: thincan::DefaultParser;
-        use msgs [Ping, Pong];
-        handles { Pong => on_pong }
-        unhandled_by_default = true;
-        ignore [];
-    }
-}
-
-#[derive(Default)]
-pub struct Handlers;
-
-impl<'a> demo_bundle::Handlers<'a, demo_maplet::ReplyTo> for Handlers {
-    type Error = ();
-    async fn on_ping(
-        &mut self,
-        _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
-        _msg: &'a [u8; atlas::Ping::BODY_LEN],
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-impl<'a> demo_maplet::Handlers<'a> for Handlers {
-    type Error = ();
-    async fn on_pong(
-        &mut self,
-        _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
-        _msg: &'a [u8; atlas::Pong::BODY_LEN],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+thincan::maplet! {
+    pub mod maplet: atlas {
+        bundles [protocol_bundle];
     }
 }
 
 #[test]
-fn no_std_smoke_compiles_and_links() {
-    use thincan::RouterDispatch;
+fn no_std_atlas_markers_and_decode_wire_compile() {
+    let payload = [
+        (<atlas::Ping as thincan::Message>::ID as u8),
+        ((<atlas::Ping as thincan::Message>::ID >> 8) as u8),
+    ];
+    let raw = thincan::decode_wire(&payload).unwrap();
+    assert_eq!(raw.id, <atlas::Ping as thincan::Message>::ID);
+    assert!(raw.body.is_empty());
 
-    let mut router = demo_maplet::Router::new();
-    let mut handlers = demo_maplet::HandlersImpl {
-        app: Handlers::default(),
-        demo_bundle: Handlers::default(),
-    };
-
-    let meta = thincan::RecvMeta { reply_to: () };
-    let _ = block_on(router.dispatch(
-        &mut handlers,
-        meta,
-        thincan::RawMessage {
-            id: <atlas::Ping as thincan::Message>::ID,
-            body: &[0u8; atlas::Ping::BODY_LEN],
-        },
-    ));
+    let _iface =
+        maplet::Interface::<embassy_sync::blocking_mutex::raw::NoopRawMutex, _, _, 1, 8, 1>::new(
+            (),
+            &mut [0u8; 8][..],
+        );
 }

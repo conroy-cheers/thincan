@@ -1,6 +1,7 @@
 #![cfg(feature = "tokio")]
 
 use core::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use can_isotp_interface::{
     IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
@@ -14,22 +15,29 @@ thincan::bus_atlas! {
     }
 }
 
+pub mod protocol_bundle {
+    pub type Bundle = thincan_file_transfer::FileTransferBundle<super::atlas::Atlas>;
+    pub const MESSAGE_COUNT: usize = thincan_file_transfer::FILE_TRANSFER_MESSAGE_COUNT;
+}
+
+thincan::maplet! {
+    pub mod maplet: atlas {
+        bundles [file_transfer = protocol_bundle];
+    }
+}
+
 impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileReq = atlas::FileReq;
     type FileChunk = atlas::FileChunk;
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Debug)]
-struct DummyNode {
-    inbox: thincan_file_transfer::AckInbox,
-    transfer_id: u32,
-    total_len: u32,
-    accept_chunk_size: u32,
-    chunks_seen: u32,
+#[derive(Debug, Default)]
+struct CountingNode {
+    sent_ids: Arc<Mutex<Vec<u16>>>,
 }
 
-impl IsoTpAsyncEndpoint for DummyNode {
+impl IsoTpAsyncEndpoint for CountingNode {
     type Error = ();
 
     async fn send_to(
@@ -38,40 +46,20 @@ impl IsoTpAsyncEndpoint for DummyNode {
         payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
-        if payload.len() < 2 {
-            return Ok(());
-        }
-        let id = u16::from_le_bytes([payload[0], payload[1]]);
-        if id == <atlas::FileReq as thincan::Message>::ID {
-            self.inbox.push(thincan_file_transfer::Ack {
-                transfer_id: self.transfer_id,
-                kind: thincan_file_transfer::schema::FileAckKind::Accept,
-                next_offset: 0,
-                chunk_size: self.accept_chunk_size,
-                error: thincan_file_transfer::schema::FileAckError::None,
-            });
-        } else if id == <atlas::FileChunk as thincan::Message>::ID {
-            self.chunks_seen += 1;
-            let next_offset = match self.chunks_seen {
-                1 => self.accept_chunk_size,
-                2 => self.accept_chunk_size.saturating_mul(2),
-                _ => self.total_len,
-            }
-            .min(self.total_len);
-            let kind = if next_offset == self.total_len {
-                thincan_file_transfer::schema::FileAckKind::Complete
-            } else {
-                thincan_file_transfer::schema::FileAckKind::Ack
-            };
-            self.inbox.push(thincan_file_transfer::Ack {
-                transfer_id: self.transfer_id,
-                kind,
-                next_offset,
-                chunk_size: 0,
-                error: thincan_file_transfer::schema::FileAckError::None,
-            });
+        if payload.len() >= 2 {
+            let id = u16::from_le_bytes([payload[0], payload[1]]);
+            self.sent_ids.lock().unwrap().push(id);
         }
         Ok(())
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        self.send_to(0, payload, timeout).await
     }
 
     async fn recv_one<Cb>(
@@ -86,41 +74,174 @@ impl IsoTpAsyncEndpoint for DummyNode {
     }
 }
 
-#[tokio::test]
-async fn async_sender_completes_with_accept_and_progress_acks() {
-    let (inbox, mut acks) = thincan_file_transfer::ack_channel();
+#[derive(Debug, Default)]
+struct MemoryStore {
+    bytes: Vec<u8>,
+}
 
-    let transfer_id = 1u32;
-    let total_len = 20u32;
-    let accept_chunk_size = 8u32;
-    let node = DummyNode {
-        inbox,
-        transfer_id,
-        total_len,
-        accept_chunk_size,
-        chunks_seen: 0,
+impl thincan_file_transfer::AsyncFileStore for MemoryStore {
+    type Error = ();
+    type WriteHandle = ();
+
+    async fn begin_write(
+        &mut self,
+        _transfer_id: u32,
+        total_len: u32,
+    ) -> Result<Self::WriteHandle, Self::Error> {
+        self.bytes.clear();
+        self.bytes.resize(total_len as usize, 0);
+        Ok(())
+    }
+
+    async fn write_at(
+        &mut self,
+        _handle: &mut Self::WriteHandle,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        let offset = offset as usize;
+        let end = offset + bytes.len();
+        self.bytes[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn commit(&mut self, _handle: Self::WriteHandle) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn abort(&mut self, _handle: Self::WriteHandle) {}
+}
+
+#[tokio::test]
+async fn async_sender_completes_with_preingested_acks() {
+    let sent_ids = Arc::new(Mutex::new(Vec::new()));
+    let node = CountingNode {
+        sent_ids: sent_ids.clone(),
     };
 
     let mut tx_buf = [0u8; 256];
-    let mut iface = thincan::Interface::new(node, (), &mut tx_buf);
+    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(node, &mut tx_buf);
+    let mut bundles = maplet::Bundles::new(&iface);
+    let ingress = iface.handle();
 
-    let mut sender = thincan_file_transfer::AsyncSender::<atlas::Atlas>::new();
-    let bytes = [0xABu8; 20];
-    let out = sender
-        .send_file_with_id(
-            &mut iface,
-            0,
-            &mut acks,
-            transfer_id,
-            &bytes,
-            Duration::from_millis(50),
+    let transfer_id = 1u32;
+    let mut enc_buf = [0u8; 256];
+    let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 1, 256, 1>::new(
+        (),
+        enc_buf.as_mut_slice(),
+    );
+
+    let accept_wire = enc
+        .encode_capnp_into::<atlas::FileAck, _>(&thincan_file_transfer::file_ack_accept::<
+            atlas::Atlas,
+        >(transfer_id, 8))
+        .unwrap()
+        .to_vec();
+    let complete_wire = enc
+        .encode_capnp_into::<atlas::FileAck, _>(
+            &thincan_file_transfer::FileAckValue::<atlas::Atlas>::new(
+                transfer_id,
+                thincan_file_transfer::schema::FileAckKind::Complete,
+                20,
+                0,
+                thincan_file_transfer::schema::FileAckError::None,
+            ),
         )
+        .unwrap()
+        .to_vec();
+
+    ingress.ingest(0, &accept_wire).await.unwrap();
+    ingress.ingest(0, &complete_wire).await.unwrap();
+
+    let config = thincan_file_transfer::SendConfig::default();
+    let bytes = [0xABu8; 20];
+    let out = bundles
+        .file_transfer
+        .send_file_with_id(0, transfer_id, &bytes, Duration::from_millis(50), config)
         .await
         .unwrap();
 
     assert_eq!(out.transfer_id, transfer_id);
     assert_eq!(out.total_len, 20);
-    assert_eq!(out.chunk_size, accept_chunk_size as usize);
+    assert_eq!(out.chunk_size, 8);
     assert_eq!(out.chunks_sent, 3);
     assert_eq!(out.retries, 0);
+
+    let sent = sent_ids.lock().unwrap();
+    let reqs = sent
+        .iter()
+        .filter(|&&id| id == <atlas::FileReq as thincan::Message>::ID)
+        .count();
+    let chunks = sent
+        .iter()
+        .filter(|&&id| id == <atlas::FileChunk as thincan::Message>::ID)
+        .count();
+    assert_eq!(reqs, 1);
+    assert_eq!(chunks, 3);
+}
+
+#[tokio::test]
+async fn recv_file_writes_store_and_sends_acks() {
+    let sent_ids = Arc::new(Mutex::new(Vec::new()));
+    let node = CountingNode {
+        sent_ids: sent_ids.clone(),
+    };
+
+    let mut tx_buf = [0u8; 256];
+    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let bundles = maplet::Bundles::new(&iface);
+    let ingress = iface.handle();
+
+    let mut enc_buf = [0u8; 256];
+    let mut enc =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), &mut enc_buf);
+    let req = enc
+        .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
+            9, 11, 8, b"meta",
+        ))
+        .unwrap()
+        .to_vec();
+    let chunk_a = enc
+        .encode_capnp_into::<atlas::FileChunk, _>(
+            &thincan_file_transfer::file_chunk::<atlas::Atlas>(9, 0, b"hello "),
+        )
+        .unwrap()
+        .to_vec();
+    let chunk_b = enc
+        .encode_capnp_into::<atlas::FileChunk, _>(
+            &thincan_file_transfer::file_chunk::<atlas::Atlas>(9, 6, b"world"),
+        )
+        .unwrap()
+        .to_vec();
+
+    ingress.ingest(0, &req).await.unwrap();
+    ingress.ingest(0, &chunk_a).await.unwrap();
+    ingress.ingest(0, &chunk_b).await.unwrap();
+
+    let mut store = MemoryStore::default();
+    let out = bundles
+        .file_transfer
+        .recv_file(
+            0,
+            &mut store,
+            Duration::from_millis(50),
+            thincan_file_transfer::ReceiverConfig { max_chunk_size: 64 },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.transfer_id, 9);
+    assert_eq!(out.total_len, 11);
+    assert_eq!(out.received_len, 11);
+    assert_eq!(out.sender_max_chunk_size, 8);
+    assert_eq!(out.negotiated_chunk_size, 8);
+    assert_eq!(out.metadata.as_slice(), b"meta");
+    assert_eq!(store.bytes, b"hello world");
+
+    let sent = sent_ids.lock().unwrap();
+    let acks = sent
+        .iter()
+        .filter(|&&id| id == <atlas::FileAck as thincan::Message>::ID)
+        .count();
+    assert!(acks >= 2);
 }

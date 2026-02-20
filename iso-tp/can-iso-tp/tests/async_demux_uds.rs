@@ -150,11 +150,13 @@ async fn async_demux_receives_two_sources_without_mixing() {
 
     let storages: [RxStorage<'static>; MAX_PEERS] =
         core::array::from_fn(|_| RxStorage::Owned(vec![0u8; 256]));
-    let mut demux = IsoTpAsyncDemux::<_, _, _, _, MAX_PEERS>::with_std_clock(
+    let mut demux = IsoTpAsyncDemux::<_, _, _, _, MAX_PEERS>::new(
         rx_tx,
         rx_rx,
         base_cfg(256),
+        StdClock,
         local,
+        None,
         storages,
     )
     .unwrap();
@@ -195,12 +197,18 @@ async fn async_demux_receives_two_sources_without_mixing() {
     let recv_fut = async {
         let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
         for _ in 0..2 {
-            demux
-                .recv(&rt, Duration::from_millis(500), &mut |reply_to, payload| {
-                    got.push((reply_to, payload.to_vec()));
-                })
+            let mut out = [0u8; 256];
+            let mut app = demux.app();
+            let st = app
+                .recv_next_into(&rt, Duration::from_millis(500), &mut out)
                 .await
                 .unwrap();
+            match st {
+                None => panic!("expected payload, got timeout"),
+                Some((reply_to, len)) => {
+                    got.push((reply_to, out[..len].to_vec()));
+                }
+            }
         }
         got
     };
@@ -235,15 +243,16 @@ async fn async_demux_receives_functional_single_frame() {
 
     let storages: [RxStorage<'static>; MAX_PEERS] =
         core::array::from_fn(|_| RxStorage::Owned(vec![0u8; 64]));
-    let mut demux = IsoTpAsyncDemux::<_, _, _, _, MAX_PEERS>::with_std_clock(
+    let mut demux = IsoTpAsyncDemux::<_, _, _, _, MAX_PEERS>::new(
         rx_tx,
         rx_rx,
         base_cfg(64),
+        StdClock,
         local_phys,
+        Some(local_func),
         storages,
     )
-    .unwrap()
-    .with_functional_addr(local_func);
+    .unwrap();
 
     let payload = b"ping";
     let mut data = [0u8; 8];
@@ -259,14 +268,16 @@ async fn async_demux_receives_functional_single_frame() {
     s_tx.send(&frame).await.unwrap();
 
     let rt = TokioRt;
-    let mut got: Option<(u8, Vec<u8>)> = None;
-    demux
-        .recv(&rt, Duration::from_millis(200), &mut |reply_to, payload| {
-            got = Some((reply_to, payload.to_vec()));
-        })
+    let mut out = [0u8; 64];
+    let mut app = demux.app();
+    let st = app
+        .recv_next_into(&rt, Duration::from_millis(200), &mut out)
         .await
         .unwrap();
-    let (reply_to, bytes) = got.expect("expected a delivered payload");
+    let (reply_to, bytes) = match st {
+        None => panic!("expected payload, got timeout"),
+        Some((reply_to, len)) => (reply_to, out[..len].to_vec()),
+    };
     assert_eq!(reply_to, tester);
     assert_eq!(bytes, payload);
 }

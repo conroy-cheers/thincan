@@ -9,12 +9,16 @@ clap = { version = "4.5.23", features = ["derive"] }
 can-iso-tp = { path = "../../iso-tp/can-iso-tp", features = ["std", "uds"] }
 can-isotp-interface = { path = "../../iso-tp/can-isotp-interface" }
 can-uds = { path = "../../can-uds" }
+capnp = { version = "0.25.0", default-features = false, features = ["unaligned"] }
 embedded-can = "0.4.1"
 embedded-can-interface = "0.1.1"
+rand = { version = "0.9.2", features = ["std"] }
 thincan = { path = "../../thincan", default-features = false, features = [
     "std",
     "capnp",
 ] }
+thincan-file-transfer = { path = "../../thincan-file-transfer", features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", optional = true }
 embedded-can-socketcan = { path = "../../embedded-can/embedded-can-socketcan", optional = true }
@@ -35,4 +39,14 @@ socketcan-isotp = [
 [[bin]]
 name = "uds-server"
 path = "src/bin/uds-server.rs"
+required-features = ["uds"]
+
+[[bin]]
+name = "file-transfer-bench-a"
+path = "src/bin/file-transfer-bench-a.rs"
+required-features = ["uds"]
+
+[[bin]]
+name = "file-transfer-bench-b"
+path = "src/bin/file-transfer-bench-b.rs"
 required-features = ["uds"]

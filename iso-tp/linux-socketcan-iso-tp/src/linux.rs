@@ -304,6 +304,15 @@ impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
         }
     }
 
+    fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        self.send_to(0, payload, timeout)
+    }
+
     fn recv_one<Cb>(
         &mut self,
         timeout: Duration,
@@ -331,7 +340,8 @@ impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
                 }
 
                 let payload = &self.rx_buf[..read as usize];
-                let _ = on_payload(RecvMeta { reply_to: 0 }, payload).map_err(RecvError::Backend)?;
+                let _ =
+                    on_payload(RecvMeta { reply_to: 0 }, payload).map_err(RecvError::Backend)?;
                 return Ok(RecvStatus::DeliveredOne);
             }
 
@@ -459,6 +469,15 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
             Ok(v) => v,
             Err(_) => Err(SendError::Timeout),
         }
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        self.send_to(0, payload, timeout).await
     }
 
     async fn recv_one<Cb>(
@@ -592,6 +611,17 @@ impl can_isotp_interface::IsoTpEndpoint for KernelUdsDemux {
     ) -> Result<(), SendError<Self::Error>> {
         let socket = self.ensure_peer(to).map_err(SendError::Backend)?;
         socket.send_to(to, payload, timeout)
+    }
+
+    fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        Err(SendError::Backend(Error::InvalidConfig(
+            "functional send is not supported by KernelUdsDemux",
+        )))
     }
 
     fn recv_one<Cb>(

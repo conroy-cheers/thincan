@@ -25,10 +25,17 @@ fn demux_send_and_recv_single_frame() {
     let storages_b: [can_iso_tp::RxStorage<'static>; MAX] =
         core::array::from_fn(|_| can_iso_tp::RxStorage::Owned(vec![0u8; 4095]));
 
-    let mut demux_a =
-        IsoTpDemux::new(a_tx, a_rx, cfg.clone(), can_iso_tp::StdClock, 0x10, storages_a).unwrap();
-    let mut demux_b = IsoTpDemux::new(b_tx, b_rx, cfg, can_iso_tp::StdClock, 0x20, storages_b)
-        .unwrap();
+    let mut demux_a = IsoTpDemux::new(
+        a_tx,
+        a_rx,
+        cfg.clone(),
+        can_iso_tp::StdClock,
+        0x10,
+        storages_a,
+    )
+    .unwrap();
+    let mut demux_b =
+        IsoTpDemux::new(b_tx, b_rx, cfg, can_iso_tp::StdClock, 0x20, storages_b).unwrap();
 
     demux_a
         .send_to(0x20, b"yo", core::time::Duration::from_millis(10))
@@ -37,11 +44,14 @@ fn demux_send_and_recv_single_frame() {
     let mut reply_to = None;
     let mut got = Vec::new();
     let status = demux_b
-        .recv_one(core::time::Duration::from_millis(10), |meta: RecvMeta, payload| {
-            reply_to = Some(meta.reply_to);
-            got.extend_from_slice(payload);
-            Ok(RecvControl::Continue)
-        })
+        .recv_one(
+            core::time::Duration::from_millis(10),
+            |meta: RecvMeta, payload| {
+                reply_to = Some(meta.reply_to);
+                got.extend_from_slice(payload);
+                Ok(RecvControl::Continue)
+            },
+        )
         .unwrap();
 
     assert_eq!(status, RecvStatus::DeliveredOne);

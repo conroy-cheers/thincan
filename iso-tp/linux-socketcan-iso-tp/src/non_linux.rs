@@ -3,12 +3,12 @@
 //! This crate targets Linux kernel `CAN_ISOTP` sockets. On non-Linux targets we provide
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
+#[cfg(feature = "tokio")]
+use can_isotp_interface::IsoTpAsyncEndpoint;
 use can_isotp_interface::{
     IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
     RxFlowControl, SendError,
 };
-#[cfg(feature = "tokio")]
-use can_isotp_interface::IsoTpAsyncEndpoint;
 use core::time::Duration;
 use embedded_can::Id;
 
@@ -138,6 +138,15 @@ impl IsoTpEndpoint for SocketCanIsoTp {
         Err(SendError::Backend(Error))
     }
 
+    fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        Err(SendError::Backend(Error))
+    }
+
     fn recv_one<Cb>(
         &mut self,
         _timeout: Duration,
@@ -182,6 +191,15 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
     async fn send_to(
         &mut self,
         _to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        Err(SendError::Backend(Error))
+    }
+
+    async fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
         _payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {
@@ -239,6 +257,15 @@ impl IsoTpEndpoint for KernelUdsDemux {
     fn send_to(
         &mut self,
         _to: u8,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<(), SendError<Self::Error>> {
+        Err(SendError::Backend(Error))
+    }
+
+    fn send_functional_to(
+        &mut self,
+        _functional_to: u8,
         _payload: &[u8],
         _timeout: Duration,
     ) -> Result<(), SendError<Self::Error>> {

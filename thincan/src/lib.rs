@@ -1,133 +1,22 @@
-//! thincan: application-layer messages over ISO-TP.
+//! thincan: capnp-only message transport helpers over ISO-TP payloads.
 //!
-//! `thincan` is a tiny application-layer protocol intended to sit *above* ISO-TP: once an
-//! ISO-TP implementation has delivered a payload, `thincan` defines how that payload is
-//! interpreted as an application message and routed to a handler.
+//! `thincan` sits above ISO-TP and defines a tiny wire header:
+//! - `u16` message id (little-endian)
+//! - message body bytes (Cap'n Proto single segment)
 //!
 //! The crate provides:
-//! - A tiny wire format (`u16` message id + body bytes).
-//! - Macros to declare a message registry (**atlas**) via [`bus_atlas!`].
-//! - Macros to group message handlers into reusable (**bundle**) modules via [`bundle!`].
-//! - Macros to compose bundles + application handlers into per-device (**maplet**) routers via
-//!   [`bus_maplet!`].
-//! - Optional send/receive helpers ([`Interface`]) that integrate with addressed ISO-TP endpoints.
-//!
-//! `thincan` intentionally does **not** implement ISO-TP framing/flow-control. It expects an
-//! addressed ISO-TP endpoint (UDS-style `reply_to` metadata).
-//!
-//! # Concepts
-//! - **Atlas**: the global registry of message ids and names for a "bus".
-//! - **Bundle**: a reusable unit of parsing + handler methods for a subset of atlas messages.
-//! - **Maplet**: a per-firmware/per-device view of the bus: which messages exist, which are
-//!   handled by the application, which are handled by bundles, and which should be ignored.
-//!
-//! # Quick start (atlas → bundle → maplet → dispatch)
-//! ```rust,ignore
-//! use thincan::{bus_atlas, bus_maplet, bundle, DispatchOutcome, Message, RawMessage, RouterDispatch};
-//!
-//! bus_atlas! {
-//!     pub mod atlas {
-//!         0x0100 => Ping(len = 1);
-//!         0x0101 => Pong(len = 2);
-//!     }
-//! }
-//!
-//! bundle! {
-//!     pub mod demo_bundle(atlas) {
-//!         parser: thincan::DefaultParser;
-//!         use msgs [Ping, Pong];
-//!         handles { Ping => on_ping }
-//!     }
-//! }
-//!
-//! bus_maplet! {
-//!     pub mod demo_maplet: atlas {
-//!         reply_to: u8;
-//!         bundles [demo_bundle];
-//!         parser: thincan::DefaultParser;
-//!         use msgs [Ping, Pong];
-//!         handles { Pong => on_pong }
-//!         unhandled_by_default = true;
-//!         ignore [];
-//!     }
-//! }
-//!
-//! #[derive(Default)]
-//! struct Handlers;
-//!
-//! impl<'a> demo_bundle::Handlers<'a, demo_maplet::ReplyTo> for Handlers {
-//!     type Error = ();
-//!     async fn on_ping(
-//!         &mut self,
-//!         _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
-//!         _msg: &'a [u8; atlas::Ping::BODY_LEN],
-//!     ) -> Result<(), Self::Error> {
-//!         Ok(())
-//!     }
-//! }
-//!
-//! impl<'a> demo_maplet::Handlers<'a> for Handlers {
-//!     type Error = ();
-//!     async fn on_pong(
-//!         &mut self,
-//!         _meta: thincan::RecvMeta<demo_maplet::ReplyTo>,
-//!         _msg: &'a [u8; atlas::Pong::BODY_LEN],
-//!     ) -> Result<(), Self::Error> {
-//!         Ok(())
-//!     }
-//! }
-//!
-//! async fn demo() -> Result<(), thincan::Error> {
-//!     let mut router = demo_maplet::Router::new();
-//!     let mut handlers = demo_maplet::HandlersImpl {
-//!         app: Handlers::default(),
-//!         demo_bundle: Handlers::default(),
-//!     };
-//!
-//!     let msg = RawMessage {
-//!         id: <atlas::Ping as Message>::ID,
-//!         body: &[0u8; atlas::Ping::BODY_LEN],
-//!     };
-//!     let meta = thincan::RecvMeta { reply_to: 0u8 };
-//!     assert_eq!(
-//!         router.dispatch(&mut handlers, meta, msg).await?,
-//!         DispatchOutcome::Handled
-//!     );
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # Wire format
-//! - 2 bytes: message id (`u16`, little endian)
-//! - N bytes: message body (fixed-length or schema-encoded)
-//!
-//! The helper [`decode_wire()`] parses an incoming payload into a [`RawMessage`]. When sending,
-//! [`Interface::send_msg_to()`] and [`Interface::send_encoded_to()`] take care of writing
-//! the header.
-//!
-//! # Feature flags
-//! - `std` (default): enables `std::error::Error` and `Display` for [`Error`].
-//! - `capnp`: enables Cap'n Proto decode helpers (`Capnp` / `CapnpTyped`).
-//!
-//! # More examples
-//! ### `no_std` wiring example (from `tests/no_std_smoke.rs`)
-#![doc = "```rust,ignore"]
-#![doc = include_str!("../tests/no_std_smoke.rs")]
-#![doc = "```"]
-//!
-//! ### Cap'n Proto round-trip example (from `tests/capnp_person.rs`)
-#![doc = "```rust,ignore"]
-#![doc = include_str!("../tests/capnp_person.rs")]
-#![doc = "```"]
+//! - `bus_atlas!` for message marker declarations
+//! - `maplet!` for composing a compile-time message set
+//! - maplet-typed `Interface` for async send, ingest, and mailboxed typed receive
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(async_fn_in_trait)]
 
 use core::marker::PhantomData;
 use core::time::Duration;
 
+pub use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+
 /// Simple message metadata (id + body length).
-///
-/// This is a lightweight helper for tooling and documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageSpec {
     /// 16-bit message id.
@@ -137,60 +26,16 @@ pub struct MessageSpec {
 }
 
 /// Marker trait for message types declared in a bus atlas.
-///
-/// Each message has a globally unique `ID` within the atlas, and an optional
-/// fixed-length `BODY_LEN` for validation.
 pub trait Message {
     /// 16-bit message id written to the wire (little endian).
     const ID: u16;
-    /// Fixed body length in bytes, if known at compile time.
-    ///
-    /// Messages declared via `bus_atlas!(... len = N ...)` set this to `Some(N)`.
-    /// Messages declared via `bus_atlas!(... capnp = ... )` leave this as `None`.
-    const BODY_LEN: Option<usize> = None;
 }
 
-/// Simple parse trait for converting a raw body into a typed view.
-///
-/// Most code uses [`MessageParser`] + [`DefaultParser`] instead. This is kept
-/// for convenience when you want a message-local parser.
-pub trait Parse<'a>: Message {
-    /// Parsed representation of the message body.
-    type Parsed;
-    /// Parse a body into a typed representation.
-    fn parse(body: &'a [u8]) -> Result<Self::Parsed, Error>;
+/// Marker trait for messages whose body is a Cap'n Proto single segment.
+pub trait CapnpMessage: Message {
+    /// The Cap'n Proto owned type used for typed decoding.
+    type Owned;
 }
-
-/// Default parser used by `bus_atlas!` for `len = N` and `capnp = ...` messages.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultParser;
-
-/// Parser abstraction used by bundles and maplets.
-///
-/// The parser is generic over a message type and can return a borrowed view
-/// (via the GAT `Parsed<'a>`).
-pub trait MessageParser<M: Message> {
-    /// Parsed representation of `M` that may borrow the input buffer.
-    type Parsed<'a>;
-    /// Parse a raw body into a typed representation.
-    fn parse<'a>(&self, body: &'a [u8]) -> Result<Self::Parsed<'a>, Error>;
-}
-
-/// Convenience extension trait for calling `parse_msg` on any parser.
-pub trait ParseExt {
-    /// Parse a message body using the parser implementation for `M`.
-    fn parse_msg<'a, M: Message>(
-        &self,
-        body: &'a [u8],
-    ) -> Result<<Self as MessageParser<M>>::Parsed<'a>, Error>
-    where
-        Self: MessageParser<M>,
-    {
-        <Self as MessageParser<M>>::parse(self, body)
-    }
-}
-
-impl<T> ParseExt for T {}
 
 /// Error classification returned by `thincan` operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,13 +47,6 @@ pub enum ErrorKind {
         /// Needed length in bytes.
         needed: usize,
         /// Available length in bytes.
-        got: usize,
-    },
-    /// Body length did not match the expected fixed-length message size.
-    InvalidBodyLen {
-        /// Expected body length in bytes.
-        expected: usize,
-        /// Received body length in bytes.
         got: usize,
     },
     /// Catch-all for other errors (parsing, protocol, or transport).
@@ -250,7 +88,7 @@ pub struct RawMessage<'a> {
     pub body: &'a [u8],
 }
 
-/// A convenient wrapper for "typed decode helpers" (e.g. Cap'n Proto readers) that borrow a buffer.
+/// A convenient wrapper for Cap'n Proto decode helpers that borrow a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capnp<'a> {
     /// Raw message bytes.
@@ -258,9 +96,6 @@ pub struct Capnp<'a> {
 }
 
 /// A schema-typed Cap'n Proto decode helper that borrows a buffer.
-///
-/// The primary DX goal is that RX handlers can receive a *typed* value, while still supporting
-/// Cap'n Proto's zero-copy reading model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapnpTyped<'a, Schema>(
     /// Raw bytes wrapped as a Cap'n Proto helper.
@@ -324,46 +159,6 @@ impl<'a> Capnp<'a> {
     }
 }
 
-/// Result of dispatching a decoded message to a maplet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchOutcome<'a, Unhandled = RawMessage<'a>> {
-    /// A message was decoded and routed to its unique handler.
-    Handled,
-    /// The message ID was known and decodable in this maplet, but intentionally not routed.
-    Unhandled(Unhandled),
-    /// The message ID was not recognized for this maplet (or not supported by this firmware).
-    Unknown { id: u16, body: &'a [u8] },
-}
-
-#[doc(hidden)]
-pub const fn __assert_unique_u16_slices<const N: usize>(slices: [&[u16]; N]) {
-    let mut s1 = 0usize;
-    while s1 < N {
-        let a = slices[s1];
-        let mut i = 0usize;
-        while i < a.len() {
-            let v = a[i];
-
-            let mut s2 = s1;
-            let mut j = i + 1;
-            while s2 < N {
-                let b = slices[s2];
-                while j < b.len() {
-                    if b[j] == v {
-                        panic!("duplicate handled message id");
-                    }
-                    j += 1;
-                }
-                s2 += 1;
-                j = 0;
-            }
-
-            i += 1;
-        }
-        s1 += 1;
-    }
-}
-
 /// Number of bytes used for the message id header.
 pub const HEADER_LEN: usize = 2;
 
@@ -383,106 +178,13 @@ pub fn decode_wire(payload: &[u8]) -> Result<RawMessage<'_>, Error> {
     })
 }
 
-/// A trait for message bodies that can be encoded for transmission.
-///
-/// This is intentionally implemented for *value types* (often local to a bundle),
-/// rather than for the atlas message type itself, so bundles can be composed
-/// without requiring orphan-rule-breaking impls.
-pub trait Encode<M: Message> {
-    /// Upper bound on the number of bytes `encode()` may write.
-    ///
-    /// Implementations must ensure `encode()` never returns a value greater than this.
+/// A trait for values that can encode a Cap'n Proto body for transmission.
+pub trait EncodeCapnp<M: CapnpMessage> {
+    /// Upper bound on bytes `encode()` may write.
     fn max_encoded_len(&self) -> usize;
 
-    /// Encodes into `out` and returns the number of bytes written.
-    ///
-    /// The returned length is the body length (it does not include the 2-byte header).
+    /// Encodes into `out` and returns written body length (excluding header).
     fn encode(&self, out: &mut [u8]) -> Result<usize, Error>;
-}
-
-impl<M: Message> Encode<M> for &[u8] {
-    fn max_encoded_len(&self) -> usize {
-        self.len()
-    }
-
-    fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
-        if out.len() < self.len() {
-            return Err(Error {
-                kind: ErrorKind::Other,
-            });
-        }
-        out[..self.len()].copy_from_slice(self);
-        Ok(self.len())
-    }
-}
-
-impl<const N: usize, M: Message> Encode<M> for &[u8; N] {
-    fn max_encoded_len(&self) -> usize {
-        N
-    }
-
-    fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
-        if out.len() < N {
-            return Err(Error {
-                kind: ErrorKind::Other,
-            });
-        }
-        out[..N].copy_from_slice(&self[..]);
-        Ok(N)
-    }
-}
-
-/// Receive control returned by transport callbacks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvControl {
-    /// Continue normal operation.
-    Continue,
-    /// Stop early (transport may ignore this for single-delivery APIs).
-    Stop,
-}
-
-/// Status returned by receive operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvStatus {
-    /// A single payload was delivered.
-    DeliveredOne,
-    /// No payload arrived before the timeout.
-    TimedOut,
-}
-
-/// Event emitted during receive+dispatch.
-///
-/// All borrowed data is only valid for the duration of the callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchEvent<'a> {
-    /// The received payload could not be decoded as a `thincan` message (missing/short header).
-    MalformedPayload { payload: &'a [u8] },
-    /// A payload was decoded and dispatched through the router.
-    Dispatched {
-        raw: RawMessage<'a>,
-        outcome: DispatchOutcome<'a>,
-    },
-}
-
-/// Event emitted during receive+dispatch when the transport provides reply-to metadata.
-///
-/// All borrowed data is only valid for the duration of the callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchEventMeta<'a, A>
-where
-    A: Copy,
-{
-    /// The received payload could not be decoded as a `thincan` message (missing/short header).
-    MalformedPayload {
-        meta: RecvMeta<A>,
-        payload: &'a [u8],
-    },
-    /// A payload was decoded and dispatched through the router.
-    Dispatched {
-        meta: RecvMeta<A>,
-        raw: RawMessage<'a>,
-        outcome: DispatchOutcome<'a>,
-    },
 }
 
 /// Receive metadata provided by transports that can identify the sender.
@@ -501,18 +203,7 @@ fn map_isotp_send_error<E>(err: can_isotp_interface::SendError<E>) -> Error {
     }
 }
 
-fn map_isotp_recv_error<E>(err: can_isotp_interface::RecvError<E>) -> Error {
-    Error {
-        kind: match err {
-            can_isotp_interface::RecvError::BufferTooSmall { needed, got } => {
-                ErrorKind::BufferTooSmall { needed, got }
-            }
-            can_isotp_interface::RecvError::Backend(_) => ErrorKind::Other,
-        },
-    }
-}
-
-/// Optional extension trait: configure ISO-TP receive-side FlowControl (BS/STmin) for backpressure.
+/// Optional extension trait: configure ISO-TP receive-side FlowControl (BS/STmin).
 pub trait RxFlowControlConfig {
     fn set_rx_flow_control(&mut self, fc: can_isotp_interface::RxFlowControl) -> Result<(), Error>;
 }
@@ -530,139 +221,83 @@ where
     }
 }
 
-/// Dispatch raw messages into bundle/app handlers.
-pub trait RouterDispatch<Handlers, ReplyTo>
-where
-    ReplyTo: Copy,
+/// Marker for a compile-time message set.
+pub trait MapletSpec<const MAX_TYPES: usize> {
+    /// Ordered list of message IDs in this maplet.
+    const MESSAGE_IDS: [u16; MAX_TYPES];
+
+    /// Resolve message id -> mailbox slot index.
+    fn slot_for_id(id: u16) -> Option<usize> {
+        let mut i = 0usize;
+        while i < MAX_TYPES {
+            if Self::MESSAGE_IDS[i] == id {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// Marker for a bundle's declared message set.
+pub trait BundleSpec<const N: usize> {
+    /// Ordered list of message IDs in this bundle.
+    const MESSAGE_IDS: [u16; N];
+}
+
+/// Marker: maplet contains bundle `B`.
+pub trait MapletHasBundle<B> {}
+
+/// Factory hook used by `maplet!` to build singleton bundle instances.
+pub trait BundleFactory<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+>: Sized where
+    Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<Self>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
 {
-    /// Decode and route a raw message into the appropriate handler.
-    async fn dispatch<'a>(
-        &mut self,
-        handlers: &mut Handlers,
-        meta: RecvMeta<ReplyTo>,
-        msg: RawMessage<'a>,
-    ) -> Result<DispatchOutcome<'a>, Error>;
+    /// Concrete bundle instance type stored by the generated maplet bundle container.
+    type Instance;
+
+    /// Create a bundle instance from a scoped doodad handle.
+    fn make(
+        handle: DoodadHandle<
+            'a,
+            Maplet,
+            RM,
+            Node,
+            TxBuf,
+            MAX_TYPES,
+            DEPTH,
+            MAX_BODY,
+            MAX_WAITERS,
+            Self,
+        >,
+    ) -> Self::Instance;
 }
 
-/// Bundle metadata independent of the handler implementation.
-///
-/// This allows `bus_maplet!` to reason about IDs (e.g. duplicate detection) without needing to
-/// know the concrete handler types.
-pub trait BundleMeta<Atlas> {
-    /// Parser used for this bundle.
-    type Parser: Default;
-    /// Message IDs handled by this bundle (must be unique across bundles).
-    const HANDLED_IDS: &'static [u16];
-    /// Message IDs used by this bundle (handled + referenced).
-    const USED_IDS: &'static [u16];
-    /// Returns true if this bundle recognizes the given message id.
-    fn is_known(id: u16) -> bool;
-}
+/// Marker for an unscoped handle that is limited to ingest-only operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Unscoped;
 
-/// Bundle dispatch for a specific handler type.
-pub trait BundleDispatch<Atlas, Handlers, ReplyTo>: BundleMeta<Atlas>
-where
-    ReplyTo: Copy,
-{
-    /// Attempt to dispatch a raw message; return `None` if this bundle doesn't handle it.
-    async fn try_dispatch<'a>(
-        parser: &Self::Parser,
-        handlers: &mut Handlers,
-        meta: RecvMeta<ReplyTo>,
-        msg: RawMessage<'a>,
-    ) -> Option<Result<(), Error>>;
-}
-
-/// Summary of a single receive+dispatch cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvDispatch {
-    /// No payload arrived before timeout.
-    TimedOut,
-    /// A payload arrived but was not a valid `thincan` wire message.
-    MalformedPayload,
-    /// A message was decoded and dispatched.
-    Dispatched { id: u16, kind: RecvDispatchKind },
-}
-
-/// Minimal classification of dispatch results (no borrowed body).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvDispatchKind {
-    Handled,
-    Unhandled,
-    Unknown,
-}
-
-/// High-level interface that couples a transport node and a generated maplet router.
-///
-/// This interface is designed to be allocation-free: callers supply a TX scratch buffer and
-/// callers supply an RX buffer for `recv_one_dispatch_*` so higher-level handlers can `await`
-/// (backpressure) without being constrained by callback lifetimes.
 #[derive(Debug)]
-pub struct Interface<Node, Router, TxBuf> {
+struct TxState<Node, TxBuf> {
     node: Node,
-    router: Router,
     tx: TxBuf,
 }
 
-impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
+impl<Node, TxBuf> TxState<Node, TxBuf>
 where
     TxBuf: AsMut<[u8]>,
 {
-    /// Create a new interface from a transport node, a maplet router, and a caller-provided TX buffer.
-    pub fn new(node: Node, router: Router, tx: TxBuf) -> Self {
-        Self { node, router, tx }
-    }
-
-    /// Borrow the transport node.
-    pub fn node(&self) -> &Node {
-        &self.node
-    }
-
-    /// Mutably borrow the transport node (e.g. to reconfigure).
-    pub fn node_mut(&mut self) -> &mut Node {
-        &mut self.node
-    }
-
-    /// Borrow the router.
-    pub fn router(&self) -> &Router {
-        &self.router
-    }
-
-    /// Mutably borrow the router.
-    pub fn router_mut(&mut self) -> &mut Router {
-        &mut self.router
-    }
-
-    fn encode_msg_into_buf<'b, M: Message>(
-        buf: &'b mut [u8],
-        body: &[u8],
-    ) -> Result<&'b [u8], Error> {
-        if let Some(expected) = M::BODY_LEN
-            && body.len() != expected
-        {
-            return Err(Error {
-                kind: ErrorKind::InvalidBodyLen {
-                    expected,
-                    got: body.len(),
-                },
-            });
-        }
-
-        let needed = HEADER_LEN + body.len();
-        if buf.len() < needed {
-            return Err(Error {
-                kind: ErrorKind::BufferTooSmall {
-                    needed,
-                    got: buf.len(),
-                },
-            });
-        }
-        buf[..HEADER_LEN].copy_from_slice(&M::ID.to_le_bytes());
-        buf[HEADER_LEN..needed].copy_from_slice(body);
-        Ok(&buf[..needed])
-    }
-
-    fn encode_value_into_buf<'b, M: Message, V: Encode<M>>(
+    fn encode_capnp_into_buf<'b, M: CapnpMessage, V: EncodeCapnp<M>>(
         buf: &'b mut [u8],
         value: &V,
     ) -> Result<&'b [u8], Error> {
@@ -684,50 +319,262 @@ where
                 kind: ErrorKind::Other,
             });
         }
-        if let Some(expected) = M::BODY_LEN
-            && used != expected
-        {
-            return Err(Error {
-                kind: ErrorKind::InvalidBodyLen {
-                    expected,
-                    got: used,
-                },
-            });
-        }
         Ok(&buf[..HEADER_LEN + used])
     }
+}
 
-    /// Encode a raw body for message `M` into the caller-provided TX buffer.
-    pub fn encode_msg_into<M: Message>(&mut self, body: &[u8]) -> Result<&[u8], Error> {
-        Self::encode_msg_into_buf::<M>(self.tx.as_mut(), body)
+/// Result of ingesting a payload into a doodad mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestOutcome {
+    pub from: u8,
+    pub id: u16,
+    pub len: usize,
+}
+
+/// Error returned while ingesting payloads into a doodad mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestError {
+    MalformedPayload,
+    UnknownId { id: u16 },
+    BodyTooLarge { got: usize, max: usize },
+    MailboxFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MailboxSlot<const MAX_BODY: usize> {
+    from: u8,
+    len: usize,
+    body: [u8; MAX_BODY],
+}
+
+impl<const MAX_BODY: usize> MailboxSlot<MAX_BODY> {
+    const fn empty() -> Self {
+        Self {
+            from: 0,
+            len: 0,
+            body: [0u8; MAX_BODY],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TypeMailbox<const DEPTH: usize, const MAX_BODY: usize> {
+    slots: [MailboxSlot<MAX_BODY>; DEPTH],
+    used: usize,
+}
+
+impl<const DEPTH: usize, const MAX_BODY: usize> TypeMailbox<DEPTH, MAX_BODY> {
+    fn new() -> Self {
+        Self {
+            slots: [MailboxSlot::empty(); DEPTH],
+            used: 0,
+        }
     }
 
-    /// Encode a typed value for message `M` into the caller-provided TX buffer.
-    pub fn encode_value_into<M: Message, V: Encode<M>>(
+    fn push(&mut self, from: u8, body: &[u8]) -> Result<(), IngestError> {
+        if body.len() > MAX_BODY {
+            return Err(IngestError::BodyTooLarge {
+                got: body.len(),
+                max: MAX_BODY,
+            });
+        }
+        if self.used == DEPTH {
+            return Err(IngestError::MailboxFull);
+        }
+
+        let idx = self.used;
+        self.slots[idx].from = from;
+        self.slots[idx].len = body.len();
+        self.slots[idx].body[..body.len()].copy_from_slice(body);
+        self.used += 1;
+        Ok(())
+    }
+
+    fn pop_matching_where<F>(&mut self, from: u8, mut predicate: F) -> Option<MailboxSlot<MAX_BODY>>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let mut idx = None;
+        let mut i = 0usize;
+        while i < self.used {
+            if self.slots[i].from == from {
+                let len = self.slots[i].len;
+                if predicate(&self.slots[i].body[..len]) {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            i += 1;
+        }
+
+        let idx = idx?;
+        let out = self.slots[idx];
+        let mut j = idx;
+        while j + 1 < self.used {
+            self.slots[j] = self.slots[j + 1];
+            j += 1;
+        }
+        self.slots[self.used - 1] = MailboxSlot::empty();
+        self.used -= 1;
+        Some(out)
+    }
+}
+
+#[derive(Debug)]
+struct RxState<const MAX_TYPES: usize, const DEPTH: usize, const MAX_BODY: usize> {
+    by_type: [TypeMailbox<DEPTH, MAX_BODY>; MAX_TYPES],
+}
+
+impl<const MAX_TYPES: usize, const DEPTH: usize, const MAX_BODY: usize>
+    RxState<MAX_TYPES, DEPTH, MAX_BODY>
+{
+    fn new() -> Self {
+        Self {
+            by_type: core::array::from_fn(|_| TypeMailbox::new()),
+        }
+    }
+
+    fn push(&mut self, slot: usize, from: u8, body: &[u8]) -> Result<(), IngestError> {
+        self.by_type[slot].push(from, body)
+    }
+
+    fn pop_matching_where<F>(
+        &mut self,
+        slot: usize,
+        from: u8,
+        predicate: F,
+    ) -> Option<MailboxSlot<MAX_BODY>>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        self.by_type[slot].pop_matching_where(from, predicate)
+    }
+}
+
+/// Typed received message payload returned by protocol receive helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received<M, const MAX_BODY: usize>
+where
+    M: CapnpMessage,
+{
+    /// Sender address.
+    pub from: u8,
+    /// Message id.
+    pub id: u16,
+    len: usize,
+    body: [u8; MAX_BODY],
+    _marker: PhantomData<M>,
+}
+
+impl<M, const MAX_BODY: usize> Received<M, MAX_BODY>
+where
+    M: CapnpMessage,
+{
+    fn from_slot(from: u8, slot: MailboxSlot<MAX_BODY>) -> Self {
+        Self {
+            from,
+            id: M::ID,
+            len: slot.len,
+            body: slot.body,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Borrow raw body bytes (without the 2-byte thincan header).
+    pub fn body(&self) -> &[u8] {
+        &self.body[..self.len]
+    }
+
+    /// Borrow this payload as a typed Cap'n Proto helper.
+    pub fn as_capnp(&self) -> CapnpTyped<'_, M::Owned> {
+        CapnpTyped::new(self.body())
+    }
+
+    /// Read the typed Cap'n Proto root.
+    #[cfg(feature = "capnp")]
+    pub fn with_root<R>(
+        &self,
+        options: capnp::message::ReaderOptions,
+        f: impl FnOnce(<M::Owned as capnp::traits::Owned>::Reader<'_>) -> R,
+    ) -> Result<R, capnp::Error>
+    where
+        M::Owned: capnp::traits::Owned,
+    {
+        self.as_capnp().with_root(options, f)
+    }
+}
+
+/// Maplet-typed shared interface containing transport send path and per-message receive mailboxes.
+pub struct Interface<
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    tx_state: embassy_sync::mutex::Mutex<RM, TxState<Node, TxBuf>>,
+    rx_state: embassy_sync::mutex::Mutex<RM, RxState<MAX_TYPES, DEPTH, MAX_BODY>>,
+    notify: [embassy_sync::watch::Watch<RM, (), MAX_WAITERS>; MAX_TYPES],
+    _maplet: PhantomData<Maplet>,
+}
+
+impl<
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+    TxBuf: AsMut<[u8]>,
+{
+    /// Create a new maplet-typed interface from a transport node and caller-provided TX buffer.
+    pub fn new(node: Node, tx: TxBuf) -> Self {
+        Self {
+            tx_state: embassy_sync::mutex::Mutex::new(TxState { node, tx }),
+            rx_state: embassy_sync::mutex::Mutex::new(RxState::new()),
+            notify: core::array::from_fn(|_| embassy_sync::watch::Watch::new_with(())),
+            _maplet: PhantomData,
+        }
+    }
+
+    /// Create a cloneable handle borrowing this interface.
+    pub fn handle(
+        &self,
+    ) -> DoodadHandle<'_, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS> {
+        DoodadHandle {
+            iface: self,
+            _bundle: PhantomData,
+        }
+    }
+
+    /// Mutably borrow the underlying transport node.
+    pub fn node_mut(&mut self) -> &mut Node {
+        &mut self.tx_state.get_mut().node
+    }
+
+    /// Encode a Cap'n Proto value for message `M` into this interface's TX buffer.
+    pub fn encode_capnp_into<M: CapnpMessage, V: EncodeCapnp<M>>(
         &mut self,
         value: &V,
     ) -> Result<&[u8], Error> {
-        Self::encode_value_into_buf::<M, V>(self.tx.as_mut(), value)
+        let state = self.tx_state.get_mut();
+        TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(state.tx.as_mut(), value)
     }
 
-    /// Send a raw body for message `M` to a specific transport address.
-    pub fn send_msg_to<M: Message>(
-        &mut self,
-        to: u8,
-        body: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Node: can_isotp_interface::IsoTpEndpoint,
-    {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send_to(to, payload, timeout)
-            .map_err(map_isotp_send_error)
-    }
-
-    /// Encode and send a typed value for message `M` to a specific transport address.
-    pub fn send_encoded_to<M: Message, V: Encode<M>>(
+    /// Encode and send a Cap'n Proto value for message `M` to a specific address.
+    pub fn send_capnp_to<M: CapnpMessage, V: EncodeCapnp<M>>(
         &mut self,
         to: u8,
         value: &V,
@@ -736,124 +583,334 @@ where
     where
         Node: can_isotp_interface::IsoTpEndpoint,
     {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
+        let tx_state = self.tx_state.get_mut();
+        let TxState { node, tx } = tx_state;
+        let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
         node.send_to(to, payload, timeout)
             .map_err(map_isotp_send_error)
     }
 
-    // NOTE: Sync receive+dispatch helpers were removed in favor of async-native dispatch that can
-    // apply backpressure by awaiting in handlers (e.g. slow storage I/O).
+    /// Encode and send a Cap'n Proto value for message `M` to a functional address.
+    pub fn send_capnp_functional_to<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &mut self,
+        functional_to: u8,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), Error>
+    where
+        Node: can_isotp_interface::IsoTpEndpoint,
+    {
+        let tx_state = self.tx_state.get_mut();
+        let TxState { node, tx } = tx_state;
+        let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
+        node.send_functional_to(functional_to, payload, timeout)
+            .map_err(map_isotp_send_error)
+    }
+
+    async fn send_capnp_to_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &self,
+        to: u8,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), Error>
+    where
+        Node: can_isotp_interface::IsoTpAsyncEndpoint,
+    {
+        let mut state = self.tx_state.lock().await;
+        let tx_state = &mut *state;
+        let TxState { node, tx } = tx_state;
+        let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
+        node.send_to(to, payload, timeout)
+            .await
+            .map_err(map_isotp_send_error)
+    }
+
+    async fn send_capnp_functional_to_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &self,
+        functional_to: u8,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), Error>
+    where
+        Node: can_isotp_interface::IsoTpAsyncEndpoint,
+    {
+        let mut state = self.tx_state.lock().await;
+        let tx_state = &mut *state;
+        let TxState { node, tx } = tx_state;
+        let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
+        node.send_functional_to(functional_to, payload, timeout)
+            .await
+            .map_err(map_isotp_send_error)
+    }
 }
 
-impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
+impl<
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
 where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
     Node: can_isotp_interface::IsoTpAsyncEndpoint,
     TxBuf: AsMut<[u8]>,
 {
-    /// Async send helper for ISO-TP async demux nodes (addressed send).
-    pub async fn send_msg_to_async<M: Message>(
-        &mut self,
-        to: u8,
-        body: &[u8],
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_msg_into_buf::<M>(tx.as_mut(), body)?;
-        node.send_to(to, payload, timeout)
-            .await
-            .map_err(map_isotp_send_error)
-    }
-
-    /// Async send-encoded helper for ISO-TP async demux nodes (addressed send).
-    pub async fn send_encoded_to_async<M: Message, V: Encode<M>>(
+    /// Async addressed send helper.
+    pub async fn send_capnp_to_async<M: CapnpMessage, V: EncodeCapnp<M>>(
         &mut self,
         to: u8,
         value: &V,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let (node, tx) = (&mut self.node, &mut self.tx);
-        let payload = Self::encode_value_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_to(to, payload, timeout)
+        self.send_capnp_to_async_shared::<M, V>(to, value, timeout)
             .await
-            .map_err(map_isotp_send_error)
+    }
+
+    /// Async functional-address send helper.
+    pub async fn send_capnp_functional_to_async<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &mut self,
+        functional_to: u8,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        self.send_capnp_functional_to_async_shared::<M, V>(functional_to, value, timeout)
+            .await
     }
 }
 
-impl<Node, Router, TxBuf> Interface<Node, Router, TxBuf>
-where
-    Node: can_isotp_interface::IsoTpAsyncEndpoint + can_isotp_interface::IsoTpAsyncEndpointRecvInto,
-    TxBuf: AsMut<[u8]>,
+/// Cloneable async protocol handle that borrows a shared [`Interface`].
+pub struct DoodadHandle<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B = Unscoped,
+> where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
 {
-    /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
-    pub async fn recv_one_dispatch_with_meta_async<Handlers, Ev>(
-        &mut self,
-        handlers: &mut Handlers,
-        timeout: Duration,
-        rx: &mut [u8],
-        mut on_event: Ev,
-    ) -> Result<RecvDispatch, Error>
-    where
-        Router: RouterDispatch<Handlers, u8>,
-        Ev: for<'a> FnMut(DispatchEventMeta<'a, u8>) -> Result<(), Error>,
-    {
-        let (node, router) = (&mut self.node, &mut self.router);
+    iface: &'a Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>,
+    _bundle: PhantomData<B>,
+}
 
-        match node
-            .recv_one_into(timeout, rx)
-            .await
-            .map_err(map_isotp_recv_error)?
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B,
+> Copy for DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+}
+
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B,
+> Clone for DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B,
+> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    /// Ingest one payload delivered by the external demux pump.
+    pub async fn ingest(&self, from: u8, payload: &[u8]) -> Result<IngestOutcome, IngestError> {
+        let raw = decode_wire(payload).map_err(|_| IngestError::MalformedPayload)?;
+        let slot = Maplet::slot_for_id(raw.id).ok_or(IngestError::UnknownId { id: raw.id })?;
+        let len = raw.body.len();
+
         {
-            can_isotp_interface::RecvMetaIntoStatus::TimedOut => Ok(RecvDispatch::TimedOut),
-            can_isotp_interface::RecvMetaIntoStatus::DeliveredOne { meta, len } => {
-                let meta = RecvMeta {
-                    reply_to: meta.reply_to,
-                };
-                let payload = &rx[..len];
-                match decode_wire(payload) {
-                    Ok(raw) => {
-                        let outcome = router.dispatch(handlers, meta, raw).await?;
-                        on_event(DispatchEventMeta::Dispatched { meta, raw, outcome })?;
-                        Ok(RecvDispatch::Dispatched {
-                            id: raw.id,
-                            kind: match outcome {
-                                DispatchOutcome::Handled => RecvDispatchKind::Handled,
-                                DispatchOutcome::Unhandled(_) => RecvDispatchKind::Unhandled,
-                                DispatchOutcome::Unknown { .. } => RecvDispatchKind::Unknown,
-                            },
-                        })
-                    }
-                    Err(_) => {
-                        on_event(DispatchEventMeta::MalformedPayload { meta, payload })?;
-                        Ok(RecvDispatch::MalformedPayload)
-                    }
-                }
-            }
+            let mut state = self.iface.rx_state.lock().await;
+            state.push(slot, from, raw.body)?;
+        }
+
+        self.iface.notify[slot].sender().send(());
+        Ok(IngestOutcome {
+            from,
+            id: raw.id,
+            len,
+        })
+    }
+}
+
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, Unscoped>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    /// Narrow this handle to a specific bundle's message capabilities.
+    pub fn scope<B>(
+        self,
+    ) -> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+    where
+        Maplet: MapletHasBundle<B>,
+    {
+        DoodadHandle {
+            iface: self.iface,
+            _bundle: PhantomData,
         }
     }
+}
 
-    /// Async receive+dispatch helper with reply-to metadata for ISO-TP async demux nodes.
-    pub async fn recv_one_dispatch_meta_async<Handlers>(
-        &mut self,
-        handlers: &mut Handlers,
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B,
+> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+where
+    Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<B>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+    Node: can_isotp_interface::IsoTpAsyncEndpoint,
+    TxBuf: AsMut<[u8]>,
+{
+    /// Hidden protocol primitive: async addressed send.
+    #[doc(hidden)]
+    pub async fn __send_capnp_to<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &self,
+        to: u8,
+        value: &V,
         timeout: Duration,
-        rx: &mut [u8],
-    ) -> Result<RecvDispatch, Error>
-    where
-        Router: RouterDispatch<Handlers, u8>,
-    {
-        self.recv_one_dispatch_with_meta_async(handlers, timeout, rx, |_| Ok(()))
+    ) -> Result<(), Error> {
+        self.iface
+            .send_capnp_to_async_shared::<M, V>(to, value, timeout)
             .await
+    }
+
+    /// Hidden protocol primitive: async functional-address send.
+    #[doc(hidden)]
+    pub async fn __send_capnp_functional_to<M: CapnpMessage, V: EncodeCapnp<M>>(
+        &self,
+        functional_to: u8,
+        value: &V,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        self.iface
+            .send_capnp_functional_to_async_shared::<M, V>(functional_to, value, timeout)
+            .await
+    }
+}
+
+impl<
+    'a,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+    B,
+> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+where
+    Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<B>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    /// Hidden protocol primitive: wait for the next message of type `M` from `from`.
+    #[doc(hidden)]
+    pub async fn __recv_next_capnp_from<M: CapnpMessage>(
+        &self,
+        from: u8,
+    ) -> Result<Received<M, MAX_BODY>, Error> {
+        self.__recv_next_capnp_from_where::<M, _>(from, |_| true)
+            .await
+    }
+
+    /// Hidden protocol primitive: wait for the next message of type `M` from `from` that
+    /// satisfies `predicate`.
+    #[doc(hidden)]
+    pub async fn __recv_next_capnp_from_where<M: CapnpMessage, F>(
+        &self,
+        from: u8,
+        mut predicate: F,
+    ) -> Result<Received<M, MAX_BODY>, Error>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let slot = Maplet::slot_for_id(M::ID).ok_or(Error {
+            kind: ErrorKind::Other,
+        })?;
+
+        let mut receiver = self.iface.notify[slot].receiver().ok_or(Error {
+            kind: ErrorKind::Other,
+        })?;
+
+        loop {
+            {
+                let mut state = self.iface.rx_state.lock().await;
+                if let Some(found) = state.pop_matching_where(slot, from, &mut predicate) {
+                    return Ok(Received::from_slot(from, found));
+                }
+            }
+
+            let _ = receiver.changed().await;
+        }
     }
 }
 
 /// Define a bus atlas: a registry of message ids and names.
-///
-/// This macro generates a module containing:
-/// - message marker types implementing [`Message`]
-/// - a marker `Atlas` type for bundle composition
-///
-/// See the crate-level **Examples** section for a complete, working snippet.
 #[macro_export]
 macro_rules! bus_atlas {
     (
@@ -863,7 +920,7 @@ macro_rules! bus_atlas {
     ) => {
         $vis mod $atlas {
             #[derive(Debug, Clone, Copy, Default)]
-            /// Marker type representing this atlas in bundle/maplet composition.
+            /// Marker type representing this atlas.
             pub struct Atlas;
             $crate::bus_atlas!(@entries $($entries)*);
         }
@@ -871,70 +928,17 @@ macro_rules! bus_atlas {
 
     (@entries) => {};
 
-    (@entries $(#[$meta:meta])* $id:literal => $name:ident (len = $len:literal); $($rest:tt)*) => {
-        $(#[$meta])*
-        #[doc = concat!(
-            "Atlas message `",
-            stringify!($name),
-            "` (id ",
-            stringify!($id),
-            ", fixed body length ",
-            stringify!($len),
-            " bytes)."
-        )]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub struct $name;
-
-        impl $name {
-            /// Fixed body length in bytes.
-            pub const BODY_LEN: usize = $len;
-        }
-
-        impl $crate::Message for $name {
-            const ID: u16 = $id;
-            const BODY_LEN: Option<usize> = Some($len);
-        }
-
-        impl $crate::MessageParser<$name> for $crate::DefaultParser {
-            type Parsed<'a> = &'a [u8; $len];
-            fn parse<'a>(&self, body: &'a [u8]) -> Result<Self::Parsed<'a>, $crate::Error> {
-                if body.len() != $len {
-                    return Err($crate::Error {
-                        kind: $crate::ErrorKind::Other,
-                    });
-                }
-                let bytes: &[u8; $len] = body.try_into().map_err(|_| $crate::Error {
-                    kind: $crate::ErrorKind::Other,
-                })?;
-                Ok(bytes)
-            }
-        }
-
-        $crate::bus_atlas!(@entries $($rest)*);
-    };
-
     (@entries $(#[$meta:meta])* $id:literal => $name:ident (capnp = $owned:path); $($rest:tt)*) => {
         $(#[$meta])*
-        #[doc = concat!(
-            "Atlas message `",
-            stringify!($name),
-            "` (id ",
-            stringify!($id),
-            ", Cap'n Proto single-segment body)."
-        )]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        #[doc = concat!("capnp owned type: `", stringify!($owned), "`")]
         pub struct $name;
 
         impl $crate::Message for $name {
             const ID: u16 = $id;
         }
 
-        impl $crate::MessageParser<$name> for $crate::DefaultParser {
-            type Parsed<'a> = $crate::CapnpTyped<'a, $owned>;
-            fn parse<'a>(&self, body: &'a [u8]) -> Result<Self::Parsed<'a>, $crate::Error> {
-                Ok($crate::CapnpTyped::new(body))
-            }
+        impl $crate::CapnpMessage for $name {
+            type Owned = $owned;
         }
 
         $crate::bus_atlas!(@entries $($rest)*);
@@ -942,540 +946,217 @@ macro_rules! bus_atlas {
 
     (@entries $(#[$meta:meta])* $id:literal => removed; $($rest:tt)*) => {
         $(#[$meta])*
-        #[doc = "Reserved/removed message id (kept to avoid accidental reuse)."]
         #[allow(dead_code)]
         const _: u16 = $id;
         $crate::bus_atlas!(@entries $($rest)*);
     };
 }
 
-/// Define a reusable handler bundle tied to an atlas.
-///
-/// Bundles encapsulate parsing and handler logic for a set of messages and can be composed into a
-/// maplet via `bus_maplet!`.
-///
-/// See the crate-level **Examples** section for a complete, working snippet.
+/// Define a maplet by composing message bundles.
 #[macro_export]
-macro_rules! bundle {
-    (
-        $vis:vis mod $bundle:ident ($atlas:ident) {
-            parser: $parser:ty;
-            use msgs [ $($msg:ident),* $(,)? ];
-            handles { $($handled:ident => $method:ident),* $(,)? }
-            $(items { $($items:tt)* })?
-        }
-    ) => {
-        $vis mod $bundle {
-            pub use super::$atlas::{ $($msg,)* };
-            /// Parser type used by this bundle.
-            pub type BundleParser = $parser;
-
-            #[derive(Default, Debug, Clone, Copy)]
-            /// Marker type representing this bundle for [`bus_maplet!`] composition.
-            pub struct Bundle;
-
-            /// Handlers implemented by a concrete bundle implementation.
-            ///
-            /// A `bundle!` expands to a trait with one method per handled message. A maplet can then
-            /// embed this bundle's handler implementation inside [`bus_maplet!`]'s `HandlersImpl`.
-            pub trait Handlers<'a, ReplyTo>
-            where
-                ReplyTo: Copy,
-            {
-                /// Bundle-specific error type.
-                type Error;
-                $(
-                    async fn $method(
-                        &mut self,
-                        meta: $crate::RecvMeta<ReplyTo>,
-                        msg: <$parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
-                    ) -> Result<(), Self::Error>;
-                )*
-            }
-
-            #[derive(Default, Debug, Clone, Copy)]
-            /// A no-op handler implementation that accepts all handled messages.
-            pub struct DefaultHandlers;
-
-            impl<'a, ReplyTo> Handlers<'a, ReplyTo> for DefaultHandlers
-            where
-                ReplyTo: Copy,
-            {
-                type Error = core::convert::Infallible;
-                $(
-                    async fn $method(
-                        &mut self,
-                        _meta: $crate::RecvMeta<ReplyTo>,
-                        _msg: <$parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
-                    ) -> Result<(), Self::Error> {
-                        Ok(())
-                    }
-                )*
-            }
-
-            const _: () = {
-                fn _assert_one<P, M>()
-                where
-                    P: $crate::MessageParser<M>,
-                    M: $crate::Message,
-                {
-                }
-                $(
-                    let _ = _assert_one::<$parser, super::$atlas::$handled>;
-                )*
-            };
-
-            #[doc(hidden)]
-            pub const HANDLED_IDS: &[u16] = &[
-                $(<super::$atlas::$handled as $crate::Message>::ID,)*
-            ];
-
-            #[doc(hidden)]
-            pub const USED_IDS: &[u16] = &[
-                $(<super::$atlas::$msg as $crate::Message>::ID,)*
-            ];
-
-            /// Returns `true` if this bundle recognizes `id` as any message it references.
-            pub fn is_known(id: u16) -> bool {
-                match id {
-                    $(<super::$atlas::$msg as $crate::Message>::ID => true,)*
-                    _ => false,
-                }
-            }
-
-            /// Attempt to dispatch a decoded message to this bundle's handlers.
-            ///
-            /// Returns `None` when the message is not handled by this bundle.
-            pub async fn try_dispatch<'a, H, ReplyTo>(
-                parser: &BundleParser,
-                handlers: &mut H,
-                meta: $crate::RecvMeta<ReplyTo>,
-                msg: $crate::RawMessage<'a>,
-            ) -> Option<Result<(), $crate::Error>>
-            where
-                ReplyTo: Copy,
-                H: Handlers<'a, ReplyTo>,
-            {
-                let _ = parser;
-                let _ = handlers;
-                match msg.id {
-                    $(
-                        <super::$atlas::$handled as $crate::Message>::ID => {
-                            let parsed = match <$parser as $crate::MessageParser<super::$atlas::$handled>>::parse(parser, msg.body) {
-                                Ok(v) => v,
-                                Err(e) => return Some(Err(e)),
-                            };
-                            if let Err(_e) = handlers.$method(meta, parsed).await {
-                                return Some(Err($crate::Error { kind: $crate::ErrorKind::Other }));
-                            }
-                            Some(Ok(()))
-                        }
-                    )*
-                    _ => None,
-                }
-            }
-
-            impl<Atlas> $crate::BundleMeta<Atlas> for Bundle {
-                type Parser = BundleParser;
-                const HANDLED_IDS: &'static [u16] = HANDLED_IDS;
-                const USED_IDS: &'static [u16] = USED_IDS;
-                fn is_known(id: u16) -> bool {
-                    is_known(id)
-                }
-            }
-
-            impl<Atlas, H, ReplyTo> $crate::BundleDispatch<Atlas, H, ReplyTo> for Bundle
-            where
-                ReplyTo: Copy,
-                for<'a> H: Handlers<'a, ReplyTo>,
-            {
-                async fn try_dispatch<'a>(
-                    parser: &Self::Parser,
-                    handlers: &mut H,
-                    meta: $crate::RecvMeta<ReplyTo>,
-                    msg: $crate::RawMessage<'a>,
-                ) -> Option<Result<(), $crate::Error>> {
-                    try_dispatch::<H, ReplyTo>(parser, handlers, meta, msg).await
-                }
-            }
-
-            $( $($items)* )?
-        }
-    };
-}
-
-/// Define a per-device/app maplet (atlas subset + handlers + bundles).
-///
-/// Maplets compose bundles with application handlers and provide a router that dispatches raw
-/// messages by id.
-///
-/// See the crate-level **Examples** section for a complete, working snippet.
-#[macro_export]
-macro_rules! bus_maplet {
+macro_rules! maplet {
     (
         $vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            bundles [ $($bundles:tt)* ];
-            parser: $app_parser:ty;
             use msgs [ $($msg:ident),* $(,)? ];
-            handles { $($handled:ident => $method:ident),* $(,)? }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident),* $(,)? ];
         }
     ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            []
-            $($bundles)*
-        );
+        $crate::maplet!(@define_from_msgs $vis mod $maplet : $atlas { [ $($msg),* ] });
     };
 
     (
         $vis:vis mod $maplet:ident : $atlas:ident {
-            bundles [ $($bundles:tt)* ];
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident),* $(,)? ];
-            handles { $($handled:ident => $method:ident),* $(,)? }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident),* $(,)? ];
+            bundles [ $( $bundle:ident ),* $(,)? ];
         }
     ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: ();
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            []
-            $($bundles)*
-        );
+        $crate::maplet!(@define_from_bundles $vis mod $maplet : $atlas { [ $($bundle),* ] });
     };
 
-    (@parse_bundles
-        ($vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
-        })
-        [ $($out:tt)* ]
-    ) => {
-        $crate::bus_maplet!(@expand
-            $vis mod $maplet : $atlas {
-                bundles [ $($out)* ];
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            }
-        );
-    };
-
-    (@parse_bundles
-        ($vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
-        })
-        [ $($out:tt)* ]
-        $name:ident = $spec:ty , $($rest:tt)*
-    ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            [ $($out)* ($name, $spec), ]
-            $($rest)*
-        );
-    };
-
-    (@parse_bundles
-        ($vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
-        })
-        [ $($out:tt)* ]
-        $name:ident , $($rest:tt)*
-    ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            [ $($out)* ($name, super::$name::Bundle), ]
-            $($rest)*
-        );
-    };
-
-    (@parse_bundles
-        ($vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
-        })
-        [ $($out:tt)* ]
-        $name:ident = $spec:ty
-    ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            [ $($out)* ($name, $spec), ]
-        );
-    };
-
-    (@parse_bundles
-        ($vis:vis mod $maplet:ident : $atlas:ident {
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
-        })
-        [ $($out:tt)* ]
-        $name:ident
-    ) => {
-        $crate::bus_maplet!(@parse_bundles
-            ($vis mod $maplet : $atlas {
-                reply_to: $reply_to;
-                parser: $app_parser;
-                use msgs [ $($msg,)* ];
-                handles { $($handled => $method,)* }
-                unhandled_by_default = $unhandled_by_default;
-                ignore [ $($ignore,)* ];
-            })
-            [ $($out)* ($name, super::$name::Bundle), ]
-        );
-    };
-
-    (@expand
+    (
         $vis:vis mod $maplet:ident : $atlas:ident {
-            bundles [ $(($bundle:ident, $bundle_spec:ty),)* ];
-            reply_to: $reply_to:ty;
-            parser: $app_parser:ty;
-            use msgs [ $($msg:ident,)* ];
-            handles { $($handled:ident => $method:ident,)* }
-            unhandled_by_default = $unhandled_by_default:literal;
-            ignore [ $($ignore:ident,)* ];
+            bundles [ $( $alias:ident = $bundle:ident ),* $(,)? ];
         }
     ) => {
+        $crate::maplet!(@define_from_bundles_aliases $vis mod $maplet : $atlas { [ $( $alias = $bundle ),* ] });
+    };
+
+    (
+        $vis:vis mod $maplet:ident : $atlas:ident {
+            bundles [ $( $bundle:ident => [ $($msg:ident),* $(,)? ] ),* $(,)? ];
+        }
+    ) => {
+        $crate::maplet!(@define_from_msgs $vis mod $maplet : $atlas { [ $($($msg),*),* ] });
+    };
+
+    (@define_from_msgs $vis:vis mod $maplet:ident : $atlas:ident { [ $($msg:ident),* ] }) => {
         $vis mod $maplet {
-            #![allow(non_camel_case_types)]
-            pub use super::$atlas;
+            #[derive(Clone, Copy, Debug, Default)]
+            pub struct Maplet;
 
-            /// Transport reply-to metadata type used by this maplet's handler signatures.
-            pub type ReplyTo = $reply_to;
+            pub const MESSAGE_COUNT: usize = [$(<super::$atlas::$msg as $crate::Message>::ID),*].len();
 
-            #[derive(Debug)]
-            /// Router generated for this maplet.
-            ///
-            /// Implements [`RouterDispatch`] and routes [`RawMessage`] values to either:
-            /// - bundle handlers (listed in `bundles [...]`), or
-            /// - application handlers (listed in `handles { ... }`).
-            pub struct Router {
-                /// Parser used for application-handled messages.
-                pub app_parser: $app_parser,
-                $(
-                    #[doc = concat!("Parser for bundle `", stringify!($bundle), "`.")]
-                    pub $bundle: <$bundle_spec as $crate::BundleMeta<super::$atlas::Atlas>>::Parser,
-                )*
+            impl $crate::MapletSpec<{ MESSAGE_COUNT }> for Maplet {
+                const MESSAGE_IDS: [u16; MESSAGE_COUNT] = [
+                    $(<super::$atlas::$msg as $crate::Message>::ID),*
+                ];
             }
 
-            impl Router {
-                /// Construct a router with default parser instances.
-                pub fn new() -> Self {
-                    Self {
-                        app_parser: Default::default(),
-                        $($bundle: Default::default(),)*
-                    }
-                }
-            }
+            pub type Interface<
+                RM,
+                Node,
+                TxBuf,
+                const DEPTH: usize,
+                const MAX_BODY: usize,
+                const MAX_WAITERS: usize,
+            > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
 
-            /// When `true`, known-but-unhandled messages return [`DispatchOutcome::Unhandled`].
-            pub const UNHANDLED_BY_DEFAULT: bool = $unhandled_by_default;
+            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+        }
+    };
 
-            #[doc(hidden)]
-            pub const MAPLET_HANDLED_IDS: &[u16] = &[
-                $(<super::$atlas::$handled as $crate::Message>::ID,)*
-            ];
+    (@define_from_bundles $vis:vis mod $maplet:ident : $atlas:ident { [ $($bundle:ident),* ] }) => {
+        $vis mod $maplet {
+            #[derive(Clone, Copy, Debug, Default)]
+            pub struct Maplet;
 
-            const _: () = {
-                $crate::__assert_unique_u16_slices([
-                    $(<$bundle_spec as $crate::BundleMeta<super::$atlas::Atlas>>::HANDLED_IDS,)*
-                    MAPLET_HANDLED_IDS,
-                ]);
-            };
+            pub const MESSAGE_COUNT: usize = 0 $(+ super::$bundle::MESSAGE_COUNT)*;
 
-            #[allow(dead_code)]
-            /// Message IDs that are recognized but intentionally ignored.
-            pub const IGNORED_IDS: &[u16] = &[
-                $(<super::$atlas::$ignore as $crate::Message>::ID,)*
-            ];
-
-            /// Handlers implemented by the application for this maplet.
-            ///
-            /// A `bus_maplet!` expands to a trait with one method per `handles { ... }` entry.
-            pub trait Handlers<'a> {
-                /// Application-specific error type.
-                type Error;
-                $(
-                    async fn $method(
-                        &mut self,
-                        meta: $crate::RecvMeta<ReplyTo>,
-                        msg: <$app_parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
-                    ) -> Result<(), Self::Error>;
-                )*
-            }
-
-            #[allow(non_camel_case_types)]
-            /// Concrete handler container used by [`Router::dispatch`](RouterDispatch::dispatch).
-            ///
-            /// `App` is the application's `Handlers` implementation, and the remaining fields are
-            /// bundle handler implementations (one per bundle in `bundles [...]`).
-            pub struct HandlersImpl<App, $($bundle),*> {
-                /// Application handlers.
-                pub app: App,
-                $(
-                    #[doc = concat!("Handlers for bundle `", stringify!($bundle), "`.")]
-                    pub $bundle: $bundle,
-                )*
-            }
-
-            impl<'a, App, $($bundle),*> Handlers<'a> for HandlersImpl<App, $($bundle),*>
-            where
-                App: Handlers<'a>,
-            {
-                type Error = <App as Handlers<'a>>::Error;
-                $(
-                    async fn $method(
-                        &mut self,
-                        meta: $crate::RecvMeta<ReplyTo>,
-                        msg: <$app_parser as $crate::MessageParser<super::$atlas::$handled>>::Parsed<'a>,
-                    ) -> Result<(), Self::Error> {
-                        self.app.$method(meta, msg).await
-                    }
-                )*
-            }
-
-            // This stub doesn't use these, but keeping them here makes the intended API more concrete.
-            #[allow(dead_code)]
-            /// Marker tuple of all message types referenced by this maplet.
-            pub type MessagesInMaplet = ( $(super::$atlas::$msg,)* );
-
-            const _: () = {
-                fn _assert_one<P, M>()
-                where
-                    P: $crate::MessageParser<M>,
-                    M: $crate::Message,
-                {
-                }
-                $(
-                    let _ = _assert_one::<$app_parser, super::$atlas::$handled>;
-                )*
-            };
-
-            fn is_known(id: u16) -> bool {
-                match id {
-                    $(<super::$atlas::$msg as $crate::Message>::ID => true,)*
-                    _ => false,
-                }
-            }
-
-            fn is_ignored(id: u16) -> bool {
-                match id {
-                    $(<super::$atlas::$ignore as $crate::Message>::ID => true,)*
-                    _ => false,
-                }
-            }
-
-            impl<App, $($bundle),*> $crate::RouterDispatch<HandlersImpl<App, $($bundle),*>, ReplyTo> for Router
-            where
-                for<'a> App: Handlers<'a>,
-                $($bundle_spec: $crate::BundleDispatch<super::$atlas::Atlas, $bundle, ReplyTo>,)*
-            {
-                async fn dispatch<'a>(
-                    &mut self,
-                    handlers: &mut HandlersImpl<App, $($bundle),*>,
-                    meta: $crate::RecvMeta<ReplyTo>,
-                    msg: $crate::RawMessage<'a>,
-                ) -> Result<$crate::DispatchOutcome<'a>, $crate::Error> {
+            impl $crate::MapletSpec<{ MESSAGE_COUNT }> for Maplet {
+                const MESSAGE_IDS: [u16; MESSAGE_COUNT] = {
+                    let mut out = [0u16; MESSAGE_COUNT];
+                    let mut at = 0usize;
                     $(
-                        if let Some(result) = <$bundle_spec as $crate::BundleDispatch<super::$atlas::Atlas, $bundle, ReplyTo>>::try_dispatch(&self.$bundle, &mut handlers.$bundle, meta, msg).await {
-                            result?;
-                            return Ok($crate::DispatchOutcome::Handled);
+                        let ids = <super::$bundle::Bundle as $crate::BundleSpec<{ super::$bundle::MESSAGE_COUNT }>>::MESSAGE_IDS;
+                        let mut i = 0usize;
+                        while i < super::$bundle::MESSAGE_COUNT {
+                            out[at + i] = ids[i];
+                            i += 1;
                         }
+                        at += super::$bundle::MESSAGE_COUNT;
                     )*
+                    out
+                };
+            }
 
-                    match msg.id {
+            $(
+                impl $crate::MapletHasBundle<super::$bundle::Bundle> for Maplet {}
+            )*
+
+            const _: () = {
+                let ids = <Maplet as $crate::MapletSpec<{ MESSAGE_COUNT }>>::MESSAGE_IDS;
+                let mut i = 0usize;
+                while i < MESSAGE_COUNT {
+                    let mut j = i + 1usize;
+                    while j < MESSAGE_COUNT {
+                        if ids[i] == ids[j] {
+                            panic!("duplicate message id in maplet bundles");
+                        }
+                        j += 1;
+                    }
+                    i += 1;
+                }
+            };
+
+            pub type Interface<
+                RM,
+                Node,
+                TxBuf,
+                const DEPTH: usize,
+                const MAX_BODY: usize,
+                const MAX_WAITERS: usize,
+            > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
+
+            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+        }
+    };
+
+    (@define_from_bundles_aliases $vis:vis mod $maplet:ident : $atlas:ident { [ $( $alias:ident = $bundle:ident ),* ] }) => {
+        $vis mod $maplet {
+            #[derive(Clone, Copy, Debug, Default)]
+            pub struct Maplet;
+
+            pub const MESSAGE_COUNT: usize = 0 $(+ super::$bundle::MESSAGE_COUNT)*;
+
+            impl $crate::MapletSpec<{ MESSAGE_COUNT }> for Maplet {
+                const MESSAGE_IDS: [u16; MESSAGE_COUNT] = {
+                    let mut out = [0u16; MESSAGE_COUNT];
+                    let mut at = 0usize;
+                    $(
+                        let ids = <super::$bundle::Bundle as $crate::BundleSpec<{ super::$bundle::MESSAGE_COUNT }>>::MESSAGE_IDS;
+                        let mut i = 0usize;
+                        while i < super::$bundle::MESSAGE_COUNT {
+                            out[at + i] = ids[i];
+                            i += 1;
+                        }
+                        at += super::$bundle::MESSAGE_COUNT;
+                    )*
+                    out
+                };
+            }
+
+            $(
+                impl $crate::MapletHasBundle<super::$bundle::Bundle> for Maplet {}
+            )*
+
+            const _: () = {
+                let ids = <Maplet as $crate::MapletSpec<{ MESSAGE_COUNT }>>::MESSAGE_IDS;
+                let mut i = 0usize;
+                while i < MESSAGE_COUNT {
+                    let mut j = i + 1usize;
+                    while j < MESSAGE_COUNT {
+                        if ids[i] == ids[j] {
+                            panic!("duplicate message id in maplet bundles");
+                        }
+                        j += 1;
+                    }
+                    i += 1;
+                }
+            };
+
+            pub type Interface<
+                RM,
+                Node,
+                TxBuf,
+                const DEPTH: usize,
+                const MAX_BODY: usize,
+                const MAX_WAITERS: usize,
+            > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
+
+            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+
+            pub struct Bundles<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize>
+            where
+                RM: $crate::RawMutex,
+                TxBuf: AsMut<[u8]>,
+                $(
+                    super::$bundle::Bundle: $crate::BundleFactory<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>,
+                )*
+            {
+                $(
+                    pub $alias: <super::$bundle::Bundle as $crate::BundleFactory<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>>::Instance,
+                )*
+            }
+
+            impl<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize>
+                Bundles<'a, RM, Node, TxBuf, DEPTH, MAX_BODY, MAX_WAITERS>
+            where
+                RM: $crate::RawMutex,
+                TxBuf: AsMut<[u8]>,
+                $(
+                    super::$bundle::Bundle: $crate::BundleFactory<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>,
+                )*
+            {
+                pub fn new(iface: &'a Interface<RM, Node, TxBuf, DEPTH, MAX_BODY, MAX_WAITERS>) -> Self {
+                    let ingress = iface.handle();
+                    Self {
                         $(
-                            <super::$atlas::$handled as $crate::Message>::ID => {
-                                let parsed = <$app_parser as $crate::MessageParser<super::$atlas::$handled>>::parse(
-                                    &self.app_parser,
-                                    msg.body,
-                                )?;
-                                if let Err(_e) = handlers.app.$method(meta, parsed).await {
-                                    return Err($crate::Error { kind: $crate::ErrorKind::Other });
-                                }
-                                return Ok($crate::DispatchOutcome::Handled);
-                            }
+                            $alias: <super::$bundle::Bundle as $crate::BundleFactory<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>>::make(
+                                ingress.scope::<super::$bundle::Bundle>(),
+                            ),
                         )*
-                        _ => {}
                     }
-
-                    let known = is_known(msg.id) $(|| <$bundle_spec as $crate::BundleMeta<super::$atlas::Atlas>>::is_known(msg.id))*;
-                    if known {
-                        if is_ignored(msg.id) {
-                            return Ok($crate::DispatchOutcome::Handled);
-                        }
-                        if UNHANDLED_BY_DEFAULT {
-                            return Ok($crate::DispatchOutcome::Unhandled(msg));
-                        }
-                        return Ok($crate::DispatchOutcome::Handled);
-                    }
-
-                    Ok($crate::DispatchOutcome::Unknown {
-                        id: msg.id,
-                        body: msg.body,
-                    })
                 }
             }
         }
