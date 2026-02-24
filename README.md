@@ -12,6 +12,6 @@ An application-layer comms protocol intended for UDS 29-bit addressed ISO-TP tra
     - per-device routers (*maplet*s)
 
 - `thincan-file-transfer`
-  - A reusable “file transfer” bundle for `thincan`, implemented using Cap’n Proto types.
+  - A reusable “file transfer” bundle for `thincan`.
   - Provides encoding helpers, a state machine for decoding, and a storage trait to persist
     the received bytes.

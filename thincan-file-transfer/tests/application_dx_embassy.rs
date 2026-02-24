@@ -167,10 +167,16 @@ async fn application_dx_end_to_end_embassy_no_alloc_bundle_api() {
 
     let mut a_tx = [0u8; 512];
     let mut b_tx = [0u8; 512];
-    let a_iface =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(a_node, &mut a_tx);
-    let b_iface =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(b_node, &mut b_tx);
+    let a_iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(
+        a_node.clone(),
+        a_node,
+        &mut a_tx,
+    );
+    let b_iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(
+        b_node.clone(),
+        b_node,
+        &mut b_tx,
+    );
 
     let mut a_bundles = maplet::Bundles::new(&a_iface);
     let b_bundles = maplet::Bundles::new(&b_iface);

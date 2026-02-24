@@ -76,12 +76,12 @@ pub const fn capnp_padded_len(len: usize) -> usize {
 
 /// Upper bound for an encoded `FileReq` body (bytes) without metadata.
 pub const fn file_req_max_encoded_len() -> usize {
-    32
+    40
 }
 
 /// Upper bound for an encoded `FileReq` body (bytes) with metadata.
-pub const fn file_offer_max_encoded_len(metadata_len: usize) -> usize {
-    32 + capnp_padded_len(metadata_len)
+pub const fn file_offer_max_encoded_len(metadata_len: usize, hash_len: usize) -> usize {
+    40 + capnp_padded_len(metadata_len) + capnp_padded_len(hash_len)
 }
 
 /// Upper bound for an encoded `FileChunk` body (bytes).
@@ -199,6 +199,8 @@ pub struct FileOfferValue<'a, A> {
     pub total_len: u32,
     pub file_metadata: &'a [u8],
     pub sender_max_chunk_size: u32,
+    pub file_hash_algo: schema::FileHashAlgo,
+    pub file_hash: &'a [u8],
     _atlas: PhantomData<A>,
 }
 
@@ -234,12 +236,16 @@ impl<'a, A> FileOfferValue<'a, A> {
         total_len: u32,
         sender_max_chunk_size: u32,
         file_metadata: &'a [u8],
+        file_hash_algo: schema::FileHashAlgo,
+        file_hash: &'a [u8],
     ) -> Self {
         Self {
             transfer_id,
             total_len,
             file_metadata,
             sender_max_chunk_size,
+            file_hash_algo,
+            file_hash,
             _atlas: PhantomData,
         }
     }
@@ -251,8 +257,17 @@ pub fn file_offer<'a, A>(
     total_len: u32,
     sender_max_chunk_size: u32,
     file_metadata: &'a [u8],
+    file_hash_algo: schema::FileHashAlgo,
+    file_hash: &'a [u8],
 ) -> FileOfferValue<'a, A> {
-    FileOfferValue::new(transfer_id, total_len, sender_max_chunk_size, file_metadata)
+    FileOfferValue::new(
+        transfer_id,
+        total_len,
+        sender_max_chunk_size,
+        file_metadata,
+        file_hash_algo,
+        file_hash,
+    )
 }
 
 impl<'a, A> FileChunkValue<'a, A> {

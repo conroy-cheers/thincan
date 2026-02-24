@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use can_isotp_interface::{
     IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
 };
+use sha2::{Digest, Sha256};
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -32,7 +33,7 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CountingNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
@@ -120,13 +121,15 @@ async fn async_sender_completes_with_preingested_acks() {
     };
 
     let mut tx_buf = [0u8; 256];
-    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(node, &mut tx_buf);
+    let iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(node.clone(), node, &mut tx_buf);
     let mut bundles = maplet::Bundles::new(&iface);
     let ingress = iface.handle();
 
     let transfer_id = 1u32;
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 1, 256, 1>::new(
+        (),
         (),
         enc_buf.as_mut_slice(),
     );
@@ -188,16 +191,22 @@ async fn recv_file_writes_store_and_sends_acks() {
     };
 
     let mut tx_buf = [0u8; 256];
-    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
     let ingress = iface.handle();
 
     let mut enc_buf = [0u8; 256];
     let mut enc =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), &mut enc_buf);
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), (), &mut enc_buf);
     let req = enc
         .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
-            9, 11, 8, b"meta",
+            9,
+            11,
+            8,
+            b"meta",
+            thincan_file_transfer::schema::FileHashAlgo::Sha256,
+            Sha256::digest(b"hello world").as_slice(),
         ))
         .unwrap()
         .to_vec();

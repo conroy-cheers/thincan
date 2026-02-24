@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use can_isotp_interface::{
     IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
 };
+use sha2::{Digest, Sha256};
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -32,7 +33,7 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AckSinkNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
@@ -123,19 +124,26 @@ async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
     };
 
     let mut tx_buf = [0u8; 256];
-    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
     let ingress = iface.handle();
 
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(
         (),
+        (),
         enc_buf.as_mut_slice(),
     );
 
     let req = enc
         .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
-            7, 11, 16, b"meta",
+            7,
+            11,
+            16,
+            b"meta",
+            thincan_file_transfer::schema::FileHashAlgo::Sha256,
+            Sha256::digest(b"hello world").as_slice(),
         ))
         .unwrap()
         .to_vec();

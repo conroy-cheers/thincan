@@ -13,6 +13,16 @@ struct FileReq {
   # Maximum chunk payload size (bytes) the sender is able/willing to emit for this transfer.
   # The receiver may respond with a smaller chunk size in `FileAck`.
   senderMaxChunkSize @3 :UInt32;
+
+  # Algorithm used for the file hash.
+  fileHashAlgo @4 :FileHashAlgo;
+
+  # Digest of the full file payload.
+  fileHash @5 :Data;
+}
+
+enum FileHashAlgo {
+  sha256 @0;
 }
 
 struct FileChunk {
@@ -31,12 +41,13 @@ enum FileAckKind {
 
 enum FileAckError {
   none @0;
-  busy @1;
-  invalidRequest @2;
-  unsupported @3;
-  chunkSizeTooLarge @4;
-  chunkSizeTooSmall @5;
-  internal @6;
+  invalidRequest @1;
+  chunkSizeTooLarge @2;
+  chunkSizeTooSmall @3;
+  hashMissing @4;
+  hashInvalidLength @5;
+  hashAlgoUnsupported @6;
+  hashMismatch @7;
 }
 
 struct FileAck {

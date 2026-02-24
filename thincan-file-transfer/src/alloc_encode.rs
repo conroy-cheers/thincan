@@ -60,6 +60,10 @@ where
             let mut root: schema::file_req::Builder = message.init_root();
             root.set_transfer_id(self.transfer_id);
             root.set_total_len(self.total_len);
+            root.set_file_metadata(&[]);
+            root.set_sender_max_chunk_size(0);
+            root.set_file_hash_algo(schema::FileHashAlgo::Sha256);
+            root.set_file_hash(&[]);
 
             let segments = message.get_segments_for_output();
             if segments.len() != 1 {
@@ -84,7 +88,7 @@ where
     A: Atlas,
 {
     fn max_encoded_len(&self) -> usize {
-        crate::file_offer_max_encoded_len(self.file_metadata.len())
+        crate::file_offer_max_encoded_len(self.file_metadata.len(), self.file_hash.len())
     }
 
     fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
@@ -102,6 +106,8 @@ where
             root.set_total_len(self.total_len);
             root.set_file_metadata(self.file_metadata);
             root.set_sender_max_chunk_size(self.sender_max_chunk_size);
+            root.set_file_hash_algo(self.file_hash_algo);
+            root.set_file_hash(self.file_hash);
 
             let segments = message.get_segments_for_output();
             if segments.len() != 1 {

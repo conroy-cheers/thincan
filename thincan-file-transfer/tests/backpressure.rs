@@ -32,7 +32,7 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CountingNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
@@ -82,7 +82,11 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
     };
 
     let mut tx_buf = [0u8; 256];
-    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(
+        node.clone(),
+        node,
+        &mut tx_buf,
+    );
     let mut bundles = maplet::Bundles::new(&iface);
     let ingress = iface.handle();
 
@@ -93,6 +97,7 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
 
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 1, 256, 1>::new(
+        (),
         (),
         enc_buf.as_mut_slice(),
     );
