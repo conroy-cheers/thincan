@@ -11,7 +11,7 @@ use crate::pdu::{
     FlowStatus, Pdu, decode_with_offset, duration_to_st_min, encode_with_prefix_sized,
     st_min_to_duration,
 };
-use crate::rx::{RxMachine, RxOutcome, RxStorage};
+use crate::rx::{RxMachine, RxOutcome, RxState, RxStorage};
 use crate::timer::Clock;
 use crate::{IsoTpConfig, RxFlowControl, id_matches};
 
@@ -28,6 +28,7 @@ where
     rx_flow_control: RxFlowControl,
     clock: C,
     rx_machine: RxMachine<'a>,
+    rx_last_activity: Option<C::Instant>,
 }
 
 impl<'a, Tx, Rx, F, C> IsoTpAsyncNode<'a, Tx, Rx, F, C>
@@ -77,6 +78,29 @@ where
         self.rx_flow_control = fc;
     }
 
+    fn update_rx_timeout_activity(&mut self, now: C::Instant) {
+        self.rx_last_activity = if self.rx_machine.state == RxState::Receiving {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    fn expire_rx_timeout_if_needed(&mut self) {
+        let Some(last_activity) = self.rx_last_activity else {
+            return;
+        };
+        if self.rx_machine.state != RxState::Receiving {
+            self.rx_last_activity = None;
+            return;
+        }
+        if self.clock.elapsed(last_activity) >= self.cfg.n_br {
+            isotp_warn!("async recv n_br timeout; aborting in-flight rx");
+            self.rx_machine.reset();
+            self.rx_last_activity = None;
+        }
+    }
+
     /// Blocking-by-await send until completion or timeout.
     ///
     /// This method performs the full ISO-TP handshake and segmentation as needed, using the
@@ -88,6 +112,11 @@ where
         timeout: Duration,
     ) -> Result<(), IsoTpError<Tx::Error>> {
         if payload.len() > self.cfg.max_payload_len {
+            isotp_warn!(
+                "async send overflow payload_len={} max={}",
+                payload.len(),
+                self.cfg.max_payload_len
+            );
             return Err(IsoTpError::Overflow);
         }
 
@@ -97,6 +126,7 @@ where
         }
 
         if payload.len() <= self.cfg.max_single_frame_payload() {
+            isotp_trace!("async send single-frame len={}", payload.len());
             let pdu = Pdu::SingleFrame {
                 len: payload.len() as u8,
                 data: payload,
@@ -117,6 +147,13 @@ where
         let mut offset = payload.len().min(self.cfg.max_first_frame_payload());
         let mut next_sn: u8 = 1;
         let wait_count: u8 = 0;
+        isotp_debug!(
+            "async send first-frame payload_len={} ff_chunk={} bs={} st_min_ms={}",
+            payload.len(),
+            offset,
+            self.cfg.block_size,
+            self.cfg.st_min.as_millis() as u64
+        );
 
         let pdu = Pdu::FirstFrame {
             len: payload.len() as u16,
@@ -178,6 +215,14 @@ where
             .map_err(|_| IsoTpError::InvalidFrame)?;
             self.send_frame(rt, start, timeout, TimeoutKind::NAs, &frame)
                 .await?;
+            isotp_trace!(
+                "async send cf sent sn={} chunk={} offset={} payload_len={} block_remaining={}",
+                next_sn & 0x0F,
+                chunk,
+                offset,
+                payload.len(),
+                block_remaining
+            );
 
             last_cf_sent = Some(self.clock.now());
             offset += chunk;
@@ -205,22 +250,60 @@ where
         let start = self.clock.now();
 
         loop {
-            let frame = self
-                .recv_frame(rt, start, timeout, TimeoutKind::NAr)
-                .await?;
+            self.expire_rx_timeout_if_needed();
+
+            let global_remaining = remaining(timeout, self.clock.elapsed(start))
+                .ok_or(IsoTpError::Timeout(TimeoutKind::NAr))?;
+            let wait_for = if let Some(last_activity) = self.rx_last_activity {
+                if self.rx_machine.state == RxState::Receiving {
+                    let elapsed = self.clock.elapsed(last_activity);
+                    match self.cfg.n_br.checked_sub(elapsed) {
+                        Some(remaining_n_br) => global_remaining.min(remaining_n_br),
+                        None => Duration::from_millis(0),
+                    }
+                } else {
+                    global_remaining
+                }
+            } else {
+                global_remaining
+            };
+            if wait_for == Duration::from_millis(0) {
+                self.expire_rx_timeout_if_needed();
+                continue;
+            }
+
+            let frame = match rt.timeout(wait_for, self.rx.recv()).await {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(err)) => return Err(IsoTpError::LinkError(err)),
+                Err(_) => {
+                    self.expire_rx_timeout_if_needed();
+                    if remaining(timeout, self.clock.elapsed(start)).is_none() {
+                        return Err(IsoTpError::Timeout(TimeoutKind::NAr));
+                    }
+                    continue;
+                }
+            };
 
             if !id_matches(frame.id(), &self.cfg.rx_id) {
+                isotp_trace!("async recv drop frame: rx_id mismatch");
                 continue;
             }
             if let Some(expected) = self.cfg.rx_addr
                 && frame.data().first().copied() != Some(expected)
             {
+                isotp_trace!(
+                    "async recv drop frame: rx_addr mismatch expected={}",
+                    expected
+                );
                 continue;
             }
 
-            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset())
-                .map_err(|_| IsoTpError::InvalidFrame)?;
+            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset()).map_err(|_| {
+                isotp_warn!("async recv invalid frame decode");
+                IsoTpError::InvalidFrame
+            })?;
             if matches!(pdu, Pdu::FlowControl { .. }) {
+                isotp_trace!("async recv ignore flow-control while receiving");
                 continue;
             }
 
@@ -230,11 +313,22 @@ where
             {
                 Ok(o) => o,
                 Err(IsoTpError::Overflow) => {
+                    isotp_warn!("async recv rx overflow; sending overflow fc");
+                    self.rx_machine.reset();
+                    self.rx_last_activity = None;
                     let _ = self.send_overflow_fc(rt, start, timeout).await;
                     return Err(IsoTpError::RxOverflow);
                 }
-                Err(IsoTpError::UnexpectedPdu) => continue,
-                Err(IsoTpError::BadSequence) => return Err(IsoTpError::BadSequence),
+                Err(IsoTpError::UnexpectedPdu) => {
+                    self.update_rx_timeout_activity(self.clock.now());
+                    continue;
+                }
+                Err(IsoTpError::BadSequence) => {
+                    isotp_warn!("async recv bad sequence");
+                    self.rx_machine.reset();
+                    self.rx_last_activity = None;
+                    return Err(IsoTpError::BadSequence);
+                }
                 Err(IsoTpError::InvalidFrame) => return Err(IsoTpError::InvalidFrame),
                 Err(IsoTpError::InvalidConfig) => return Err(IsoTpError::InvalidConfig),
                 Err(IsoTpError::Timeout(kind)) => return Err(IsoTpError::Timeout(kind)),
@@ -245,17 +339,29 @@ where
             };
 
             match outcome {
-                RxOutcome::None => continue,
+                RxOutcome::None => {
+                    self.update_rx_timeout_activity(self.clock.now());
+                    continue;
+                }
                 RxOutcome::SendFlowControl {
                     status,
                     block_size,
                     st_min,
                 } => {
+                    self.update_rx_timeout_activity(self.clock.now());
+                    isotp_trace!(
+                        "async recv send fc status={} bs={} st_min_raw={}",
+                        flow_status_code(status),
+                        block_size,
+                        st_min
+                    );
                     self.send_flow_control(rt, start, timeout, status, block_size, st_min)
                         .await?;
                 }
                 RxOutcome::Completed(_len) => {
+                    self.rx_last_activity = None;
                     let data = self.rx_machine.take_completed();
+                    isotp_debug!("async recv completed len={}", data.len());
                     deliver(data);
                     return Ok(());
                 }
@@ -293,16 +399,23 @@ where
             };
 
             if !id_matches(frame.id(), &self.cfg.rx_id) {
+                isotp_trace!("async wait_fc drop frame: rx_id mismatch");
                 continue;
             }
             if let Some(expected) = self.cfg.rx_addr
                 && frame.data().first().copied() != Some(expected)
             {
+                isotp_trace!(
+                    "async wait_fc drop frame: rx_addr mismatch expected={}",
+                    expected
+                );
                 continue;
             }
 
-            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset())
-                .map_err(|_| IsoTpError::InvalidFrame)?;
+            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset()).map_err(|_| {
+                isotp_warn!("async wait_fc invalid frame decode");
+                IsoTpError::InvalidFrame
+            })?;
             match pdu {
                 Pdu::FlowControl {
                     status,
@@ -316,10 +429,20 @@ where
                             block_size
                         };
                         let st_min = st_min_to_duration(st_min).unwrap_or(self.cfg.st_min);
+                        isotp_debug!(
+                            "async wait_fc cts bs={} st_min_ms={}",
+                            bs,
+                            st_min.as_millis() as u64
+                        );
                         return Ok((bs, st_min, 0));
                     }
                     FlowStatus::Wait => {
                         wait_count = wait_count.saturating_add(1);
+                        isotp_trace!(
+                            "async wait_fc wait wait_count={} max={}",
+                            wait_count,
+                            self.cfg.wft_max
+                        );
                         if wait_count > self.cfg.wft_max {
                             return Err(IsoTpError::Timeout(TimeoutKind::NBs));
                         }
@@ -342,6 +465,12 @@ where
         block_size: u8,
         st_min: u8,
     ) -> Result<(), IsoTpError<Tx::Error>> {
+        isotp_trace!(
+            "async send_flow_control status={} bs={} st_min_raw={}",
+            flow_status_code(status),
+            block_size,
+            st_min
+        );
         let fc = Pdu::FlowControl {
             status,
             block_size,
@@ -393,21 +522,15 @@ where
             Err(_) => Err(IsoTpError::Timeout(kind)),
         }
     }
+}
 
-    async fn recv_frame<R: AsyncRuntime>(
-        &mut self,
-        rt: &R,
-        start: C::Instant,
-        timeout: Duration,
-        kind: TimeoutKind,
-    ) -> Result<F, IsoTpError<Tx::Error>> {
-        let remaining =
-            remaining(timeout, self.clock.elapsed(start)).ok_or(IsoTpError::Timeout(kind))?;
-        match rt.timeout(remaining, self.rx.recv()).await {
-            Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(err)) => Err(IsoTpError::LinkError(err)),
-            Err(_) => Err(IsoTpError::Timeout(kind)),
-        }
+#[cfg(feature = "defmt")]
+#[inline]
+fn flow_status_code(status: FlowStatus) -> u8 {
+    match status {
+        FlowStatus::ClearToSend => 0,
+        FlowStatus::Wait => 1,
+        FlowStatus::Overflow => 2,
     }
 }
 
@@ -511,6 +634,7 @@ where
             rx_flow_control,
             clock: self.clock,
             rx_machine: RxMachine::new(self.rx_storage),
+            rx_last_activity: None,
         })
     }
 }

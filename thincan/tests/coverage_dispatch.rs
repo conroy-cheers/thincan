@@ -96,7 +96,7 @@ fn interface_send_capnp_rejects_encode_overflowing_max_len() {
         }
     }
 
-    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), [0u8; 8]);
+    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), (), [0u8; 8]);
     let err = iface
         .encode_capnp_into::<atlas::Ping, _>(&LyingValue)
         .unwrap_err();
@@ -153,7 +153,8 @@ async fn async_recv_timeout_maps_to_timeout_error() {
         }
     }
 
-    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(DummyAsync, [0u8; 64]);
+    let iface =
+        maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(DummyAsync, DummyAsync, [0u8; 64]);
     let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
     let timed_out = tokio::time::timeout(
         Duration::from_millis(1),
@@ -214,8 +215,11 @@ async fn ingest_rejects_body_larger_than_mailbox_capacity() {
         }
     }
 
-    let iface =
-        maplet::Interface::<NoopRawMutex, _, _, 4, 8, 2>::new(BufferTooSmallAsync, [0u8; 64]);
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 8, 2>::new(
+        BufferTooSmallAsync,
+        BufferTooSmallAsync,
+        [0u8; 64],
+    );
     let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
     let mut payload = [0u8; 18];
     payload[..2].copy_from_slice(&atlas::Ping::ID.to_le_bytes());
@@ -265,8 +269,11 @@ async fn async_send_helpers_map_backend_errors() {
         }
     }
 
-    let iface =
-        maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(BackendErrorNode, [0u8; 128]);
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(
+        BackendErrorNode,
+        BackendErrorNode,
+        [0u8; 128],
+    );
     let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
     let err = doodad
         .__send_capnp_to::<atlas::Ping, _>(0, &PersonValue { name: "x" }, Duration::from_millis(1))

@@ -44,6 +44,7 @@ fn no_std_atlas_markers_and_decode_wire_compile() {
     let _iface =
         maplet::Interface::<embassy_sync::blocking_mutex::raw::NoopRawMutex, _, _, 1, 8, 1>::new(
             (),
+            (),
             &mut [0u8; 8][..],
         );
 }

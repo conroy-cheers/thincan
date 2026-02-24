@@ -73,7 +73,7 @@ where
 
 #[test]
 fn send_side_validation_rejects_too_small_buffer() {
-    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), [0u8; 8]);
+    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), (), [0u8; 8]);
     let err = iface
         .encode_capnp_into::<atlas::A, _>(&PersonValue { name: "A" })
         .unwrap_err();
@@ -83,7 +83,7 @@ fn send_side_validation_rejects_too_small_buffer() {
     ));
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CountingNode {
     sends: Arc<Mutex<usize>>,
     functional_sends: Arc<Mutex<usize>>,
@@ -145,7 +145,8 @@ async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
         functional_sends: functional_sends.clone(),
     };
 
-    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node, [0u8; 128]);
+    let iface =
+        maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node.clone(), node, [0u8; 128]);
     let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
     doodad
         .__send_capnp_to::<atlas::A, _>(0x11, &PersonValue { name: "A" }, Duration::from_millis(1))
@@ -213,7 +214,8 @@ async fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(
         }
     }
 
-    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, [0u8; 64]);
+    let iface =
+        maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, TimeoutNode, [0u8; 64]);
     let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
     let timed_out = tokio::time::timeout(
         Duration::from_millis(1),

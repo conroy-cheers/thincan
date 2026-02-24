@@ -80,6 +80,45 @@
 #[cfg(any(feature = "alloc", feature = "std"))]
 extern crate alloc;
 
+#[cfg(feature = "defmt")]
+#[allow(unused_macros)]
+macro_rules! isotp_trace {
+    ($($arg:tt)*) => {
+        defmt::trace!($($arg)*);
+    };
+}
+#[cfg(not(feature = "defmt"))]
+#[allow(unused_macros)]
+macro_rules! isotp_trace {
+    ($($arg:tt)*) => {};
+}
+
+#[cfg(feature = "defmt")]
+#[allow(unused_macros)]
+macro_rules! isotp_debug {
+    ($($arg:tt)*) => {
+        defmt::debug!($($arg)*);
+    };
+}
+#[cfg(not(feature = "defmt"))]
+#[allow(unused_macros)]
+macro_rules! isotp_debug {
+    ($($arg:tt)*) => {};
+}
+
+#[cfg(feature = "defmt")]
+#[allow(unused_macros)]
+macro_rules! isotp_warn {
+    ($($arg:tt)*) => {
+        defmt::warn!($($arg)*);
+    };
+}
+#[cfg(not(feature = "defmt"))]
+#[allow(unused_macros)]
+macro_rules! isotp_warn {
+    ($($arg:tt)*) => {};
+}
+
 pub mod address;
 #[cfg(feature = "uds")]
 mod async_demux;
@@ -146,7 +185,7 @@ use pdu::{
     FlowStatus, Pdu, decode_with_offset, duration_to_st_min, encode_with_prefix_sized,
     st_min_to_duration,
 };
-use rx::{RxMachine, RxOutcome};
+use rx::{RxMachine, RxOutcome, RxState};
 use tx::{TxSession, TxState};
 
 /// Alias for CAN identifier.
@@ -168,6 +207,7 @@ where
     clock: C,
     tx_state: TxState<C::Instant>,
     rx_machine: RxMachine<'a>,
+    rx_last_activity: Option<C::Instant>,
 }
 
 impl<'a, Tx, Rx, F, C> IsoTpNode<'a, Tx, Rx, F, C>
@@ -222,6 +262,29 @@ where
         self.rx_flow_control = fc;
     }
 
+    fn update_rx_timeout_activity(&mut self, now: C::Instant) {
+        self.rx_last_activity = if self.rx_machine.state == RxState::Receiving {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    fn expire_rx_timeout_if_needed(&mut self) {
+        let Some(last_activity) = self.rx_last_activity else {
+            return;
+        };
+        if self.rx_machine.state != RxState::Receiving {
+            self.rx_last_activity = None;
+            return;
+        }
+        if self.clock.elapsed(last_activity) >= self.cfg.n_br {
+            isotp_warn!("poll_recv n_br timeout; aborting in-flight rx");
+            self.rx_machine.reset();
+            self.rx_last_activity = None;
+        }
+    }
+
     /// Advance transmission once; caller supplies current time.
     ///
     /// This method is appropriate for “superloop” style designs where you poll the node until it
@@ -244,6 +307,11 @@ where
         //     };
         // }
         if payload.len() > self.cfg.max_payload_len {
+            isotp_warn!(
+                "poll_send overflow payload_len={} max={}",
+                payload.len(),
+                self.cfg.max_payload_len
+            );
             return Err(IsoTpError::Overflow);
         }
 
@@ -288,9 +356,10 @@ where
     /// reassembly buffer.
     pub fn poll_recv(
         &mut self,
-        _now: C::Instant,
+        now: C::Instant,
         deliver: &mut dyn FnMut(&[u8]),
     ) -> Result<Progress, IsoTpError<Tx::Error>> {
+        self.expire_rx_timeout_if_needed();
         loop {
             let frame = match self.rx.try_recv() {
                 Ok(frame) => frame,
@@ -300,17 +369,25 @@ where
             };
 
             if !id_matches(frame.id(), &self.cfg.rx_id) {
+                isotp_trace!("poll_recv drop frame: rx_id mismatch");
                 continue;
             }
             if let Some(expected) = self.cfg.rx_addr
                 && frame.data().first().copied() != Some(expected)
             {
+                isotp_trace!(
+                    "poll_recv drop frame: rx_addr mismatch expected={}",
+                    expected
+                );
                 continue;
             }
 
-            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset())
-                .map_err(|_| IsoTpError::InvalidFrame)?;
+            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset()).map_err(|_| {
+                isotp_warn!("poll_recv invalid frame decode");
+                IsoTpError::InvalidFrame
+            })?;
             if matches!(pdu, Pdu::FlowControl { .. }) {
+                isotp_trace!("poll_recv ignore flow-control while receiving");
                 continue;
             }
             let outcome = match self
@@ -319,11 +396,22 @@ where
             {
                 Ok(o) => o,
                 Err(IsoTpError::Overflow) => {
+                    isotp_warn!("poll_recv rx overflow; sending overflow fc");
+                    self.rx_machine.reset();
+                    self.rx_last_activity = None;
                     let _ = self.send_overflow_fc();
                     return Err(IsoTpError::RxOverflow);
                 }
-                Err(IsoTpError::UnexpectedPdu) => continue,
-                Err(IsoTpError::BadSequence) => return Err(IsoTpError::BadSequence),
+                Err(IsoTpError::UnexpectedPdu) => {
+                    self.update_rx_timeout_activity(now);
+                    continue;
+                }
+                Err(IsoTpError::BadSequence) => {
+                    isotp_warn!("poll_recv bad sequence");
+                    self.rx_machine.reset();
+                    self.rx_last_activity = None;
+                    return Err(IsoTpError::BadSequence);
+                }
                 Err(IsoTpError::InvalidFrame) => return Err(IsoTpError::InvalidFrame),
                 Err(IsoTpError::InvalidConfig) => return Err(IsoTpError::InvalidConfig),
                 Err(IsoTpError::Timeout(kind)) => return Err(IsoTpError::Timeout(kind)),
@@ -334,17 +422,29 @@ where
             };
 
             match outcome {
-                RxOutcome::None => return Ok(Progress::InFlight),
+                RxOutcome::None => {
+                    self.update_rx_timeout_activity(now);
+                    return Ok(Progress::InFlight);
+                }
                 RxOutcome::SendFlowControl {
                     status,
                     block_size,
                     st_min,
                 } => {
+                    self.update_rx_timeout_activity(now);
+                    isotp_trace!(
+                        "poll_recv send fc status={} bs={} st_min_raw={}",
+                        flow_status_code(status),
+                        block_size,
+                        st_min
+                    );
                     self.send_flow_control(status, block_size, st_min)?;
                     return Ok(Progress::InFlight);
                 }
                 RxOutcome::Completed(_len) => {
+                    self.rx_last_activity = None;
                     let data = self.rx_machine.take_completed();
+                    isotp_debug!("poll_recv completed len={}", data.len());
                     deliver(data);
                     return Ok(Progress::Completed);
                 }
@@ -383,6 +483,7 @@ where
         now: C::Instant,
     ) -> Result<Progress, IsoTpError<Tx::Error>> {
         if payload.len() <= self.cfg.max_single_frame_payload() {
+            isotp_trace!("start_send single-frame len={}", payload.len());
             let pdu = Pdu::SingleFrame {
                 len: payload.len() as u8,
                 data: payload,
@@ -404,6 +505,13 @@ where
             let mut session = TxSession::new(payload.len(), self.cfg.block_size, self.cfg.st_min);
             let len = payload.len();
             let chunk = payload.len().min(self.cfg.max_first_frame_payload());
+            isotp_debug!(
+                "start_send first-frame payload_len={} ff_chunk={} bs={} st_min_ms={}",
+                len,
+                chunk,
+                self.cfg.block_size,
+                self.cfg.st_min.as_millis() as u64
+            );
             let pdu = Pdu::FirstFrame {
                 len: len as u16,
                 data: &payload[..chunk],
@@ -434,14 +542,25 @@ where
         now: C::Instant,
     ) -> Result<Progress, IsoTpError<Tx::Error>> {
         if payload.len() != session.payload_len {
+            isotp_warn!(
+                "wait_fc payload mismatch got={} expected={}",
+                payload.len(),
+                session.payload_len
+            );
             self.tx_state = TxState::Idle;
             return Err(IsoTpError::NotIdle);
         }
         if session.wait_count > self.cfg.wft_max {
+            isotp_warn!(
+                "wait_fc exceeded wft_max wait_count={} max={}",
+                session.wait_count,
+                self.cfg.wft_max
+            );
             self.tx_state = TxState::Idle;
             return Err(IsoTpError::Timeout(TimeoutKind::NBs));
         }
         if now >= deadline {
+            isotp_warn!("wait_fc timed out (n_bs)");
             return Err(IsoTpError::Timeout(TimeoutKind::NBs));
         }
         loop {
@@ -453,15 +572,19 @@ where
                 }
             };
             if !id_matches(frame.id(), &self.cfg.rx_id) {
+                isotp_trace!("wait_fc drop frame: rx_id mismatch");
                 continue;
             }
             if let Some(expected) = self.cfg.rx_addr
                 && frame.data().first().copied() != Some(expected)
             {
+                isotp_trace!("wait_fc drop frame: rx_addr mismatch expected={}", expected);
                 continue;
             }
-            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset())
-                .map_err(|_| IsoTpError::InvalidFrame)?;
+            let pdu = decode_with_offset(frame.data(), self.cfg.rx_pci_offset()).map_err(|_| {
+                isotp_warn!("wait_fc invalid frame decode");
+                IsoTpError::InvalidFrame
+            })?;
             match pdu {
                 Pdu::FlowControl {
                     status,
@@ -478,14 +601,20 @@ where
                         session.block_size = bs;
                         session.block_remaining = bs;
                         session.st_min = st_min_to_duration(st_min).unwrap_or(self.cfg.st_min);
+                        isotp_debug!(
+                            "wait_fc cts bs={} st_min_ms={}",
+                            bs,
+                            session.st_min.as_millis() as u64
+                        );
                         return self.continue_send(payload, session, None, now);
                     }
                     FlowStatus::Wait => {
-                        #[cfg(feature = "std")]
-                        if cfg!(debug_assertions) {
-                            println!("DEBUG wait_count before {}", session.wait_count);
-                        }
                         session.wait_count = session.wait_count.saturating_add(1);
+                        isotp_trace!(
+                            "wait_fc wait wait_count={} max={}",
+                            session.wait_count,
+                            self.cfg.wft_max
+                        );
                         if session.wait_count > self.cfg.wft_max {
                             let deadline = self.clock.add(now, self.cfg.n_bs);
                             self.tx_state = TxState::WaitingForFc { session, deadline };
@@ -499,6 +628,7 @@ where
                         return Ok(Progress::WaitingForFlowControl);
                     }
                     FlowStatus::Overflow => {
+                        isotp_warn!("wait_fc remote overflow");
                         self.tx_state = TxState::Idle;
                         return Err(IsoTpError::Overflow);
                     }
@@ -516,6 +646,11 @@ where
         now: C::Instant,
     ) -> Result<Progress, IsoTpError<Tx::Error>> {
         if payload.len() != session.payload_len {
+            isotp_warn!(
+                "continue_send payload mismatch got={} expected={}",
+                payload.len(),
+                session.payload_len
+            );
             self.tx_state = TxState::Idle;
             return Err(IsoTpError::NotIdle);
         }
@@ -530,6 +665,10 @@ where
         }
 
         if session.offset >= session.payload_len {
+            isotp_debug!(
+                "continue_send completed payload_len={}",
+                session.payload_len
+            );
             self.tx_state = TxState::Idle;
             return Ok(Progress::Completed);
         }
@@ -550,11 +689,23 @@ where
         )
         .map_err(|_| IsoTpError::InvalidFrame)?;
         self.tx.try_send(&frame).map_err(IsoTpError::LinkError)?;
+        isotp_trace!(
+            "continue_send cf sent sn={} chunk={} offset={} payload_len={} block_remaining={}",
+            pdu_sn(&pdu),
+            chunk,
+            session.offset,
+            session.payload_len,
+            session.block_remaining
+        );
 
         session.offset += chunk;
         session.next_sn = (session.next_sn + 1) & 0x0F;
 
         if session.offset >= session.payload_len {
+            isotp_debug!(
+                "continue_send completed payload_len={}",
+                session.payload_len
+            );
             self.tx_state = TxState::Idle;
             return Ok(Progress::Completed);
         }
@@ -565,6 +716,7 @@ where
                 session.block_remaining = session.block_size;
                 let deadline = self.clock.add(now, self.cfg.n_bs);
                 self.tx_state = TxState::WaitingForFc { session, deadline };
+                isotp_trace!("continue_send wait for fc block boundary");
                 return Ok(Progress::WaitingForFlowControl);
             }
         }
@@ -587,6 +739,12 @@ where
         block_size: u8,
         st_min: u8,
     ) -> Result<(), IsoTpError<Tx::Error>> {
+        isotp_trace!(
+            "send_flow_control status={} bs={} st_min_raw={}",
+            flow_status_code(status),
+            block_size,
+            st_min
+        );
         let fc = Pdu::FlowControl {
             status,
             block_size,
@@ -614,6 +772,25 @@ fn id_matches(actual: embedded_can::Id, expected: &Id) -> bool {
         (embedded_can::Id::Standard(a), Id::Standard(b)) => a == *b,
         (embedded_can::Id::Extended(a), Id::Extended(b)) => a == *b,
         _ => false,
+    }
+}
+
+#[cfg(feature = "defmt")]
+#[inline]
+fn flow_status_code(status: FlowStatus) -> u8 {
+    match status {
+        FlowStatus::ClearToSend => 0,
+        FlowStatus::Wait => 1,
+        FlowStatus::Overflow => 2,
+    }
+}
+
+#[cfg(feature = "defmt")]
+#[inline]
+fn pdu_sn(pdu: &Pdu<'_>) -> u8 {
+    match pdu {
+        Pdu::ConsecutiveFrame { sn, .. } => *sn,
+        _ => 0,
     }
 }
 
@@ -697,6 +874,7 @@ where
             clock: self.clock,
             tx_state: TxState::Idle,
             rx_machine: RxMachine::new(self.rx_storage),
+            rx_last_activity: None,
         })
     }
 }

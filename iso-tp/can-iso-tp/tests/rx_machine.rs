@@ -72,19 +72,35 @@ fn rx_machine_reports_errors_for_unexpected_or_overflow_pdus() {
         Err(IsoTpError::Overflow)
     ));
 
-    // FirstFrame while not idle.
-    rx.state = RxState::Receiving;
-    assert!(matches!(
-        rx.on_pdu(
-            &cfg,
-            &rx_fc,
+    // FirstFrame while receiving restarts reassembly instead of wedging.
+    let cfg_restart = cfg_with_limits(16);
+    let rx_fc_restart = RxFlowControl::from_config(&cfg_restart);
+    let mut restart_buf = [0u8; 16];
+    let mut rx_restart = RxMachine::new(RxStorage::Borrowed(&mut restart_buf));
+    let out = rx_restart
+        .on_pdu(
+            &cfg_restart,
+            &rx_fc_restart,
             Pdu::FirstFrame {
-                len: 2,
-                data: &[0x00; 6]
-            }
-        ),
-        Err(IsoTpError::UnexpectedPdu)
-    ));
+                len: 12,
+                data: &[0x11; 6],
+            },
+        )
+        .unwrap();
+    assert!(matches!(out, RxOutcome::SendFlowControl { .. }));
+    assert_eq!(rx_restart.state, RxState::Receiving);
+    let out = rx_restart
+        .on_pdu(
+            &cfg_restart,
+            &rx_fc_restart,
+            Pdu::FirstFrame {
+                len: 10,
+                data: &[0x22; 6],
+            },
+        )
+        .unwrap();
+    assert!(matches!(out, RxOutcome::SendFlowControl { .. }));
+    assert_eq!(rx_restart.state, RxState::Receiving);
 
     // ConsecutiveFrame while not receiving.
     rx.state = RxState::Idle;

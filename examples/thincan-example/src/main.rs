@@ -103,14 +103,28 @@ fn decode_seq_capnp(body: &[u8]) -> Option<u32> {
     .flatten()
 }
 
-#[derive(Clone)]
 struct SharedTx<T> {
     inner: Arc<Mutex<T>>,
 }
 
-#[derive(Clone)]
 struct SharedRx<T> {
     inner: Arc<Mutex<T>>,
+}
+
+impl<T> Clone for SharedTx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Clone for SharedRx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 fn split_shared<T>(can: T) -> (SharedTx<T>, SharedRx<T>) {
@@ -267,21 +281,33 @@ fn run_listen(cli: &Cli) -> Result<()> {
 
     let (tx, rx) = split_shared(can);
 
-    let mut rx_bufs = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
-    let storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs);
-    let node = can_iso_tp::IsoTpDemux::new(
+    let mut rx_bufs_tx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
+    let mut rx_bufs_rx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
+    let tx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_tx);
+    let rx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_rx);
+    let tx_node = can_iso_tp::IsoTpDemux::new(
+        tx.clone(),
+        rx.clone(),
+        isotp_cfg_for_cli(cli),
+        can_iso_tp::StdClock,
+        cli.id,
+        tx_storages,
+    )
+    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP tx demux"))?;
+    let rx_node = can_iso_tp::IsoTpDemux::new(
         tx,
         rx,
         isotp_cfg_for_cli(cli),
         can_iso_tp::StdClock,
         cli.id,
-        storages,
+        rx_storages,
     )
-    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
+    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP rx demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
     let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
-        node,
+        tx_node,
+        rx_node,
         tx_buf.as_mut_slice(),
     );
 
@@ -325,21 +351,33 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
         .context("set CAN acceptance filter")?;
 
     let (tx, rx) = split_shared(can);
-    let mut rx_bufs = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
-    let storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs);
-    let node = can_iso_tp::IsoTpDemux::new(
+    let mut rx_bufs_tx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
+    let mut rx_bufs_rx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
+    let tx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_tx);
+    let rx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_rx);
+    let tx_node = can_iso_tp::IsoTpDemux::new(
+        tx.clone(),
+        rx.clone(),
+        isotp_cfg_for_cli(cli),
+        can_iso_tp::StdClock,
+        cli.id,
+        tx_storages,
+    )
+    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP tx demux"))?;
+    let rx_node = can_iso_tp::IsoTpDemux::new(
         tx,
         rx,
         isotp_cfg_for_cli(cli),
         can_iso_tp::StdClock,
         cli.id,
-        storages,
+        rx_storages,
     )
-    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP demux"))?;
+    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP rx demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
     let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
-        node,
+        tx_node,
+        rx_node,
         tx_buf.as_mut_slice(),
     );
 

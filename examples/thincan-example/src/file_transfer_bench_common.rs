@@ -401,6 +401,7 @@ pub type BenchBundles<'a> =
 
 pub fn build_interface(node: BenchNode) -> BenchInterface {
     maplet::Interface::<thincan::NoopRawMutex, _, _, DEPTH, MAX_BODY, MAX_WAITERS>::new(
+        node.clone(),
         node,
         vec![0u8; TX_BUF_LEN],
     )

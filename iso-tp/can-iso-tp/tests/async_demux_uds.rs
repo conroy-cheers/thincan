@@ -281,3 +281,94 @@ async fn async_demux_receives_functional_single_frame() {
     assert_eq!(reply_to, tester);
     assert_eq!(bytes, payload);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_demux_buffers_back_to_back_same_peer_messages() {
+    const MAX_PEERS: usize = 4;
+    let bus = Arc::new(TokioBus::new());
+    let (rx_tx, rx_rx) = bus.add_interface().await;
+    let (s_tx, s_rx) = bus.add_interface().await;
+
+    let local = 0x10u8;
+    let remote = 0xA1u8;
+
+    let storages: [RxStorage<'static>; MAX_PEERS] =
+        core::array::from_fn(|_| RxStorage::Owned(vec![0u8; 256]));
+    let mut demux = IsoTpAsyncDemux::<_, _, _, _, MAX_PEERS>::new(
+        rx_tx,
+        rx_rx,
+        base_cfg(256),
+        StdClock,
+        local,
+        None,
+        storages,
+    )
+    .unwrap();
+
+    let cfg = IsoTpConfig {
+        tx_id: can_uds::uds29::encode_phys_id(local, remote),
+        rx_id: can_uds::uds29::encode_phys_id(remote, local),
+        ..base_cfg(256)
+    };
+
+    let mut node: IsoTpAsyncNode<'static, _, _, _, _> = IsoTpAsyncNode::with_clock_and_storage(
+        s_tx,
+        s_rx,
+        cfg,
+        StdClock,
+        RxStorage::Owned(vec![0u8; 256]),
+    )
+    .unwrap();
+
+    let p1: Vec<u8> = (0..40).map(|i| (i as u8).wrapping_add(1)).collect();
+    let p2: Vec<u8> = (0..40).map(|i| (i as u8).wrapping_add(81)).collect();
+    let expect_p1 = p1.clone();
+    let expect_p2 = p2.clone();
+
+    let sender = async move {
+        let rt = TokioRt;
+        node.send(&rt, &p1, Duration::from_millis(500))
+            .await
+            .unwrap();
+        node.send(&rt, &p2, Duration::from_millis(500))
+            .await
+            .unwrap();
+    };
+
+    let rt = TokioRt;
+    let start = Instant::now();
+    let mut sender = core::pin::pin!(sender);
+    {
+        let mut driver = demux.driver();
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "sender did not finish"
+            );
+            tokio::select! {
+                _ = &mut sender => break,
+                step = driver.step(&rt, Duration::from_millis(5)) => {
+                    let _ = step.unwrap();
+                }
+            }
+        }
+    }
+
+    let mut out = [0u8; 256];
+    let mut app = demux.app();
+    let first = app
+        .recv_next_into(&rt, Duration::from_millis(200), &mut out)
+        .await
+        .unwrap()
+        .expect("expected first payload");
+    assert_eq!(first.0, remote);
+    assert_eq!(&out[..first.1], expect_p1.as_slice());
+
+    let second = app
+        .recv_next_into(&rt, Duration::from_millis(200), &mut out)
+        .await
+        .unwrap()
+        .expect("expected second payload");
+    assert_eq!(second.0, remote);
+    assert_eq!(&out[..second.1], expect_p2.as_slice());
+}

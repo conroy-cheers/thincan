@@ -216,9 +216,13 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
     let (a_node, b_node) = PipeEnd::pair(0xA0, 0xB0);
     let b_pump = b_node.clone();
 
-    let sender_iface = maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(a_node, [0u8; 256]);
+    let sender_iface = maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(
+        a_node.clone(),
+        a_node,
+        [0u8; 256],
+    );
     let receiver_iface =
-        maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(b_node, [0u8; 256]);
+        maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
     let sender = sender_iface.handle().scope::<protocol_bundle::Bundle>();
     let receiver = receiver_iface.handle().scope::<protocol_bundle::Bundle>();
 

@@ -340,6 +340,26 @@ pub enum IngestError {
     MailboxFull,
 }
 
+/// Result of one integrated transport-ingest pump step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestPumpStatus {
+    /// No payload arrived before timeout elapsed.
+    TimedOut,
+    /// One payload was received and ingested into the matching mailbox.
+    Delivered(IngestOutcome),
+}
+
+/// Error returned by integrated transport-ingest pump operations.
+#[derive(Debug)]
+pub enum IngestPumpError<E> {
+    /// Caller-provided RX scratch buffer was too small.
+    RecvBufferTooSmall { needed: usize, got: usize },
+    /// Underlying transport receive error.
+    RecvBackend(E),
+    /// Message could not be ingested into mailbox state.
+    Ingest(IngestError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MailboxSlot<const MAX_BODY: usize> {
     from: u8,
@@ -519,6 +539,7 @@ pub struct Interface<
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
 {
     tx_state: embassy_sync::mutex::Mutex<RM, TxState<Node, TxBuf>>,
+    rx_transport: embassy_sync::mutex::Mutex<RM, Node>,
     rx_state: embassy_sync::mutex::Mutex<RM, RxState<MAX_TYPES, DEPTH, MAX_BODY>>,
     notify: [embassy_sync::watch::Watch<RM, (), MAX_WAITERS>; MAX_TYPES],
     _maplet: PhantomData<Maplet>,
@@ -539,14 +560,23 @@ where
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
     TxBuf: AsMut<[u8]>,
 {
-    /// Create a new maplet-typed interface from a transport node and caller-provided TX buffer.
-    pub fn new(node: Node, tx: TxBuf) -> Self {
+    /// Create a new maplet-typed interface from split transport endpoints and caller-provided TX buffer.
+    pub fn new(tx_node: Node, rx_node: Node, tx: TxBuf) -> Self {
         Self {
-            tx_state: embassy_sync::mutex::Mutex::new(TxState { node, tx }),
+            tx_state: embassy_sync::mutex::Mutex::new(TxState { node: tx_node, tx }),
+            rx_transport: embassy_sync::mutex::Mutex::new(rx_node),
             rx_state: embassy_sync::mutex::Mutex::new(RxState::new()),
             notify: core::array::from_fn(|_| embassy_sync::watch::Watch::new_with(())),
             _maplet: PhantomData,
         }
+    }
+
+    /// Create a new maplet-typed interface using the same transport endpoint for TX and RX.
+    pub fn new_shared(node: Node, tx: TxBuf) -> Self
+    where
+        Node: Clone,
+    {
+        Self::new(node.clone(), node, tx)
     }
 
     /// Create a cloneable handle borrowing this interface.
@@ -561,7 +591,17 @@ where
 
     /// Mutably borrow the underlying transport node.
     pub fn node_mut(&mut self) -> &mut Node {
+        self.tx_node_mut()
+    }
+
+    /// Mutably borrow the TX transport endpoint.
+    pub fn tx_node_mut(&mut self) -> &mut Node {
         &mut self.tx_state.get_mut().node
+    }
+
+    /// Mutably borrow the RX transport endpoint.
+    pub fn rx_node_mut(&mut self) -> &mut Node {
+        self.rx_transport.get_mut()
     }
 
     /// Encode a Cap'n Proto value for message `M` into this interface's TX buffer.
@@ -586,7 +626,7 @@ where
         let tx_state = self.tx_state.get_mut();
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_to(to, payload, timeout)
+        <Node as can_isotp_interface::IsoTpEndpoint>::send_to(node, to, payload, timeout)
             .map_err(map_isotp_send_error)
     }
 
@@ -603,8 +643,13 @@ where
         let tx_state = self.tx_state.get_mut();
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_functional_to(functional_to, payload, timeout)
-            .map_err(map_isotp_send_error)
+        <Node as can_isotp_interface::IsoTpEndpoint>::send_functional_to(
+            node,
+            functional_to,
+            payload,
+            timeout,
+        )
+        .map_err(map_isotp_send_error)
     }
 
     async fn send_capnp_to_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
@@ -620,7 +665,7 @@ where
         let tx_state = &mut *state;
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_to(to, payload, timeout)
+        <Node as can_isotp_interface::IsoTpAsyncEndpoint>::send_to(node, to, payload, timeout)
             .await
             .map_err(map_isotp_send_error)
     }
@@ -638,9 +683,14 @@ where
         let tx_state = &mut *state;
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        node.send_functional_to(functional_to, payload, timeout)
-            .await
-            .map_err(map_isotp_send_error)
+        <Node as can_isotp_interface::IsoTpAsyncEndpoint>::send_functional_to(
+            node,
+            functional_to,
+            payload,
+            timeout,
+        )
+        .await
+        .map_err(map_isotp_send_error)
     }
 }
 
@@ -680,6 +730,62 @@ where
     ) -> Result<(), Error> {
         self.send_capnp_functional_to_async_shared::<M, V>(functional_to, value, timeout)
             .await
+    }
+}
+
+impl<
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+    Node: can_isotp_interface::IsoTpAsyncEndpointRecvInto,
+    TxBuf: AsMut<[u8]>,
+{
+    /// Receive at most one payload from the transport and ingest it into this interface.
+    ///
+    /// Typical usage is from a dedicated protocol pump task:
+    /// - call repeatedly with a reusable RX scratch buffer,
+    /// - `TimedOut` can be used to yield/sleep briefly.
+    pub async fn pump_ingest_once(
+        &self,
+        timeout: Duration,
+        rx_buf: &mut [u8],
+    ) -> Result<IngestPumpStatus, IngestPumpError<Node::Error>> {
+        let recv = {
+            let mut state = self.rx_transport.lock().await;
+            <Node as can_isotp_interface::IsoTpAsyncEndpointRecvInto>::recv_one_into(
+                &mut *state,
+                timeout,
+                rx_buf,
+            )
+            .await
+        };
+
+        match recv {
+            Ok(can_isotp_interface::RecvMetaIntoStatus::TimedOut) => Ok(IngestPumpStatus::TimedOut),
+            Ok(can_isotp_interface::RecvMetaIntoStatus::DeliveredOne { meta, len }) => {
+                let outcome = self
+                    .handle()
+                    .ingest(meta.reply_to, &rx_buf[..len])
+                    .await
+                    .map_err(IngestPumpError::Ingest)?;
+                Ok(IngestPumpStatus::Delivered(outcome))
+            }
+            Err(can_isotp_interface::RecvError::BufferTooSmall { needed, got }) => {
+                Err(IngestPumpError::RecvBufferTooSmall { needed, got })
+            }
+            Err(can_isotp_interface::RecvError::Backend(err)) => {
+                Err(IngestPumpError::RecvBackend(err))
+            }
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use crate::pdu::{
     FlowStatus, Pdu, decode_with_offset, duration_to_st_min, encode_with_prefix_sized,
     st_min_to_duration,
 };
-use crate::rx::{RxMachine, RxOutcome, RxStorage};
+use crate::rx::{RxMachine, RxOutcome, RxState, RxStorage};
 use crate::timer::Clock;
 use crate::tx::Progress;
 
@@ -37,26 +37,40 @@ struct PendingFc {
     st_min: u8,
 }
 
-struct Peer<'a> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyItem {
+    Peer(usize),
+    Completed(usize),
+}
+
+struct CompletedPayload<'a> {
+    remote: u8,
+    len: usize,
+    storage: RxStorage<'a>,
+}
+
+struct Peer<'a, I> {
     remote: u8,
     rx_machine: RxMachine<'a>,
     rx_ready: bool,
     pending_fc: Option<PendingFc>,
+    rx_last_activity: Option<I>,
 }
 
-impl<'a> Peer<'a> {
+impl<'a, I> Peer<'a, I> {
     fn new(remote: u8, storage: RxStorage<'a>) -> Self {
         Self {
             remote,
             rx_machine: RxMachine::new(storage),
             rx_ready: false,
             pending_fc: None,
+            rx_last_activity: None,
         }
     }
 }
 
 struct ReadyQueue<const N: usize> {
-    buf: [usize; N],
+    buf: [ReadyItem; N],
     head: usize,
     tail: usize,
     len: usize,
@@ -65,14 +79,14 @@ struct ReadyQueue<const N: usize> {
 impl<const N: usize> ReadyQueue<N> {
     fn new() -> Self {
         Self {
-            buf: [0; N],
+            buf: [ReadyItem::Peer(0); N],
             head: 0,
             tail: 0,
             len: 0,
         }
     }
 
-    fn push(&mut self, v: usize) -> Result<(), ()> {
+    fn push(&mut self, v: ReadyItem) -> Result<(), ()> {
         if self.len == N {
             return Err(());
         }
@@ -82,7 +96,7 @@ impl<const N: usize> ReadyQueue<N> {
         Ok(())
     }
 
-    fn pop(&mut self) -> Option<usize> {
+    fn pop(&mut self) -> Option<ReadyItem> {
         if self.len == 0 {
             return None;
         }
@@ -112,8 +126,9 @@ where
     clock: C,
     local_addr: u8,
     functional_addr: Option<u8>,
-    peers: [Option<Peer<'a>>; MAX_PEERS],
+    peers: [Option<Peer<'a, C::Instant>>; MAX_PEERS],
     free: [Option<RxStorage<'a>>; MAX_PEERS],
+    completed: [Option<CompletedPayload<'a>>; MAX_PEERS],
     ready: ReadyQueue<MAX_PEERS>,
 }
 
@@ -180,6 +195,7 @@ where
             functional_addr,
             peers: core::array::from_fn(|_| None),
             free,
+            completed: core::array::from_fn(|_| None),
             ready: ReadyQueue::new(),
         })
     }
@@ -209,6 +225,7 @@ where
 
     fn alloc_peer(&mut self, remote: u8) -> Result<usize, IsoTpError<Tx::Error>> {
         if remote == self.local_addr {
+            isotp_warn!("async demux alloc_peer invalid remote=local {}", remote);
             return Err(IsoTpError::InvalidConfig);
         }
 
@@ -224,6 +241,7 @@ where
             .ok_or(IsoTpError::RxOverflow)?;
         let storage = self.free[free_idx].take().ok_or(IsoTpError::RxOverflow)?;
         self.peers[idx] = Some(Peer::new(remote, storage));
+        isotp_debug!("async demux peer allocated remote={} idx={}", remote, idx);
         Ok(idx)
     }
 
@@ -234,32 +252,172 @@ where
         }
     }
 
+    fn refresh_peer_rx_timeout(peer: &mut Peer<'a, C::Instant>, now: C::Instant) {
+        peer.rx_last_activity = if peer.rx_machine.state == RxState::Receiving {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    fn expire_peer_rx_timeouts(&mut self) {
+        for peer in &mut self.peers {
+            let Some(peer) = peer.as_mut() else {
+                continue;
+            };
+            let Some(last_activity) = peer.rx_last_activity else {
+                continue;
+            };
+            if peer.rx_machine.state != RxState::Receiving {
+                peer.rx_last_activity = None;
+                continue;
+            }
+            if self.clock.elapsed(last_activity) >= self.base_cfg.n_br {
+                isotp_warn!(
+                    "async demux n_br timeout; aborting in-flight rx remote={}",
+                    peer.remote
+                );
+                peer.rx_machine.reset();
+                peer.rx_last_activity = None;
+            }
+        }
+    }
+
+    fn next_rx_timeout_wait(&self) -> Option<Duration> {
+        let mut min_wait: Option<Duration> = None;
+        for peer in &self.peers {
+            let Some(peer) = peer.as_ref() else {
+                continue;
+            };
+            if peer.rx_machine.state != RxState::Receiving {
+                continue;
+            }
+            let Some(last_activity) = peer.rx_last_activity else {
+                continue;
+            };
+            let elapsed = self.clock.elapsed(last_activity);
+            let remaining = self
+                .base_cfg
+                .n_br
+                .checked_sub(elapsed)
+                .unwrap_or(Duration::from_millis(0));
+            min_wait = Some(match min_wait {
+                Some(current) => current.min(remaining),
+                None => remaining,
+            });
+        }
+        min_wait
+    }
+
     fn take_pending_fc(&mut self, peer_idx: usize) -> Option<PendingFc> {
         self.peers[peer_idx]
             .as_mut()
             .and_then(|p| p.pending_fc.take())
     }
 
+    fn try_spill_completed_from_peer(
+        &mut self,
+        peer_idx: usize,
+    ) -> Result<bool, IsoTpError<Tx::Error>> {
+        let free_idx = match self.free.iter().position(|s| s.is_some()) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        let completed_idx = match self.completed.iter().position(|s| s.is_none()) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        let replacement = self.free[free_idx].take().ok_or(IsoTpError::RxOverflow)?;
+        let peer = self.peers[peer_idx].as_mut().expect("peer exists");
+        if !peer.rx_ready {
+            self.free[free_idx] = Some(replacement);
+            return Ok(false);
+        }
+
+        let len = peer.rx_machine.completed_len();
+        let remote = peer.remote;
+        let storage = peer.rx_machine.replace_storage(replacement);
+        peer.rx_machine.reset();
+        peer.rx_ready = false;
+        peer.rx_last_activity = None;
+        isotp_trace!(
+            "async demux spill completed remote={} len={} peer_idx={}",
+            remote,
+            len,
+            peer_idx
+        );
+        self.completed[completed_idx] = Some(CompletedPayload {
+            remote,
+            len,
+            storage,
+        });
+        self.ready
+            .push(ReadyItem::Completed(completed_idx))
+            .map_err(|_| IsoTpError::RxOverflow)?;
+        Ok(true)
+    }
+
+    fn recycle_storage(&mut self, storage: RxStorage<'a>) -> Result<(), IsoTpError<Tx::Error>> {
+        let free_idx = self
+            .free
+            .iter()
+            .position(|s| s.is_none())
+            .ok_or(IsoTpError::RxOverflow)?;
+        self.free[free_idx] = Some(storage);
+        Ok(())
+    }
+
     fn deliver_ready_into(
         &mut self,
         out: &mut [u8],
     ) -> Result<Option<(u8, usize)>, AppRecvIntoError<Tx::Error>> {
-        let Some(idx) = self.ready.pop() else {
+        let Some(item) = self.ready.pop() else {
             return Ok(None);
         };
-        let peer = self.peers[idx].as_mut().expect("ready peer exists");
-        let data = peer.rx_machine.take_completed();
-        if data.len() > out.len() {
-            // Keep payload queued for a later call with a larger buffer.
-            let _ = self.ready.push(idx);
-            return Err(AppRecvIntoError::BufferTooSmall {
-                needed: data.len(),
-                got: out.len(),
-            });
+
+        match item {
+            ReadyItem::Peer(idx) => {
+                let peer = self.peers[idx].as_mut().expect("ready peer exists");
+                let data = peer.rx_machine.take_completed();
+                if data.len() > out.len() {
+                    // Keep payload queued for a later call with a larger buffer.
+                    let _ = self.ready.push(item);
+                    return Err(AppRecvIntoError::BufferTooSmall {
+                        needed: data.len(),
+                        got: out.len(),
+                    });
+                }
+                out[..data.len()].copy_from_slice(data);
+                peer.rx_ready = false;
+                peer.rx_last_activity = None;
+                isotp_debug!(
+                    "async demux deliver peer remote={} len={}",
+                    peer.remote,
+                    data.len()
+                );
+                Ok(Some((peer.remote, data.len())))
+            }
+            ReadyItem::Completed(idx) => {
+                let completed = self.completed[idx].as_ref().expect("completed slot exists");
+                if completed.len > out.len() {
+                    let _ = self.ready.push(item);
+                    return Err(AppRecvIntoError::BufferTooSmall {
+                        needed: completed.len,
+                        got: out.len(),
+                    });
+                }
+
+                out[..completed.len].copy_from_slice(&completed.storage.as_ref()[..completed.len]);
+                let remote = completed.remote;
+                let len = completed.len;
+                let completed = self.completed[idx].take().expect("completed slot exists");
+                self.recycle_storage(completed.storage)
+                    .map_err(AppRecvIntoError::IsoTp)?;
+                isotp_debug!("async demux deliver spilled remote={} len={}", remote, len);
+                Ok(Some((remote, len)))
+            }
         }
-        out[..data.len()].copy_from_slice(data);
-        peer.rx_ready = false;
-        Ok(Some((peer.remote, data.len())))
     }
 
     async fn send_flow_control_frame(
@@ -282,20 +440,34 @@ where
     }
 
     async fn ingest_frame(&mut self, frame: F) -> Result<Progress, IsoTpError<Tx::Error>> {
+        let now = self.clock.now();
+        self.expire_peer_rx_timeouts();
+
         let uds = match uds29::decode_id(frame.id()) {
             Some(v) => v,
             None => return Ok(Progress::InFlight),
         };
         let (kind, target, source) = (uds.kind, uds.target, uds.source);
+        isotp_trace!(
+            "async demux ingest kind={} target={} source={}",
+            uds_kind_code(kind),
+            target,
+            source
+        );
 
         match kind {
             Uds29Kind::Physical => {
                 if target != self.local_addr {
+                    isotp_trace!(
+                        "async demux drop physical target mismatch local={}",
+                        self.local_addr
+                    );
                     return Ok(Progress::InFlight);
                 }
             }
             Uds29Kind::Functional => {
                 if Some(target) != self.functional_addr {
+                    isotp_trace!("async demux drop functional target mismatch");
                     return Ok(Progress::InFlight);
                 }
             }
@@ -305,6 +477,7 @@ where
         let cfg = self.cfg_for_peer(source);
         let mut fc_to_send: Option<(FlowStatus, u8, u8)> = None;
         let mut final_result: Result<Progress, IsoTpError<Tx::Error>> = Ok(Progress::InFlight);
+        let mut completed_ready = false;
 
         {
             let peer = self.peers[peer_idx].as_mut().expect("peer exists");
@@ -315,14 +488,23 @@ where
                 {
                     return Ok(Progress::InFlight);
                 }
-                let pdu = decode_with_offset(frame.data(), cfg.rx_pci_offset())
-                    .map_err(|_| IsoTpError::InvalidFrame)?;
+                let pdu = decode_with_offset(frame.data(), cfg.rx_pci_offset()).map_err(|_| {
+                    isotp_warn!("async demux rx_ready invalid frame decode");
+                    IsoTpError::InvalidFrame
+                })?;
                 if let Pdu::FlowControl {
                     status,
                     block_size,
                     st_min,
                 } = pdu
                 {
+                    isotp_trace!(
+                        "async demux store pending fc remote={} status={} bs={} st_min_raw={}",
+                        source,
+                        flow_status_code(status),
+                        block_size,
+                        st_min
+                    );
                     peer.pending_fc = Some(PendingFc {
                         status,
                         block_size,
@@ -342,8 +524,10 @@ where
                     return Ok(Progress::InFlight);
                 }
 
-                let pdu = decode_with_offset(frame.data(), cfg.rx_pci_offset())
-                    .map_err(|_| IsoTpError::InvalidFrame)?;
+                let pdu = decode_with_offset(frame.data(), cfg.rx_pci_offset()).map_err(|_| {
+                    isotp_warn!("async demux invalid frame decode remote={}", source);
+                    IsoTpError::InvalidFrame
+                })?;
 
                 if kind == Uds29Kind::Functional && !matches!(pdu, Pdu::SingleFrame { .. }) {
                     return Ok(Progress::InFlight);
@@ -355,6 +539,13 @@ where
                         block_size,
                         st_min,
                     } => {
+                        isotp_trace!(
+                            "async demux got fc remote={} status={} bs={} st_min_raw={}",
+                            source,
+                            flow_status_code(status),
+                            block_size,
+                            st_min
+                        );
                         peer.pending_fc = Some(PendingFc {
                             status,
                             block_size,
@@ -363,10 +554,15 @@ where
                         final_result = Ok(Progress::InFlight);
                     }
                     _ => {
+                        let restart_on_ff = matches!(pdu, Pdu::FirstFrame { .. })
+                            && peer.rx_machine.state == RxState::Receiving;
                         let outcome = match peer.rx_machine.on_pdu(&cfg, &self.rx_flow_control, pdu)
                         {
                             Ok(o) => o,
                             Err(IsoTpError::Overflow) => {
+                                isotp_warn!("async demux rx overflow remote={}", source);
+                                peer.rx_machine.reset();
+                                peer.rx_last_activity = None;
                                 fc_to_send = Some((
                                     FlowStatus::Overflow,
                                     0,
@@ -376,8 +572,16 @@ where
                                 // Delay return until after FC send.
                                 RxOutcome::None
                             }
-                            Err(IsoTpError::UnexpectedPdu) => return Ok(Progress::InFlight),
-                            Err(IsoTpError::BadSequence) => return Err(IsoTpError::BadSequence),
+                            Err(IsoTpError::UnexpectedPdu) => {
+                                Self::refresh_peer_rx_timeout(peer, now);
+                                return Ok(Progress::InFlight);
+                            }
+                            Err(IsoTpError::BadSequence) => {
+                                isotp_warn!("async demux bad sequence remote={}", source);
+                                peer.rx_machine.reset();
+                                peer.rx_last_activity = None;
+                                return Err(IsoTpError::BadSequence);
+                            }
                             Err(IsoTpError::InvalidFrame) => return Err(IsoTpError::InvalidFrame),
                             Err(IsoTpError::InvalidConfig) => {
                                 return Err(IsoTpError::InvalidConfig);
@@ -391,6 +595,11 @@ where
                             Err(IsoTpError::LinkError(_)) => return Err(IsoTpError::InvalidFrame),
                         };
 
+                        if restart_on_ff {
+                            isotp_warn!("async demux rx restart on ff remote={}", source);
+                        }
+                        Self::refresh_peer_rx_timeout(peer, now);
+
                         match outcome {
                             RxOutcome::None => {}
                             RxOutcome::SendFlowControl {
@@ -398,13 +607,24 @@ where
                                 block_size,
                                 st_min,
                             } => {
+                                isotp_trace!(
+                                    "async demux send fc remote={} status={} bs={} st_min_raw={}",
+                                    source,
+                                    flow_status_code(status),
+                                    block_size,
+                                    st_min
+                                );
                                 fc_to_send = Some((status, block_size, st_min));
                             }
                             RxOutcome::Completed(_len) => {
                                 peer.rx_ready = true;
-                                self.ready
-                                    .push(peer_idx)
-                                    .map_err(|_| IsoTpError::RxOverflow)?;
+                                peer.rx_last_activity = None;
+                                isotp_debug!(
+                                    "async demux rx complete remote={} len={}",
+                                    source,
+                                    peer.rx_machine.completed_len()
+                                );
+                                completed_ready = true;
                                 final_result = Ok(Progress::Completed);
                             }
                         }
@@ -413,7 +633,21 @@ where
             }
         }
 
+        if completed_ready {
+            if !self.try_spill_completed_from_peer(peer_idx)? {
+                self.ready
+                    .push(ReadyItem::Peer(peer_idx))
+                    .map_err(|_| IsoTpError::RxOverflow)?;
+            }
+        }
+
         if let Some((status, block_size, st_min)) = fc_to_send {
+            isotp_trace!(
+                "async demux tx fc status={} bs={} st_min_raw={}",
+                flow_status_code(status),
+                block_size,
+                st_min
+            );
             self.send_flow_control_frame(&cfg, status, block_size, st_min)
                 .await?;
         }
@@ -449,6 +683,8 @@ where
         mut wait_count: u8,
     ) -> Result<(u8, Duration, u8), IsoTpError<Tx::Error>> {
         loop {
+            self.expire_peer_rx_timeouts();
+
             if self.clock.elapsed(fc_start) >= cfg.n_bs {
                 return Err(IsoTpError::Timeout(TimeoutKind::NBs));
             }
@@ -456,16 +692,27 @@ where
             let fc_remaining = cfg.n_bs - self.clock.elapsed(fc_start);
             let global_remaining = remaining(global_timeout, self.clock.elapsed(global_start))
                 .ok_or(IsoTpError::Timeout(TimeoutKind::NAs))?;
-            let wait_for = fc_remaining.min(global_remaining);
+            let mut wait_for = fc_remaining.min(global_remaining);
+            if let Some(rx_wait) = self.next_rx_timeout_wait() {
+                wait_for = wait_for.min(rx_wait);
+            }
+            if wait_for == Duration::from_millis(0) {
+                self.expire_peer_rx_timeouts();
+                continue;
+            }
 
             let frame = match rt.timeout(wait_for, self.rx.recv()).await {
                 Ok(Ok(f)) => f,
                 Ok(Err(err)) => return Err(IsoTpError::LinkError(err)),
                 Err(_) => {
-                    if global_remaining <= fc_remaining {
+                    self.expire_peer_rx_timeouts();
+                    if remaining(global_timeout, self.clock.elapsed(global_start)).is_none() {
                         return Err(IsoTpError::Timeout(TimeoutKind::NAs));
                     }
-                    return Err(IsoTpError::Timeout(TimeoutKind::NBs));
+                    if self.clock.elapsed(fc_start) >= cfg.n_bs {
+                        return Err(IsoTpError::Timeout(TimeoutKind::NBs));
+                    }
+                    continue;
                 }
             };
 
@@ -482,10 +729,22 @@ where
                         fc.block_size
                     };
                     let st_min = st_min_to_duration(fc.st_min).unwrap_or(cfg.st_min);
+                    isotp_debug!(
+                        "async demux wait_fc cts peer_idx={} bs={} st_min_ms={}",
+                        peer_idx,
+                        bs,
+                        st_min.as_millis() as u64
+                    );
                     return Ok((bs, st_min, 0));
                 }
                 FlowStatus::Wait => {
                     wait_count = wait_count.saturating_add(1);
+                    isotp_trace!(
+                        "async demux wait_fc wait peer_idx={} wait_count={} max={}",
+                        peer_idx,
+                        wait_count,
+                        cfg.wft_max
+                    );
                     if wait_count > cfg.wft_max {
                         return Err(IsoTpError::Timeout(TimeoutKind::NBs));
                     }
@@ -505,6 +764,12 @@ where
     ) -> Result<(), IsoTpError<Tx::Error>> {
         let cfg = self.cfg_for_peer(remote);
         if payload.len() > cfg.max_payload_len {
+            isotp_warn!(
+                "async demux send_to overflow remote={} payload_len={} max={}",
+                remote,
+                payload.len(),
+                cfg.max_payload_len
+            );
             return Err(IsoTpError::Overflow);
         }
         let peer_idx = self.peer_index_or_alloc(remote)?;
@@ -513,6 +778,11 @@ where
         let start = self.clock.now();
 
         if payload.len() <= cfg.max_single_frame_payload() {
+            isotp_trace!(
+                "async demux send_to single-frame remote={} len={}",
+                remote,
+                payload.len()
+            );
             let pdu = Pdu::SingleFrame {
                 len: payload.len() as u8,
                 data: payload,
@@ -528,6 +798,14 @@ where
         let mut offset = payload.len().min(cfg.max_first_frame_payload());
         let mut next_sn: u8 = 1;
         let wait_count: u8 = 0;
+        isotp_debug!(
+            "async demux send_to first-frame remote={} payload_len={} ff_chunk={} bs={} st_min_ms={}",
+            remote,
+            payload.len(),
+            offset,
+            cfg.block_size,
+            cfg.st_min.as_millis() as u64
+        );
 
         let ff = Pdu::FirstFrame {
             len: payload.len() as u16,
@@ -585,6 +863,15 @@ where
                     .map_err(|_| IsoTpError::InvalidFrame)?;
             self.send_frame_with_global_timeout(rt, start, timeout, TimeoutKind::NAs, &cf_frame)
                 .await?;
+            isotp_trace!(
+                "async demux send_to cf remote={} sn={} chunk={} offset={} payload_len={} block_remaining={}",
+                remote,
+                next_sn & 0x0F,
+                chunk,
+                offset,
+                payload.len(),
+                block_remaining
+            );
 
             last_cf_sent = Some(self.clock.now());
             offset += chunk;
@@ -638,15 +925,31 @@ where
 
         let start = self.clock.now();
         loop {
-            let remaining = match remaining(timeout, self.clock.elapsed(start)) {
+            self.expire_peer_rx_timeouts();
+
+            let global_remaining = match remaining(timeout, self.clock.elapsed(start)) {
                 Some(r) => r,
                 None => return Ok(None),
             };
+            let mut wait_for = global_remaining;
+            if let Some(rx_wait) = self.next_rx_timeout_wait() {
+                wait_for = wait_for.min(rx_wait);
+            }
+            if wait_for == Duration::from_millis(0) {
+                self.expire_peer_rx_timeouts();
+                continue;
+            }
 
-            let frame = match rt.timeout(remaining, self.rx.recv()).await {
+            let frame = match rt.timeout(wait_for, self.rx.recv()).await {
                 Ok(Ok(frame)) => frame,
                 Ok(Err(err)) => return Err(AppRecvIntoError::IsoTp(IsoTpError::LinkError(err))),
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    self.expire_peer_rx_timeouts();
+                    if remaining(timeout, self.clock.elapsed(start)).is_none() {
+                        return Ok(None);
+                    }
+                    continue;
+                }
             };
 
             let _ = self
@@ -744,19 +1047,47 @@ where
         rt: &R,
         max_wait: Duration,
     ) -> Result<Progress, IsoTpError<Tx::Error>> {
-        if !self.demux.ready.is_empty() {
-            return Ok(Progress::Completed);
-        }
+        self.demux.expire_peer_rx_timeouts();
+
         if max_wait == Duration::from_millis(0) {
-            return Ok(Progress::WouldBlock);
+            return Ok(if self.demux.ready.is_empty() {
+                Progress::WouldBlock
+            } else {
+                Progress::Completed
+            });
         }
 
-        let frame = match rt.timeout(max_wait, self.demux.rx.recv()).await {
+        let mut wait_for = max_wait;
+        if let Some(rx_wait) = self.demux.next_rx_timeout_wait() {
+            wait_for = wait_for.min(rx_wait);
+        }
+        if wait_for == Duration::from_millis(0) {
+            self.demux.expire_peer_rx_timeouts();
+            return Ok(if self.demux.ready.is_empty() {
+                Progress::WouldBlock
+            } else {
+                Progress::Completed
+            });
+        }
+
+        let frame = match rt.timeout(wait_for, self.demux.rx.recv()).await {
             Ok(Ok(frame)) => frame,
             Ok(Err(err)) => return Err(IsoTpError::LinkError(err)),
-            Err(_) => return Ok(Progress::WouldBlock),
+            Err(_) => {
+                self.demux.expire_peer_rx_timeouts();
+                return Ok(if self.demux.ready.is_empty() {
+                    Progress::WouldBlock
+                } else {
+                    Progress::Completed
+                });
+            }
         };
-        self.demux.ingest_frame(frame).await
+        let progress = self.demux.ingest_frame(frame).await?;
+        if !self.demux.ready.is_empty() {
+            Ok(Progress::Completed)
+        } else {
+            Ok(progress)
+        }
     }
 
     /// Continuously pump receive-side demux machinery.
@@ -780,6 +1111,25 @@ where
 
 fn remaining(timeout: Duration, elapsed: Duration) -> Option<Duration> {
     timeout.checked_sub(elapsed)
+}
+
+#[cfg(feature = "defmt")]
+#[inline]
+fn flow_status_code(status: FlowStatus) -> u8 {
+    match status {
+        FlowStatus::ClearToSend => 0,
+        FlowStatus::Wait => 1,
+        FlowStatus::Overflow => 2,
+    }
+}
+
+#[cfg(feature = "defmt")]
+#[inline]
+fn uds_kind_code(kind: Uds29Kind) -> u8 {
+    match kind {
+        Uds29Kind::Physical => 0,
+        Uds29Kind::Functional => 1,
+    }
 }
 
 async fn sleep_or_timeout<C: Clock, R: AsyncRuntime, E>(

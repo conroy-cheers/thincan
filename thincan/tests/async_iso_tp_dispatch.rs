@@ -213,8 +213,10 @@ where
 async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Error> {
     let (a_node, b_node) = PipeEnd::pair(0xAA, 0xBB);
     let b_pump = b_node.clone();
-    let a_iface = maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node, [0u8; 256]);
-    let b_iface = maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node, [0u8; 256]);
+    let a_iface =
+        maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node.clone(), a_node, [0u8; 256]);
+    let b_iface =
+        maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
     let a = a_iface.handle().scope::<protocol_bundle::Bundle>();
     let b = b_iface.handle().scope::<protocol_bundle::Bundle>();
 
@@ -251,8 +253,10 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
 async fn filtered_recv_allows_concurrent_waiters() -> Result<(), thincan::Error> {
     let (a_node, b_node) = PipeEnd::pair(0xAA, 0xBB);
     let b_pump = b_node.clone();
-    let a_iface = maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node, [0u8; 256]);
-    let b_iface = maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node, [0u8; 256]);
+    let a_iface =
+        maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node.clone(), a_node, [0u8; 256]);
+    let b_iface =
+        maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
     let a = a_iface.handle().scope::<protocol_bundle::Bundle>();
     let b = b_iface.handle().scope::<protocol_bundle::Bundle>();
 
