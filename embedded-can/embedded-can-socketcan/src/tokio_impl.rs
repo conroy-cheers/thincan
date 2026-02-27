@@ -21,12 +21,12 @@ fn to_socketcan_filter(f: &IdMaskFilter) -> Result<CanFilter, SocketcanError> {
     let (id_raw, mask_raw) = match (f.id, f.mask) {
         (embedded_can_interface::Id::Standard(id), IdMask::Standard(mask)) => {
             let can_id = u32::from(id.as_raw());
-            let can_mask = u32::from(mask) | (libc::CAN_EFF_FLAG as u32);
+            let can_mask = u32::from(mask) | libc::CAN_EFF_FLAG;
             (can_id, can_mask)
         }
         (embedded_can_interface::Id::Extended(id), IdMask::Extended(mask)) => {
-            let can_id = id.as_raw() | (libc::CAN_EFF_FLAG as u32);
-            let can_mask = (mask & 0x1FFF_FFFF) | (libc::CAN_EFF_FLAG as u32);
+            let can_id = id.as_raw() | libc::CAN_EFF_FLAG;
+            let can_mask = (mask & 0x1FFF_FFFF) | libc::CAN_EFF_FLAG;
             (can_id, can_mask)
         }
         _ => {
@@ -116,7 +116,7 @@ impl AsyncTxFrameIo for TokioSocketCan {
 
     async fn send(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
         self.inner
-            .write_frame(frame.clone())
+            .write_frame(*frame)
             .await
             .map_err(SocketcanError::from)
     }
@@ -175,7 +175,7 @@ impl FilterConfig for TokioSocketCan {
     }
 
     fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        ()
+        
     }
 }
 
@@ -243,6 +243,6 @@ impl FilterConfig for TokioSocketCanFd {
     }
 
     fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        ()
+        
     }
 }

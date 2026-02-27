@@ -277,7 +277,7 @@ async fn filtered_recv_allows_concurrent_waiters() -> Result<(), thincan::Error>
         b.ingest(from, &payload).await.unwrap();
     }
 
-    let b_one = b.clone();
+    let b_one = b;
     let wait_one = async move {
         b_one
             .__recv_next_capnp_from_where::<atlas::A, _>(0xAA, |body| {
@@ -290,7 +290,7 @@ async fn filtered_recv_allows_concurrent_waiters() -> Result<(), thincan::Error>
             .await
     };
 
-    let b_two = b.clone();
+    let b_two = b;
     let wait_two = async move {
         b_two
             .__recv_next_capnp_from_where::<atlas::A, _>(0xAA, |body| {

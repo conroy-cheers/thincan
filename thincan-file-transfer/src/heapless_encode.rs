@@ -1,12 +1,10 @@
-#![cfg(feature = "heapless")]
-
 use capnp::message::ReaderOptions;
 use heapless::Vec;
 
 use crate::{
-    Atlas, FileAckValue, FileChunkValue, FileOfferValue, FileReqValue,
+    Atlas,
     capnp_scratch_words_for_bytes, file_ack_max_encoded_len, file_chunk_max_encoded_len,
-    file_offer_max_encoded_len, file_req_max_encoded_len, schema,
+    file_offer_max_encoded_len, schema,
 };
 
 /// Fixed-capacity Cap'n Proto scratch (no-alloc).
@@ -54,6 +52,7 @@ impl<const WORDS: usize> CapnpScratch<WORDS> {
 }
 
 /// Encode a `FileReq` offer Cap'n Proto body into `out` using fixed scratch.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_file_offer_into<A: Atlas, const WORDS: usize>(
     scratch: &mut CapnpScratch<WORDS>,
     transfer_id: u32,

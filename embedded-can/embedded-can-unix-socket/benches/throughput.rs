@@ -1,9 +1,10 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use embedded_can::Frame as _;
 use embedded_can::{Id, StandardId};
 use embedded_can_interface::{FilterConfig, IdMask, IdMaskFilter, RxFrameIo, TxFrameIo};
 use embedded_can_unix_socket::{BusServer, UnixCan, UnixCanError, UnixFrame};
 use std::path::PathBuf;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -92,7 +93,7 @@ fn bench_multi_client_end_to_end(c: &mut Criterion) {
                 .unwrap();
 
                 b.iter_custom(|iters| {
-                    let iters_u64 = iters as u64;
+                    let iters_u64 = iters;
                     let starts: Vec<u64> =
                         counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
 
@@ -172,7 +173,7 @@ fn bench_contended_send_ack_8(c: &mut Criterion) {
         }
 
         b.iter_custom(|iters| {
-            let rounds = iters as u64;
+            let rounds = iters;
             for tx in &txs {
                 tx.send(Some(rounds)).unwrap();
             }

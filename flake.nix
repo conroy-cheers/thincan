@@ -25,6 +25,7 @@
           extensions = [
             "rust-src"
             "llvm-tools-preview"
+	    "clippy"
           ];
           targets = [ "thumbv7em-none-eabihf" ];
         };
@@ -48,6 +49,7 @@
             doCheck = true;
             checkPhase = ''
               runHook preCheck
+              export PATH="${toolchain}/bin:$PATH"
               export CARGO_TARGET_DIR="$TMPDIR/target"
               export CARGO_BUILD_TARGET="${pkgs.stdenv.hostPlatform.rust.rustcTarget}"
               ${command}
@@ -60,6 +62,9 @@
             '';
           };
         commonChecks = {
+          workspace-clippy-all-targets =
+            mkRustCheck "workspace-clippy-all-targets-check"
+              "cargo clippy --workspace --all-targets --all-features";
           thincan-all-features =
             mkRustCheck "thincan-all-features-check"
               "cargo test -p thincan --all-features";

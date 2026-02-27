@@ -9,6 +9,7 @@ use embedded_can::Frame as _;
 use embedded_can_interface::{AsyncRxFrameIo, AsyncTxFrameIo, RxFrameIo, TxFrameIo};
 use std::io::ErrorKind;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -371,10 +372,12 @@ pub fn connect_bench_node(
     };
     let rx = AsyncUnixCanRx { events: events_rx };
 
-    let mut cfg = can_iso_tp::IsoTpConfig::default();
-    cfg.max_payload_len = MAX_ISOTP_PAYLOAD;
-    cfg.frame_len = 64;
-    cfg.block_size = 0;
+    let cfg = can_iso_tp::IsoTpConfig {
+        max_payload_len: MAX_ISOTP_PAYLOAD,
+        frame_len: 64,
+        block_size: 0,
+        ..Default::default()
+    };
 
     let storages: [can_iso_tp::RxStorage<'static>; MAX_PEERS] =
         core::array::from_fn(|_| can_iso_tp::RxStorage::Owned(vec![0u8; MAX_ISOTP_PAYLOAD]));
@@ -464,7 +467,7 @@ impl thincan_file_transfer::AsyncFileStore for MemoryStore {
 
 pub async fn run_ingress_pump(
     mut node: BenchNode,
-    iface: Arc<BenchInterface>,
+    iface: Rc<BenchInterface>,
     stop: Arc<AtomicBool>,
     recv_timeout: Duration,
 ) -> Result<()> {

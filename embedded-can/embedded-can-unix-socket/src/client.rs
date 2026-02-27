@@ -113,7 +113,7 @@ impl UnixCan {
         };
         iface.wait_for_hello().map_err(|err| match err {
             UnixCanError::Io(err) => err,
-            _ => io::Error::new(io::ErrorKind::Other, "handshake failed"),
+            _ => io::Error::other("handshake failed"),
         })?;
         Ok(iface)
     }

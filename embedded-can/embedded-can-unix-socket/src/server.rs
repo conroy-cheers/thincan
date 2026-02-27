@@ -290,14 +290,13 @@ fn handle_command(
 
             broadcast_frame(clients, &frame);
 
-            if expect_ack {
-                if let Some(client) = clients.get(&id) {
+            if expect_ack
+                && let Some(client) = clients.get(&id) {
                     let _ = client.tx.send(ServerMsg::Ack {
                         seq,
                         status: ack_status,
                     });
                 }
-            }
         }
         BusCommand::SetFilters { id, seq, filters } => {
             if seq == 0 {

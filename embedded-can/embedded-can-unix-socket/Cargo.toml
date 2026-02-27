@@ -11,7 +11,7 @@ embedded-can-interface = "0.1.1"
 libc = "0.2"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8.2"
 tempfile = "3"
 
 [[bench]]

@@ -261,9 +261,10 @@ const MAX_ISO_TP_PAYLOAD: usize = 4095;
 const MAX_PEERS: usize = 16;
 
 fn base_isotp_cfg() -> can_iso_tp::IsoTpConfig {
-    let mut cfg = can_iso_tp::IsoTpConfig::default();
-    cfg.max_payload_len = MAX_ISO_TP_PAYLOAD;
-    cfg
+    can_iso_tp::IsoTpConfig {
+        max_payload_len: MAX_ISO_TP_PAYLOAD,
+        ..Default::default()
+    }
 }
 
 fn isotp_cfg_for_cli(cli: &Cli) -> can_iso_tp::IsoTpConfig {
@@ -321,11 +322,10 @@ fn run_listen(cli: &Cli) -> Result<()> {
                     Ok(r) => r,
                     Err(_) => return Ok(RecvControl::Continue),
                 };
-                if raw.id == <atlas::Ping as thincan::Message>::ID {
-                    if let Some(seq) = decode_seq_capnp(raw.body) {
+                if raw.id == <atlas::Ping as thincan::Message>::ID
+                    && let Some(seq) = decode_seq_capnp(raw.body) {
                         pending_pongs.push_back((meta.reply_to, seq));
                     }
-                }
                 Ok(RecvControl::Continue)
             })
             .map_err(|e| anyhow::anyhow!("recv error: {:?}", e))?;

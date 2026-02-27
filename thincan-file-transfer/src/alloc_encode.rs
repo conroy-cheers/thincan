@@ -1,5 +1,3 @@
-#![cfg(feature = "alloc")]
-
 use crate::{Atlas, FileAckValue, FileChunkValue, FileOfferValue, FileReqValue, schema};
 use alloc::vec::Vec;
 
@@ -12,11 +10,11 @@ thread_local! {
 }
 
 fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    let min_words = (min_len + 7) / 8;
+    let min_words = min_len.div_ceil(8);
 
     #[cfg(feature = "std")]
     {
-        return CAPNP_SCRATCH.with(|cell| {
+        CAPNP_SCRATCH.with(|cell| {
             let mut words = cell.borrow_mut();
             if words.len() < min_words {
                 words.resize(min_words, capnp::word(0, 0, 0, 0, 0, 0, 0, 0));
@@ -25,7 +23,7 @@ fn with_capnp_scratch_bytes<R>(min_len: usize, f: impl FnOnce(&mut [u8]) -> R) -
                 core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8)
             };
             f(&mut bytes[..min_len])
-        });
+        })
     }
 
     #[cfg(not(feature = "std"))]

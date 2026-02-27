@@ -65,9 +65,11 @@ fn raw_socketcan_talks_to_kernel_isotp() {
     let server = 0xF1;
     let client = 0xF2;
 
-    let mut options = IsoTpKernelOptions::default();
-    options.max_rx_payload = 4095;
-    options.flow_control = Some(IsoTpFlowControlOptions::new(4, 5, 0));
+    let options = IsoTpKernelOptions {
+        max_rx_payload: 4095,
+        flow_control: Some(IsoTpFlowControlOptions::new(4, 5, 0)),
+        ..Default::default()
+    };
 
     let mut kernel = match SocketCanIsoTp::open(
         &iface,
@@ -106,13 +108,15 @@ fn raw_socketcan_talks_to_kernel_isotp() {
         return;
     }
 
-    let mut cfg = IsoTpConfig::default();
-    cfg.tx_id = uds_phys_id_iface(server, client);
-    cfg.rx_id = uds_phys_id_iface(client, server);
-    cfg.block_size = 4;
-    cfg.st_min = Duration::from_millis(1);
-    cfg.max_payload_len = 4095;
-    cfg.frame_len = 8;
+    let cfg = IsoTpConfig {
+        tx_id: uds_phys_id_iface(server, client),
+        rx_id: uds_phys_id_iface(client, server),
+        block_size: 4,
+        st_min: Duration::from_millis(1),
+        max_payload_len: 4095,
+        frame_len: 8,
+        ..Default::default()
+    };
 
     let mut rx_buf = vec![0u8; cfg.max_payload_len];
     let mut node = IsoTpNode::with_clock(tx_can, rx_can, cfg, StdClock, rx_buf.as_mut_slice())

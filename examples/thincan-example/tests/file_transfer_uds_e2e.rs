@@ -1,6 +1,6 @@
 #![cfg(all(feature = "uds", unix))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +17,7 @@ fn unique_socket_path() -> PathBuf {
     ))
 }
 
-fn wait_for_socket(path: &PathBuf, timeout: Duration) {
+fn wait_for_socket(path: &Path, timeout: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if path.exists() {

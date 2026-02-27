@@ -4,8 +4,8 @@
 //! implements the shared `can-isotp-interface` traits.
 
 use can_isotp_interface::{
-    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
-    RxFlowControl, SendError,
+    IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus, RxFlowControl,
+    SendError,
 };
 use can_uds::uds29;
 use core::time::Duration;
@@ -52,6 +52,7 @@ impl std::error::Error for Error {}
 
 /// Socket-level ISO-TP options.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct IsoTpSocketOptions {
     /// Raw kernel flag bits (see `flags` module).
     pub flags: u32,
@@ -67,18 +68,6 @@ pub struct IsoTpSocketOptions {
     pub rx_ext_address: Option<u8>,
 }
 
-impl Default for IsoTpSocketOptions {
-    fn default() -> Self {
-        Self {
-            flags: 0,
-            frame_txtime: None,
-            ext_address: None,
-            tx_padding: None,
-            rx_padding: None,
-            rx_ext_address: None,
-        }
-    }
-}
 
 /// Flow control options advertised by the kernel.
 #[derive(Debug, Clone, Copy)]
@@ -186,7 +175,16 @@ impl SocketCanIsoTp {
         apply_kernel_options(socket.as_raw_fd(), options)?;
 
         let addr = CanAddr::from_iface_isotp(iface, rx_id, tx_id).map_err(Error::Io)?;
-        socket.bind(&addr.into_sock_addr())?;
+        let bind_res = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                addr.as_sockaddr_ptr(),
+                CanAddr::len() as libc::socklen_t,
+            )
+        };
+        if bind_res < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
 
         let fd = unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) };
         let wft_max = options.flow_control.map(|fc| fc.wft_max).unwrap_or(0);
@@ -662,8 +660,7 @@ impl can_isotp_interface::IsoTpEndpoint for KernelUdsDemux {
                     .recv_one_ready(|payload| on_payload(RecvMeta { reply_to }, payload));
             }
             if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(RecvError::Backend(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(RecvError::Backend(Error::Io(io::Error::other(
                     "poll error on iso-tp socket",
                 ))));
             }

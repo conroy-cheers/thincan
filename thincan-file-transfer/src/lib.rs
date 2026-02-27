@@ -96,11 +96,12 @@ pub const fn file_ack_max_encoded_len() -> usize {
 
 /// Convert a byte count to a conservative Cap'n Proto scratch requirement (words).
 pub const fn capnp_scratch_words_for_bytes(bytes: usize) -> usize {
-    (bytes + 7) / 8
+    bytes.div_ceil(8)
 }
 
 /// Receiver-side configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub struct ReceiverConfig {
     /// Maximum accepted `FileChunk.data` length (bytes).
     ///
@@ -109,11 +110,6 @@ pub struct ReceiverConfig {
     pub max_chunk_size: u32,
 }
 
-impl Default for ReceiverConfig {
-    fn default() -> Self {
-        Self { max_chunk_size: 0 }
-    }
-}
 
 /// Atlas contract for file-transfer message types.
 pub trait Atlas {

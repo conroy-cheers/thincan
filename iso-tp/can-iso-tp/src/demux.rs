@@ -10,8 +10,6 @@
 //! - tracks per-destination transmit sessions (FlowControl is routed by source),
 //! - exposes a receive API that includes a `reply_to` (source address) metadata field.
 
-#![cfg(feature = "uds")]
-
 use core::mem;
 use core::time::Duration;
 
@@ -748,6 +746,7 @@ where
         Ok(Progress::WaitingForFlowControl)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn continue_wait_for_fc_inner(
         tx: &mut Tx,
         clock: &C,
@@ -829,6 +828,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn continue_send_inner(
         tx: &mut Tx,
         clock: &C,

@@ -337,7 +337,7 @@ where
 
 }
 
-#[cfg(feature = "embassy")]
+#[cfg(all(not(feature = "tokio"), feature = "embassy"))]
 fn to_embassy_duration(d: Duration) -> embassy_time::Duration {
     let micros = d.as_micros().min(u128::from(u64::MAX)) as u64;
     embassy_time::Duration::from_micros(micros)

@@ -14,10 +14,12 @@ fn demux_send_and_recv_single_frame() {
     let (a_tx, a_rx) = a.split();
     let (b_tx, b_rx) = b.split();
 
-    let mut cfg = IsoTpConfig::default();
-    cfg.block_size = 0;
-    cfg.st_min = core::time::Duration::from_millis(0);
-    cfg.frame_len = 8;
+    let cfg = IsoTpConfig {
+        block_size: 0,
+        st_min: core::time::Duration::from_millis(0),
+        frame_len: 8,
+        ..Default::default()
+    };
 
     const MAX: usize = 2;
     let storages_a: [can_iso_tp::RxStorage<'static>; MAX] =

@@ -5,8 +5,9 @@ mod common;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -72,8 +73,8 @@ async fn run(args: Args) -> Result<()> {
         common::NODE_A_ADDR,
         Duration::from_millis(args.wait_for_socket_ms),
     )?;
-    let iface = Arc::new(common::build_interface(node.clone()));
-    let mut bundles = common::BenchBundles::new(Arc::as_ref(&iface));
+    let iface = Rc::new(common::build_interface(node.clone()));
+    let mut bundles = common::BenchBundles::new(Rc::as_ref(&iface));
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_wait = Duration::from_millis(10);

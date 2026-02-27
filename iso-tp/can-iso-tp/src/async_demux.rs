@@ -1,7 +1,5 @@
 //! Async multi-peer ISO-TP demultiplexing for 29-bit UDS-style addressing.
 
-#![cfg(feature = "uds")]
-
 use core::time::Duration;
 
 use can_uds::uds29::{self, Uds29Kind};
@@ -633,13 +631,12 @@ where
             }
         }
 
-        if completed_ready {
-            if !self.try_spill_completed_from_peer(peer_idx)? {
+        if completed_ready
+            && !self.try_spill_completed_from_peer(peer_idx)? {
                 self.ready
                     .push(ReadyItem::Peer(peer_idx))
                     .map_err(|_| IsoTpError::RxOverflow)?;
             }
-        }
 
         if let Some((status, block_size, st_min)) = fc_to_send {
             isotp_trace!(
@@ -672,6 +669,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn wait_for_flow_control<R: AsyncRuntime>(
         &mut self,
         rt: &R,

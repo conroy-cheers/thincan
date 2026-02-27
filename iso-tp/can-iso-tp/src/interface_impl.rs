@@ -138,11 +138,10 @@ where
 
         let res = IsoTpNode::recv(self, timeout, &mut |payload| {
             delivered = true;
-            if cb_err.is_none() {
-                if let Err(e) = on_payload(RecvMeta { reply_to: 0 }, payload) {
+            if cb_err.is_none()
+                && let Err(e) = on_payload(RecvMeta { reply_to: 0 }, payload) {
                     cb_err = Some(e);
                 }
-            }
         });
 
         if let Some(e) = cb_err {
@@ -346,11 +345,10 @@ where
 
         let res = crate::demux::IsoTpDemux::recv(self, timeout, &mut |reply_to, payload| {
             delivered = true;
-            if cb_err.is_none() {
-                if let Err(e) = on_payload(RecvMeta { reply_to }, payload) {
+            if cb_err.is_none()
+                && let Err(e) = on_payload(RecvMeta { reply_to }, payload) {
                     cb_err = Some(e);
                 }
-            }
         });
 
         if let Some(e) = cb_err {

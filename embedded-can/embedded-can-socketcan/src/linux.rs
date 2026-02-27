@@ -128,9 +128,7 @@ where
 
     socket.set_nonblocking(true)?;
     let result = f(socket).map_err(SocketcanError::from);
-    if let Err(err) = socket.set_nonblocking(false).map_err(SocketcanError::from) {
-        return Err(err);
-    }
+    socket.set_nonblocking(false).map_err(SocketcanError::from)?;
     result
 }
 
@@ -179,12 +177,12 @@ fn to_socketcan_filter(f: &IdMaskFilter) -> Result<CanFilter, SocketcanError> {
     let (id_raw, mask_raw) = match (f.id, f.mask) {
         (embedded_can_interface::Id::Standard(id), IdMask::Standard(mask)) => {
             let can_id = u32::from(id.as_raw());
-            let can_mask = u32::from(mask) | (libc::CAN_EFF_FLAG as u32);
+            let can_mask = u32::from(mask) | libc::CAN_EFF_FLAG;
             (can_id, can_mask)
         }
         (embedded_can_interface::Id::Extended(id), IdMask::Extended(mask)) => {
-            let can_id = id.as_raw() | (libc::CAN_EFF_FLAG as u32);
-            let can_mask = (mask & 0x1FFF_FFFF) | (libc::CAN_EFF_FLAG as u32);
+            let can_id = id.as_raw() | libc::CAN_EFF_FLAG;
+            let can_mask = (mask & 0x1FFF_FFFF) | libc::CAN_EFF_FLAG;
             (can_id, can_mask)
         }
         _ => {
@@ -283,7 +281,7 @@ impl FilterConfig for SocketCan {
     }
 
     fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        ()
+        
     }
 }
 
@@ -371,7 +369,7 @@ impl FilterConfig for SocketCanFd {
     }
 
     fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        ()
+        
     }
 }
 
