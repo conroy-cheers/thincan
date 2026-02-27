@@ -155,10 +155,10 @@ async fn async_recv_timeout_maps_to_timeout_error() {
 
     let iface =
         maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(DummyAsync, DummyAsync, [0u8; 64]);
-    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
+    let bus = iface.bus().scope::<protocol_bundle::Bundle>();
     let timed_out = tokio::time::timeout(
         Duration::from_millis(1),
-        doodad.__recv_next_capnp_from::<atlas::Ping>(0x12),
+        bus.__recv_next_capnp_from::<atlas::Ping>(0x12),
     )
     .await
     .is_err();
@@ -220,11 +220,11 @@ async fn ingest_rejects_body_larger_than_mailbox_capacity() {
         BufferTooSmallAsync,
         [0u8; 64],
     );
-    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
+    let bus = iface.bus().scope::<protocol_bundle::Bundle>();
     let mut payload = [0u8; 18];
     payload[..2].copy_from_slice(&atlas::Ping::ID.to_le_bytes());
 
-    let err = doodad.ingest(0x22, &payload).await.unwrap_err();
+    let err = bus.ingest(0x22, &payload).await.unwrap_err();
     assert!(matches!(
         err,
         thincan::IngestError::BodyTooLarge { got: 16, max: 8 }
@@ -274,14 +274,14 @@ async fn async_send_helpers_map_backend_errors() {
         BackendErrorNode,
         [0u8; 128],
     );
-    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
-    let err = doodad
+    let bus = iface.bus().scope::<protocol_bundle::Bundle>();
+    let err = bus
         .__send_capnp_to::<atlas::Ping, _>(0, &PersonValue { name: "x" }, Duration::from_millis(1))
         .await
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Other));
 
-    let err = doodad
+    let err = bus
         .__send_capnp_functional_to::<atlas::Ping, _>(
             0,
             &PersonValue { name: "x" },

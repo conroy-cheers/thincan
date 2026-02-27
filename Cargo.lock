@@ -195,6 +195,17 @@ name = "can-isotp-interface"
 version = "0.1.0"
 
 [[package]]
+name = "can-isotp-queue"
+version = "0.1.0"
+dependencies = [
+ "can-isotp-interface",
+ "embassy-futures",
+ "embassy-sync",
+ "embassy-time",
+ "tokio",
+]
+
+[[package]]
 name = "can-uds"
 version = "0.1.0"
 dependencies = [
@@ -1115,7 +1126,7 @@ dependencies = [
  "can-uds",
  "embedded-can",
  "libc",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "socketcan",
  "tokio",
 ]

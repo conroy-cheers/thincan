@@ -17,8 +17,8 @@
 //! storage writes complete, so slow storage naturally throttles transfer rate.
 //!
 //! ## Runtime note
-//! These methods rely on your external demux pump to feed incoming frames into the doodad mailbox
-//! via `DoodadHandle::ingest`.
+//! These methods rely on your external demux pump to feed incoming frames into the bus mailbox
+//! via `BusHandle::ingest`.
 //!
 //! With `--features heapless` you can encode Cap'n Proto bodies without allocation:
 //! ```rust,ignore

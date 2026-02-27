@@ -180,8 +180,8 @@ async fn application_dx_end_to_end_embassy_no_alloc_bundle_api() {
 
     let mut a_bundles = maplet::Bundles::new(&a_iface);
     let b_bundles = maplet::Bundles::new(&b_iface);
-    let a_ingest = a_iface.handle();
-    let b_ingest = b_iface.handle();
+    let a_ingest = a_iface.bus();
+    let b_ingest = b_iface.bus();
 
     let stop = Arc::new(AtomicBool::new(false));
 

@@ -2,10 +2,11 @@ use capnp::message::ReaderOptions;
 use heapless::Vec;
 
 use crate::{
-    Atlas,
     capnp_scratch_words_for_bytes, file_ack_max_encoded_len, file_chunk_max_encoded_len,
-    file_offer_max_encoded_len, schema,
+    file_offer_max_encoded_len, schema, Atlas,
 };
+#[cfg(not(feature = "alloc"))]
+use crate::{file_req_max_encoded_len, FileAckValue, FileChunkValue, FileOfferValue, FileReqValue};
 
 /// Fixed-capacity Cap'n Proto scratch (no-alloc).
 pub struct CapnpScratch<const WORDS: usize> {
@@ -221,8 +222,9 @@ fn encode_segmented_root<R>(
         });
     }
 
-    let mut message =
-        capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(&mut out[..max_len]));
+    let mut message = capnp::message::Builder::new(capnp::message::SingleSegmentAllocator::new(
+        &mut out[..max_len],
+    ));
     init(&mut message);
 
     let segments = message.get_segments_for_output();

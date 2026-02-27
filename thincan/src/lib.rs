@@ -7,6 +7,7 @@
 //! The crate provides:
 //! - `bus_atlas!` for message marker declarations
 //! - `maplet!` for composing a compile-time message set
+//! - `bundle_instance!` for generating bundle instance structs and `BundleFactory` impls
 //! - maplet-typed `Interface` for async send, ingest, and mailboxed typed receive
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(async_fn_in_trait)]
@@ -266,9 +267,9 @@ pub trait BundleFactory<
     /// Concrete bundle instance type stored by the generated maplet bundle container.
     type Instance;
 
-    /// Create a bundle instance from a scoped doodad handle.
+    /// Create a bundle instance from a scoped bus handle.
     fn make(
-        handle: DoodadHandle<
+        bus: BusHandle<
             'a,
             Maplet,
             RM,
@@ -323,7 +324,7 @@ where
     }
 }
 
-/// Result of ingesting a payload into a doodad mailbox.
+/// Result of ingesting a payload into a bus mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestOutcome {
     pub from: u8,
@@ -331,7 +332,7 @@ pub struct IngestOutcome {
     pub len: usize,
 }
 
-/// Error returned while ingesting payloads into a doodad mailbox.
+/// Error returned while ingesting payloads into a bus mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestError {
     MalformedPayload,
@@ -579,11 +580,11 @@ where
         Self::new(node.clone(), node, tx)
     }
 
-    /// Create a cloneable handle borrowing this interface.
-    pub fn handle(
+    /// Create a cloneable bus handle borrowing this interface.
+    pub fn bus(
         &self,
-    ) -> DoodadHandle<'_, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS> {
-        DoodadHandle {
+    ) -> BusHandle<'_, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS> {
+        BusHandle {
             iface: self,
             _bundle: PhantomData,
         }
@@ -773,7 +774,7 @@ where
             Ok(can_isotp_interface::RecvMetaIntoStatus::TimedOut) => Ok(IngestPumpStatus::TimedOut),
             Ok(can_isotp_interface::RecvMetaIntoStatus::DeliveredOne { meta, len }) => {
                 let outcome = self
-                    .handle()
+                    .bus()
                     .ingest(meta.reply_to, &rx_buf[..len])
                     .await
                     .map_err(IngestPumpError::Ingest)?;
@@ -790,7 +791,7 @@ where
 }
 
 /// Cloneable async protocol handle that borrows a shared [`Interface`].
-pub struct DoodadHandle<
+pub struct BusHandle<
     'a,
     Maplet,
     RM,
@@ -820,7 +821,7 @@ impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
     B,
-> Copy for DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+> Copy for BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
 where
     Maplet: MapletSpec<MAX_TYPES>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -838,7 +839,7 @@ impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
     B,
-> Clone for DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+> Clone for BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
 where
     Maplet: MapletSpec<MAX_TYPES>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -859,7 +860,7 @@ impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
     B,
-> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+> BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
 where
     Maplet: MapletSpec<MAX_TYPES>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -894,7 +895,7 @@ impl<
     const DEPTH: usize,
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
-> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, Unscoped>
+> BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, Unscoped>
 where
     Maplet: MapletSpec<MAX_TYPES>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -902,11 +903,11 @@ where
     /// Narrow this handle to a specific bundle's message capabilities.
     pub fn scope<B>(
         self,
-    ) -> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+    ) -> BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
     where
         Maplet: MapletHasBundle<B>,
     {
-        DoodadHandle {
+        BusHandle {
             iface: self.iface,
             _bundle: PhantomData,
         }
@@ -924,7 +925,7 @@ impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
     B,
-> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+> BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
 where
     Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<B>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -969,7 +970,7 @@ impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
     B,
-> DoodadHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
+> BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, B>
 where
     Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<B>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
@@ -1058,6 +1059,160 @@ macro_rules! bus_atlas {
     };
 }
 
+/// Generate a bundle instance wrapper struct and its [`BundleFactory`] implementation.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// thincan::bundle_instance! {
+///     pub struct TelemetryBundleInstance for Bundle;
+/// }
+/// ```
+///
+/// This expands to:
+/// - A struct `TelemetryBundleInstance<'a, Maplet, RM, Node, TxBuf, const MAX_TYPES, ...>`
+///   holding a scoped [`BusHandle`].
+/// - A `pub const fn new(handle: ...) -> Self` constructor.
+/// - A [`BundleFactory`] impl for `Bundle` that delegates to `new`.
+///
+/// Protocol methods should be added in a separate `impl` block in the same module,
+/// where they can access the `handle` field:
+///
+/// ```rust,ignore
+/// impl<
+///     'a, Maplet, RM, Node, TxBuf,
+///     const MAX_TYPES: usize, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize,
+/// > TelemetryBundleInstance<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+/// where
+///     Maplet: thincan::MapletSpec<MAX_TYPES> + thincan::MapletHasBundle<Bundle>,
+///     RM: thincan::RawMutex,
+///     Node: can_isotp_interface::IsoTpAsyncEndpoint,
+///     TxBuf: AsMut<[u8]>,
+/// {
+///     pub async fn send_status_to(&self, to: u8, ...) -> Result<(), thincan::Error> {
+///         self.bus.__send_capnp_to::<atlas::MyMessage, _>(to, &value, timeout).await
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! bundle_instance {
+    (
+        $vis:vis struct $name:ident for $bundle:ty;
+    ) => {
+        $vis struct $name<
+            'a,
+            Maplet,
+            RM,
+            Node,
+            TxBuf,
+            const MAX_TYPES: usize,
+            const DEPTH: usize,
+            const MAX_BODY: usize,
+            const MAX_WAITERS: usize,
+        >
+        where
+            Maplet: $crate::MapletSpec<MAX_TYPES> + $crate::MapletHasBundle<$bundle>,
+            RM: $crate::RawMutex,
+        {
+            pub(super) bus: $crate::BusHandle<
+                'a,
+                Maplet,
+                RM,
+                Node,
+                TxBuf,
+                MAX_TYPES,
+                DEPTH,
+                MAX_BODY,
+                MAX_WAITERS,
+                $bundle,
+            >,
+        }
+
+        impl<
+            'a,
+            Maplet,
+            RM,
+            Node,
+            TxBuf,
+            const MAX_TYPES: usize,
+            const DEPTH: usize,
+            const MAX_BODY: usize,
+            const MAX_WAITERS: usize,
+        >
+            $name<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+        where
+            Maplet: $crate::MapletSpec<MAX_TYPES> + $crate::MapletHasBundle<$bundle>,
+            RM: $crate::RawMutex,
+        {
+            pub const fn new(
+                bus: $crate::BusHandle<
+                    'a,
+                    Maplet,
+                    RM,
+                    Node,
+                    TxBuf,
+                    MAX_TYPES,
+                    DEPTH,
+                    MAX_BODY,
+                    MAX_WAITERS,
+                    $bundle,
+                >,
+            ) -> Self {
+                Self { bus }
+            }
+        }
+
+        impl<
+            'a,
+            Maplet,
+            RM,
+            Node,
+            TxBuf,
+            const MAX_TYPES: usize,
+            const DEPTH: usize,
+            const MAX_BODY: usize,
+            const MAX_WAITERS: usize,
+        >
+            $crate::BundleFactory<
+                'a,
+                Maplet,
+                RM,
+                Node,
+                TxBuf,
+                MAX_TYPES,
+                DEPTH,
+                MAX_BODY,
+                MAX_WAITERS,
+            > for $bundle
+        where
+            Maplet: $crate::MapletSpec<MAX_TYPES> + $crate::MapletHasBundle<$bundle> + 'a,
+            RM: $crate::RawMutex + 'a,
+            Node: 'a,
+            TxBuf: 'a,
+        {
+            type Instance =
+                $name<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>;
+
+            fn make(
+                bus: $crate::BusHandle<
+                    'a,
+                    Maplet,
+                    RM,
+                    Node,
+                    TxBuf,
+                    MAX_TYPES,
+                    DEPTH,
+                    MAX_BODY,
+                    MAX_WAITERS,
+                    Self,
+                >,
+            ) -> Self::Instance {
+                $name::new(bus)
+            }
+        }
+    };
+}
+
 /// Define a maplet by composing message bundles.
 #[macro_export]
 macro_rules! maplet {
@@ -1115,8 +1270,8 @@ macro_rules! maplet {
                 const MAX_WAITERS: usize,
             > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
 
-            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
-                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+            pub type BusHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::BusHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
         }
     };
 
@@ -1172,8 +1327,8 @@ macro_rules! maplet {
                 const MAX_WAITERS: usize,
             > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
 
-            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
-                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+            pub type BusHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::BusHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
         }
     };
 
@@ -1229,8 +1384,8 @@ macro_rules! maplet {
                 const MAX_WAITERS: usize,
             > = $crate::Interface<Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>;
 
-            pub type DoodadHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
-                $crate::DoodadHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
+            pub type BusHandle<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize, B = $crate::Unscoped> =
+                $crate::BusHandle<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS, B>;
 
             pub struct Bundles<'a, RM, Node, TxBuf, const DEPTH: usize, const MAX_BODY: usize, const MAX_WAITERS: usize>
             where
@@ -1255,7 +1410,7 @@ macro_rules! maplet {
                 )*
             {
                 pub fn new(iface: &'a Interface<RM, Node, TxBuf, DEPTH, MAX_BODY, MAX_WAITERS>) -> Self {
-                    let ingress = iface.handle();
+                    let ingress = iface.bus();
                     Self {
                         $(
                             $alias: <super::$bundle::Bundle as $crate::BundleFactory<'a, Maplet, RM, Node, TxBuf, { MESSAGE_COUNT }, DEPTH, MAX_BODY, MAX_WAITERS>>::make(

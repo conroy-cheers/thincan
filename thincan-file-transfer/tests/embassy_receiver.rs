@@ -127,7 +127,7 @@ async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
     let iface =
         maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
-    let ingress = iface.handle();
+    let ingress = iface.bus();
 
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(

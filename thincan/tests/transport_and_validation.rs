@@ -147,11 +147,11 @@ async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
 
     let iface =
         maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node.clone(), node, [0u8; 128]);
-    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
-    doodad
+    let bus = iface.bus().scope::<protocol_bundle::Bundle>();
+    bus
         .__send_capnp_to::<atlas::A, _>(0x11, &PersonValue { name: "A" }, Duration::from_millis(1))
         .await?;
-    doodad
+    bus
         .__send_capnp_functional_to::<atlas::A, _>(
             0x7F,
             &PersonValue { name: "A" },
@@ -216,10 +216,10 @@ async fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(
 
     let iface =
         maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, TimeoutNode, [0u8; 64]);
-    let doodad = iface.handle().scope::<protocol_bundle::Bundle>();
+    let bus = iface.bus().scope::<protocol_bundle::Bundle>();
     let timed_out = tokio::time::timeout(
         Duration::from_millis(1),
-        doodad.__recv_next_capnp_from::<atlas::A>(0x22),
+        bus.__recv_next_capnp_from::<atlas::A>(0x22),
     )
     .await
     .is_err();

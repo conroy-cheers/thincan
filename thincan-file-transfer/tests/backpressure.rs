@@ -88,7 +88,7 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
         &mut tx_buf,
     );
     let mut bundles = maplet::Bundles::new(&iface);
-    let ingress = iface.handle();
+    let ingress = iface.bus();
 
     let transfer_id = 1u32;
     let chunk_size = 8usize;

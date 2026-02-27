@@ -212,7 +212,7 @@ where
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn capnp_person_roundtrip_via_doodad() -> Result<(), thincan::Error> {
+async fn capnp_person_roundtrip_via_bus() -> Result<(), thincan::Error> {
     let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
     let a_pump = a_node.clone();
     let b_pump = b_node.clone();
@@ -221,8 +221,8 @@ async fn capnp_person_roundtrip_via_doodad() -> Result<(), thincan::Error> {
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node.clone(), a_node, [0u8; 256]);
     let b_iface =
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
-    let a = a_iface.handle().scope::<protocol_bundle::Bundle>();
-    let b = b_iface.handle().scope::<protocol_bundle::Bundle>();
+    let a = a_iface.bus().scope::<protocol_bundle::Bundle>();
+    let b = b_iface.bus().scope::<protocol_bundle::Bundle>();
 
     a.__send_capnp_to::<atlas::Person, _>(
         0x22,

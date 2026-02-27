@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "iso-tp/can-isotp-interface",
+  "iso-tp/can-isotp-queue",
   "iso-tp/can-iso-tp",
   "can-uds",
   "embedded-can/embedded-can-embassy-stm32",

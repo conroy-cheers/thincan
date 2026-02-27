@@ -4,8 +4,8 @@
 //! implements the shared `can-isotp-interface` traits.
 
 use can_isotp_interface::{
-    IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus, RxFlowControl,
-    SendError,
+    IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvMetaIntoStatus, RecvStatus,
+    RxFlowControl, SendError,
 };
 use can_uds::uds29;
 use core::time::Duration;
@@ -23,6 +23,8 @@ use tokio::io::unix::AsyncFd;
 
 #[cfg(feature = "tokio")]
 use can_isotp_interface::IsoTpAsyncEndpoint;
+#[cfg(feature = "tokio")]
+use can_isotp_interface::IsoTpAsyncEndpointRecvInto;
 
 /// ISO-TP socket error type.
 #[derive(Debug)]
@@ -51,8 +53,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Socket-level ISO-TP options.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct IsoTpSocketOptions {
     /// Raw kernel flag bits (see `flags` module).
     pub flags: u32,
@@ -67,7 +68,6 @@ pub struct IsoTpSocketOptions {
     /// Separate RX extended address (enables RX_EXT_ADDR flag).
     pub rx_ext_address: Option<u8>,
 }
-
 
 /// Flow control options advertised by the kernel.
 #[derive(Debug, Clone, Copy)]
@@ -175,16 +175,7 @@ impl SocketCanIsoTp {
         apply_kernel_options(socket.as_raw_fd(), options)?;
 
         let addr = CanAddr::from_iface_isotp(iface, rx_id, tx_id).map_err(Error::Io)?;
-        let bind_res = unsafe {
-            libc::bind(
-                socket.as_raw_fd(),
-                addr.as_sockaddr_ptr(),
-                CanAddr::len() as libc::socklen_t,
-            )
-        };
-        if bind_res < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
+        socket.bind(&addr.into_sock_addr())?;
 
         let fd = unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) };
         let wft_max = options.flow_control.map(|fc| fc.wft_max).unwrap_or(0);
@@ -512,6 +503,84 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
         match res {
             Ok(v) => v,
             Err(_) => Ok(RecvStatus::TimedOut),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl IsoTpAsyncEndpointRecvInto for TokioSocketCanIsoTp {
+    type Error = Error;
+
+    async fn recv_one_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                let mut guard = self
+                    .io
+                    .readable()
+                    .await
+                    .map_err(|e| RecvError::Backend(Error::Io(e)))?;
+
+                let recv = guard.try_io(|inner| {
+                    let fd = inner.get_ref().as_raw_fd();
+                    let read = unsafe {
+                        libc::recv(
+                            fd,
+                            out.as_mut_ptr().cast(),
+                            out.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        )
+                    };
+                    if read < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(read as usize)
+                    }
+                });
+
+                match recv {
+                    Ok(Ok(read)) => {
+                        if read == 0 {
+                            return Err(RecvError::Backend(Error::Io(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "iso-tp socket returned 0 bytes",
+                            ))));
+                        }
+                        if read > out.len() {
+                            return Err(RecvError::BufferTooSmall {
+                                needed: read,
+                                got: out.len(),
+                            });
+                        }
+                        return Ok(RecvMetaIntoStatus::DeliveredOne {
+                            meta: RecvMeta { reply_to: 0 },
+                            len: read,
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            guard.clear_ready();
+                            continue;
+                        }
+                        return Err(RecvError::Backend(Error::Io(err)));
+                    }
+                    Err(_would_block) => {
+                        continue;
+                    }
+                }
+            }
+        })
+        .await;
+
+        match res {
+            Ok(v) => v,
+            Err(_) => Ok(RecvMetaIntoStatus::TimedOut),
         }
     }
 }

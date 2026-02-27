@@ -217,8 +217,8 @@ async fn async_iso_tp_recv_one_dispatch_roundtrips() -> Result<(), thincan::Erro
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node.clone(), a_node, [0u8; 256]);
     let b_iface =
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
-    let a = a_iface.handle().scope::<protocol_bundle::Bundle>();
-    let b = b_iface.handle().scope::<protocol_bundle::Bundle>();
+    let a = a_iface.bus().scope::<protocol_bundle::Bundle>();
+    let b = b_iface.bus().scope::<protocol_bundle::Bundle>();
 
     // Send B first, then A. Receiver asks for A first; B should be buffered.
     a.__send_capnp_to::<atlas::B, _>(0xBB, &PersonValue { name: "B" }, Duration::from_millis(10))
@@ -257,8 +257,8 @@ async fn filtered_recv_allows_concurrent_waiters() -> Result<(), thincan::Error>
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(a_node.clone(), a_node, [0u8; 256]);
     let b_iface =
         maplet::Interface::<NoopRawMutex, _, _, 8, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
-    let a = a_iface.handle().scope::<protocol_bundle::Bundle>();
-    let b = b_iface.handle().scope::<protocol_bundle::Bundle>();
+    let a = a_iface.bus().scope::<protocol_bundle::Bundle>();
+    let b = b_iface.bus().scope::<protocol_bundle::Bundle>();
 
     a.__send_capnp_to::<atlas::A, _>(
         0xBB,

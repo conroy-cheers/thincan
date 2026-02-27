@@ -4,10 +4,10 @@
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
 #[cfg(feature = "tokio")]
-use can_isotp_interface::IsoTpAsyncEndpoint;
+use can_isotp_interface::{IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto};
 use can_isotp_interface::{
-    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
-    RxFlowControl, SendError,
+    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvMetaIntoStatus,
+    RecvStatus, RxFlowControl, SendError,
 };
 use core::time::Duration;
 use embedded_can::Id;
@@ -214,6 +214,19 @@ impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
     where
         Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
     {
+        Err(RecvError::Backend(Error))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl IsoTpAsyncEndpointRecvInto for TokioSocketCanIsoTp {
+    type Error = Error;
+
+    async fn recv_one_into(
+        &mut self,
+        _timeout: Duration,
+        _out: &mut [u8],
+    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
         Err(RecvError::Backend(Error))
     }
 }

@@ -224,8 +224,8 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
         b_node,
         [0u8; 256],
     );
-    let sender = sender_iface.handle().scope::<protocol_bundle::Bundle>();
-    let receiver = receiver_iface.handle().scope::<protocol_bundle::Bundle>();
+    let sender = sender_iface.bus().scope::<protocol_bundle::Bundle>();
+    let receiver = receiver_iface.bus().scope::<protocol_bundle::Bundle>();
 
     sender
         .__send_capnp_to::<atlas::FileReq, _>(

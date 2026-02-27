@@ -19,7 +19,9 @@ use crate::{
     file_ack_progress, file_ack_reject, file_chunk, file_offer, schema,
 };
 
-const PROGRESS_ACK_EVERY_CHUNKS: u32 = 2;
+// Default to per-chunk progress ACKs to avoid timeout-paced stalls when sender
+// windows are small relative to link latency/jitter.
+const PROGRESS_ACK_EVERY_CHUNKS: u32 = 1;
 const SHA256_HASH_LEN: usize = 32;
 
 /// Parsed `FileAck` fields.
@@ -117,7 +119,7 @@ pub struct FileTransferBundleInstance<
     Maplet: thincan::MapletSpec<MAX_TYPES> + thincan::MapletHasBundle<FileTransferBundle<A>>,
     RM: thincan::RawMutex,
 {
-    doodad: thincan::DoodadHandle<
+    bus: thincan::BusHandle<
         'a,
         Maplet,
         RM,
@@ -164,7 +166,7 @@ where
     TxBuf: 'a,
 {
     pub fn new(
-        doodad: thincan::DoodadHandle<
+        bus: thincan::BusHandle<
             'a,
             Maplet,
             RM,
@@ -178,7 +180,7 @@ where
         >,
     ) -> Self {
         Self {
-            doodad,
+            bus,
             send_state: SendState::new(),
         }
     }
@@ -300,7 +302,7 @@ impl<
     const MAX_WAITERS: usize,
     A,
 > DoodadCapnpExt<MAX_BODY>
-    for thincan::DoodadHandle<
+    for thincan::BusHandle<
         'a,
         Maplet,
         RM,
@@ -360,7 +362,7 @@ async fn wait_for_transfer_ack<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -387,7 +389,7 @@ where
     let ack = {
         let wait = async {
             loop {
-                let received = doodad.recv_next_from::<A::FileAck>(from).await?;
+                let received = bus.recv_next_from::<A::FileAck>(from).await?;
                 let ack = decode_file_ack(thincan::CapnpTyped::<schema::file_ack::Owned>::new(
                     received.body(),
                 ))?;
@@ -406,7 +408,7 @@ where
     let ack = {
         let wait = async {
             loop {
-                let received = doodad.recv_next_from::<A::FileAck>(from).await?;
+                let received = bus.recv_next_from::<A::FileAck>(from).await?;
                 let ack = decode_file_ack(thincan::CapnpTyped::<schema::file_ack::Owned>::new(
                     received.body(),
                 ))?;
@@ -435,7 +437,7 @@ async fn wait_for_transfer_chunk<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -462,7 +464,7 @@ where
     let received = {
         let wait = async {
             loop {
-                let received = doodad.recv_next_from::<A::FileChunk>(from).await?;
+                let received = bus.recv_next_from::<A::FileChunk>(from).await?;
                 let id = chunk_transfer_id(received.body())?;
                 if id == transfer_id {
                     return Ok(received);
@@ -479,7 +481,7 @@ where
     let received = {
         let wait = async {
             loop {
-                let received = doodad.recv_next_from::<A::FileChunk>(from).await?;
+                let received = bus.recv_next_from::<A::FileChunk>(from).await?;
                 let id = chunk_transfer_id(received.body())?;
                 if id == transfer_id {
                     return Ok(received);
@@ -508,7 +510,7 @@ async fn send_to_with_timeout<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -533,7 +535,7 @@ where
     Node: can_isotp_interface::IsoTpAsyncEndpoint,
     TxBuf: AsMut<[u8]>,
 {
-    doodad.send_to::<M, _>(to, value, timeout).await
+    bus.send_to::<M, _>(to, value, timeout).await
 }
 
 fn inflight_chunk_count(
@@ -560,7 +562,7 @@ async fn send_file_impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -586,7 +588,7 @@ where
     TxBuf: AsMut<[u8]>,
 {
     let transfer_id = state.alloc_transfer_id();
-    send_file_with_id_impl(doodad, to, state, transfer_id, bytes, timeout, config).await
+    send_file_with_id_impl(bus, to, state, transfer_id, bytes, timeout, config).await
 }
 
 async fn send_file_with_id_impl<
@@ -600,7 +602,7 @@ async fn send_file_with_id_impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -646,7 +648,7 @@ where
             file_hash.as_slice(),
         );
         if let Err(e) = send_to_with_timeout::<A, Maplet, RM, Node, TxBuf, A::FileReq, _, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>(
-            doodad, to, &offer, timeout,
+            bus, to, &offer, timeout,
         )
         .await
             && e.kind != thincan::ErrorKind::Timeout
@@ -654,7 +656,7 @@ where
             return Err(e);
         }
 
-        let ack = match wait_for_transfer_ack(doodad, to, transfer_id, timeout).await {
+        let ack = match wait_for_transfer_ack(bus, to, transfer_id, timeout).await {
             Ok(v) => v,
             Err(e) if e.kind == thincan::ErrorKind::Timeout => {
                 offer_retries += 1;
@@ -706,7 +708,7 @@ where
                 MAX_BODY,
                 MAX_WAITERS,
             >(
-                doodad,
+                bus,
                 to,
                 &file_chunk::<A>(transfer_id, next_to_send, data),
                 timeout,
@@ -719,7 +721,7 @@ where
             chunks_sent += 1;
         }
 
-        let ack = match wait_for_transfer_ack(doodad, to, transfer_id, timeout).await {
+        let ack = match wait_for_transfer_ack(bus, to, transfer_id, timeout).await {
             Ok(a) => a,
             Err(e) if e.kind == thincan::ErrorKind::Timeout => {
                 retries += 1;
@@ -777,7 +779,7 @@ async fn recv_file_impl<
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -802,7 +804,7 @@ where
     TxBuf: AsMut<[u8]>,
     S: crate::AsyncFileStore,
 {
-    let req = doodad
+    let req = bus
         .recv_next_from::<A::FileReq>(from)
         .await
         .map_err(|_| Error::Protocol)?;
@@ -837,7 +839,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &reject, send_timeout)
+            >(bus, from, &reject, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -856,7 +858,7 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
@@ -876,7 +878,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &reject, send_timeout)
+            >(bus, from, &reject, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -903,12 +905,12 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
 
-    let mut handle = store
+    let mut write_bus = store
         .begin_write(transfer_id, total_len)
         .await
         .map_err(Error::Store)?;
@@ -927,18 +929,18 @@ where
         DEPTH,
         MAX_BODY,
         MAX_WAITERS,
-    >(doodad, from, &accept, send_timeout)
+    >(bus, from, &accept, send_timeout)
     .await
     .is_err()
     {
-        store.abort(handle).await;
+        store.abort(write_bus).await;
         return Err(Error::Protocol);
     }
 
     if total_len == 0 {
         let computed = hasher.finalize();
         if computed.as_slice() != expected_hash.as_slice() {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -958,11 +960,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
-        store.commit(handle).await.map_err(Error::Store)?;
+        store.commit(write_bus).await.map_err(Error::Store)?;
         return Ok(RecvFileResult {
             transfer_id,
             total_len,
@@ -979,10 +981,10 @@ where
     let ack_stride = negotiated_chunk_size.saturating_mul(PROGRESS_ACK_EVERY_CHUNKS);
     let mut last_progress_offset = 0u32;
     while next_offset < total_len {
-        let chunk = match wait_for_transfer_chunk(doodad, from, transfer_id, send_timeout).await {
+        let chunk = match wait_for_transfer_chunk(bus, from, transfer_id, send_timeout).await {
             Ok(v) => v,
             Err(_) => {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
         };
@@ -1000,7 +1002,7 @@ where
         let (chunk_transfer_id, offset, data) = match parsed {
             Ok(v) => v,
             Err(e) => {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 let abort = FileAckValue::<A>::new(
                     transfer_id,
                     schema::FileAckKind::Abort,
@@ -1020,14 +1022,14 @@ where
                     DEPTH,
                     MAX_BODY,
                     MAX_WAITERS,
-                >(doodad, from, &abort, send_timeout)
+                >(bus, from, &abort, send_timeout)
                 .await;
                 return Err(e);
             }
         };
 
         if chunk_transfer_id != transfer_id {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -1047,13 +1049,13 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
 
         if (data.len() as u32) > negotiated_chunk_size {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -1073,7 +1075,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -1092,11 +1094,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &progress, send_timeout)
+            >(bus, from, &progress, send_timeout)
             .await
             .is_err()
             {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
             last_progress_offset = next_offset;
@@ -1110,10 +1112,10 @@ where
         }
 
         if let Err(e) = store
-            .write_at(&mut handle, offset, &data[..write_len])
+            .write_at(&mut write_bus, offset, &data[..write_len])
             .await
         {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             return Err(Error::Store(e));
         }
         hasher.update(&data[..write_len]);
@@ -1122,7 +1124,7 @@ where
         if next_offset >= total_len {
             let computed = hasher.finalize();
             if computed.as_slice() != expected_hash.as_slice() {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 let abort = FileAckValue::<A>::new(
                     transfer_id,
                     schema::FileAckKind::Abort,
@@ -1142,11 +1144,11 @@ where
                     DEPTH,
                     MAX_BODY,
                     MAX_WAITERS,
-                >(doodad, from, &abort, send_timeout)
+                >(bus, from, &abort, send_timeout)
                 .await;
                 return Err(Error::Protocol);
             }
-            store.commit(handle).await.map_err(Error::Store)?;
+            store.commit(write_bus).await.map_err(Error::Store)?;
             let complete = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Complete,
@@ -1166,7 +1168,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &complete, send_timeout)
+            >(bus, from, &complete, send_timeout)
             .await
             .is_err()
             {
@@ -1199,11 +1201,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &progress, send_timeout)
+            >(bus, from, &progress, send_timeout)
             .await
             .is_err()
             {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
             last_progress_offset = next_offset;
@@ -1228,7 +1230,7 @@ async fn recv_file_no_alloc_impl<
     const MAX_METADATA: usize,
     const MAX_CHUNK: usize,
 >(
-    doodad: &thincan::DoodadHandle<
+    bus: &thincan::BusHandle<
         '_,
         Maplet,
         RM,
@@ -1253,7 +1255,7 @@ where
     TxBuf: AsMut<[u8]>,
     S: crate::AsyncFileStore,
 {
-    let req = doodad
+    let req = bus
         .recv_next_from::<A::FileReq>(from)
         .await
         .map_err(|_| Error::Protocol)?;
@@ -1308,7 +1310,7 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
@@ -1327,7 +1329,7 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
@@ -1348,7 +1350,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &reject, send_timeout)
+            >(bus, from, &reject, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -1367,7 +1369,7 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
@@ -1387,7 +1389,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &reject, send_timeout)
+            >(bus, from, &reject, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -1414,12 +1416,12 @@ where
             DEPTH,
             MAX_BODY,
             MAX_WAITERS,
-        >(doodad, from, &reject, send_timeout)
+        >(bus, from, &reject, send_timeout)
         .await;
         return Err(Error::Protocol);
     }
 
-    let mut handle = store
+    let mut write_bus = store
         .begin_write(transfer_id, total_len)
         .await
         .map_err(Error::Store)?;
@@ -1438,18 +1440,18 @@ where
         DEPTH,
         MAX_BODY,
         MAX_WAITERS,
-    >(doodad, from, &accept, send_timeout)
+    >(bus, from, &accept, send_timeout)
     .await
     .is_err()
     {
-        store.abort(handle).await;
+        store.abort(write_bus).await;
         return Err(Error::Protocol);
     }
 
     if total_len == 0 {
         let computed = hasher.finalize();
         if computed.as_slice() != expected_hash.as_slice() {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -1469,11 +1471,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
-        store.commit(handle).await.map_err(Error::Store)?;
+        store.commit(write_bus).await.map_err(Error::Store)?;
         return Ok(RecvFileResultNoAlloc {
             transfer_id,
             total_len,
@@ -1490,10 +1492,10 @@ where
     let ack_stride = negotiated_chunk_size.saturating_mul(PROGRESS_ACK_EVERY_CHUNKS);
     let mut last_progress_offset = 0u32;
     while next_offset < total_len {
-        let chunk = match wait_for_transfer_chunk(doodad, from, transfer_id, send_timeout).await {
+        let chunk = match wait_for_transfer_chunk(bus, from, transfer_id, send_timeout).await {
             Ok(v) => v,
             Err(_) => {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
         };
@@ -1513,7 +1515,7 @@ where
         let (chunk_transfer_id, offset, data_len, copy_len) = match parsed {
             Ok(v) => v,
             Err(e) => {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 let abort = FileAckValue::<A>::new(
                     transfer_id,
                     schema::FileAckKind::Abort,
@@ -1533,14 +1535,14 @@ where
                     DEPTH,
                     MAX_BODY,
                     MAX_WAITERS,
-                >(doodad, from, &abort, send_timeout)
+                >(bus, from, &abort, send_timeout)
                 .await;
                 return Err(e);
             }
         };
 
         if chunk_transfer_id != transfer_id {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -1560,13 +1562,13 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
 
         if data_len > MAX_CHUNK || (data_len as u32) > negotiated_chunk_size {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             let abort = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Abort,
@@ -1586,7 +1588,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &abort, send_timeout)
+            >(bus, from, &abort, send_timeout)
             .await;
             return Err(Error::Protocol);
         }
@@ -1605,11 +1607,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &progress, send_timeout)
+            >(bus, from, &progress, send_timeout)
             .await
             .is_err()
             {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
             last_progress_offset = next_offset;
@@ -1623,10 +1625,10 @@ where
         }
 
         if let Err(e) = store
-            .write_at(&mut handle, offset, &chunk_data[..write_len])
+            .write_at(&mut write_bus, offset, &chunk_data[..write_len])
             .await
         {
-            store.abort(handle).await;
+            store.abort(write_bus).await;
             return Err(Error::Store(e));
         }
         hasher.update(&chunk_data[..write_len]);
@@ -1635,7 +1637,7 @@ where
         if next_offset >= total_len {
             let computed = hasher.finalize();
             if computed.as_slice() != expected_hash.as_slice() {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 let abort = FileAckValue::<A>::new(
                     transfer_id,
                     schema::FileAckKind::Abort,
@@ -1655,11 +1657,11 @@ where
                     DEPTH,
                     MAX_BODY,
                     MAX_WAITERS,
-                >(doodad, from, &abort, send_timeout)
+                >(bus, from, &abort, send_timeout)
                 .await;
                 return Err(Error::Protocol);
             }
-            store.commit(handle).await.map_err(Error::Store)?;
+            store.commit(write_bus).await.map_err(Error::Store)?;
             let complete = FileAckValue::<A>::new(
                 transfer_id,
                 schema::FileAckKind::Complete,
@@ -1679,7 +1681,7 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &complete, send_timeout)
+            >(bus, from, &complete, send_timeout)
             .await
             .is_err()
             {
@@ -1712,11 +1714,11 @@ where
                 DEPTH,
                 MAX_BODY,
                 MAX_WAITERS,
-            >(doodad, from, &progress, send_timeout)
+            >(bus, from, &progress, send_timeout)
             .await
             .is_err()
             {
-                store.abort(handle).await;
+                store.abort(write_bus).await;
                 return Err(Error::Protocol);
             }
             last_progress_offset = next_offset;
@@ -1765,7 +1767,7 @@ where
         config: SendConfig,
     ) -> Result<SendFileResult, thincan::Error> {
         send_file_impl(
-            &self.doodad,
+            &self.bus,
             to,
             &mut self.send_state,
             bytes,
@@ -1784,7 +1786,7 @@ where
         config: SendConfig,
     ) -> Result<SendFileResult, thincan::Error> {
         send_file_with_id_impl(
-            &self.doodad,
+            &self.bus,
             to,
             &mut self.send_state,
             transfer_id,
@@ -1806,7 +1808,7 @@ where
     where
         S: crate::AsyncFileStore,
     {
-        recv_file_impl(&self.doodad, from, store, send_timeout, receiver).await
+        recv_file_impl(&self.bus, from, store, send_timeout, receiver).await
     }
 
     #[cfg(feature = "heapless")]
@@ -1833,7 +1835,7 @@ where
             MAX_WAITERS,
             MAX_METADATA,
             MAX_CHUNK,
-        >(&self.doodad, from, store, send_timeout, receiver)
+        >(&self.bus, from, store, send_timeout, receiver)
         .await
     }
 }
@@ -1872,7 +1874,7 @@ where
     >;
 
     fn make(
-        handle: thincan::DoodadHandle<
+        bus: thincan::BusHandle<
             'a,
             Maplet,
             RM,
@@ -1885,6 +1887,6 @@ where
             Self,
         >,
     ) -> Self::Instance {
-        FileTransferBundleInstance::new(handle)
+        FileTransferBundleInstance::new(bus)
     }
 }

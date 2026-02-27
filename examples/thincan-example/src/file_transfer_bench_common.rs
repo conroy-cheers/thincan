@@ -499,7 +499,7 @@ pub async fn run_ingress_pump(
                         );
                     }
                     iface
-                        .handle()
+                        .bus()
                         .ingest(from, &payload)
                         .await
                         .map_err(|e| anyhow::anyhow!("thincan ingest error: {e:?}"))?;

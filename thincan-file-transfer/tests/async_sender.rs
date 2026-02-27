@@ -124,7 +124,7 @@ async fn async_sender_completes_with_preingested_acks() {
     let iface =
         maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(node.clone(), node, &mut tx_buf);
     let mut bundles = maplet::Bundles::new(&iface);
-    let ingress = iface.handle();
+    let ingress = iface.bus();
 
     let transfer_id = 1u32;
     let mut enc_buf = [0u8; 256];
@@ -194,7 +194,7 @@ async fn recv_file_writes_store_and_sends_acks() {
     let iface =
         maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
-    let ingress = iface.handle();
+    let ingress = iface.bus();
 
     let mut enc_buf = [0u8; 256];
     let mut enc =
