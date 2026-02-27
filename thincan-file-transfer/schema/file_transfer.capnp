@@ -63,7 +63,3 @@ struct FileAck {
   # Only meaningful for `kind=reject`/`kind=abort`.
   error @4 :FileAckError;
 }
-
-struct LogLine {
-  bytes @0 :Data;
-}

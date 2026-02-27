@@ -18,7 +18,6 @@ thincan::bus_atlas! {
     pub mod atlas {
         0x1001 => FileReq(capnp = crate::person_capnp::person::Owned);
         0x1002 => FileChunk(capnp = crate::person_capnp::person::Owned);
-        0x3001 => LogLine(capnp = crate::person_capnp::person::Owned);
     }
 }
 
@@ -26,13 +25,12 @@ pub mod protocol_bundle {
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Bundle;
 
-    pub const MESSAGE_COUNT: usize = 3;
+    pub const MESSAGE_COUNT: usize = 2;
 
     impl thincan::BundleSpec<MESSAGE_COUNT> for Bundle {
         const MESSAGE_IDS: [u16; MESSAGE_COUNT] = [
             <super::atlas::FileReq as thincan::Message>::ID,
             <super::atlas::FileChunk as thincan::Message>::ID,
-            <super::atlas::LogLine as thincan::Message>::ID,
         ];
     }
 }
@@ -221,8 +219,11 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
         a_node,
         [0u8; 256],
     );
-    let receiver_iface =
-        maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(b_node.clone(), b_node, [0u8; 256]);
+    let receiver_iface = maplet::Interface::<NoopRawMutex, _, _, 16, 256, 4>::new(
+        b_node.clone(),
+        b_node,
+        [0u8; 256],
+    );
     let sender = sender_iface.handle().scope::<protocol_bundle::Bundle>();
     let receiver = receiver_iface.handle().scope::<protocol_bundle::Bundle>();
 
@@ -247,20 +248,6 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
             Duration::from_millis(10),
         )
         .await?;
-    sender
-        .__send_capnp_to::<atlas::LogLine, _>(
-            0xB0,
-            &PersonValue { name: "log-1" },
-            Duration::from_millis(10),
-        )
-        .await?;
-    sender
-        .__send_capnp_to::<atlas::LogLine, _>(
-            0xB0,
-            &PersonValue { name: "log-2" },
-            Duration::from_millis(10),
-        )
-        .await?;
 
     for (from, payload) in b_pump.drain_incoming() {
         receiver.ingest(from, &payload).await.unwrap();
@@ -282,12 +269,6 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
     let chunk2 = receiver
         .__recv_next_capnp_from::<atlas::FileChunk>(0xA0)
         .await?;
-    let line1 = receiver
-        .__recv_next_capnp_from::<atlas::LogLine>(0xA0)
-        .await?;
-    let line2 = receiver
-        .__recv_next_capnp_from::<atlas::LogLine>(0xA0)
-        .await?;
 
     let chunk_names = [chunk1, chunk2].map(|m| {
         m.with_root(ReaderOptions::default(), |root| {
@@ -295,15 +276,8 @@ async fn end_to_end_file_to_logs() -> Result<(), thincan::Error> {
         })
         .unwrap()
     });
-    let line_names = [line1, line2].map(|m| {
-        m.with_root(ReaderOptions::default(), |root| {
-            root.get_name().unwrap().to_str().unwrap().to_owned()
-        })
-        .unwrap()
-    });
 
     assert_eq!(chunk_names, ["chunk-1".to_owned(), "chunk-2".to_owned()]);
-    assert_eq!(line_names, ["log-1".to_owned(), "log-2".to_owned()]);
 
     Ok(())
 }
