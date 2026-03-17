@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5.23", features = ["derive"] }
-can-iso-tp = { path = "../../iso-tp/can-iso-tp", features = ["std", "uds"] }
+can-iso-tp = { version = "0.2.0", features = ["std", "uds"] }
 can-isotp-interface = "0.1.0"
 can-uds = "0.1.0"
 capnp = { version = "0.25.0", default-features = false, features = [
@@ -15,18 +15,18 @@ capnp = { version = "0.25.0", default-features = false, features = [
 embedded-can = "0.4.1"
 embedded-can-interface = "0.1.1"
 rand = { version = "0.10.0", features = ["std"] }
-thincan = { path = "../../thincan", default-features = false, features = [
+thincan = { path = "../../thincan", version = "0.1.0", default-features = false, features = [
     "std",
     "capnp",
 ] }
-thincan-file-transfer = { path = "../../thincan-file-transfer", features = [
+thincan-file-transfer = { path = "../../thincan-file-transfer", version = "0.1.0", features = [
     "tokio",
 ] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 
-embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", optional = true }
-embedded-can-socketcan = { path = "../../embedded-can/embedded-can-socketcan", optional = true }
-linux-socketcan-iso-tp = { path = "../../iso-tp/linux-socketcan-iso-tp", optional = true }
+embedded-can-unix-socket = { path = "../../embedded-can/embedded-can-unix-socket", version = "0.1.0", optional = true }
+embedded-can-socketcan = { path = "../../embedded-can/embedded-can-socketcan", version = "0.1.0", optional = true }
+linux-socketcan-iso-tp = { path = "../../iso-tp/linux-socketcan-iso-tp", version = "0.1.0", optional = true }
 
 [features]
 default = ["uds"]

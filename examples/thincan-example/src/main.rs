@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[path = "../../../thincan/tests/support/person_capnp.rs"]
 mod person_capnp;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);

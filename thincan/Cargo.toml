@@ -11,7 +11,7 @@ capnpc = { version = "0.25.0", optional = true }
 embedded-can = "0.4.1"
 embedded-can-interface = "0.1.1"
 phf = { version = "0.13.1", default-features = false, features = ["macros"] }
-can-iso-tp = { path = "../iso-tp/can-iso-tp", version = "0.1.0", default-features = false, features = [
+can-iso-tp = { version = "0.2.0", default-features = false, features = [
     "isotp-interface",
     "uds",
 ] }

@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
   "iso-tp/can-isotp-queue",
-  "iso-tp/can-iso-tp",
   "embedded-can/embedded-can-embassy-stm32",
   "embedded-can/embedded-can-socketcan",
   "embedded-can/embedded-can-unix-socket",
@@ -11,6 +10,3 @@ members = [
   "examples/thincan-example",
   "thincan-file-transfer",
 ]
-
-[patch.crates-io]
-can-iso-tp = { path = "./iso-tp/can-iso-tp" }
