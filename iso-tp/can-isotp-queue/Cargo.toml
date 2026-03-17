@@ -9,18 +9,19 @@ repository = "https://github.com/conroy-cheers/thincan"
 [features]
 default = []
 tokio = ["dep:tokio"]
-embassy-07 = [
-  "dep:embassy-sync-07",
-  "dep:embassy-time",
-  "dep:embassy-futures",
-]
+embassy-07 = ["dep:embassy-sync-07", "dep:embassy-time", "dep:embassy-futures"]
 
 [dependencies]
-can-isotp-interface = { path = "../can-isotp-interface", version = "0.1.0" }
+can-isotp-interface = "0.1.0"
 tokio = { version = "1", optional = true, features = ["rt", "sync", "time"] }
 embassy-sync-07 = { package = "embassy-sync", version = "0.7.2", default-features = false, optional = true }
 embassy-time = { version = "0.5.0", default-features = false, optional = true }
 embassy-futures = { version = "0.1.2", default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }

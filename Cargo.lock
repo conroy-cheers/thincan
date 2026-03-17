@@ -185,7 +185,7 @@ dependencies = [
  "embedded-can",
  "embedded-can-interface",
  "embedded-can-mock",
- "embedded-can-socketcan",
+ "embedded-can-socketcan 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "linux-socketcan-iso-tp",
  "tokio",
 ]
@@ -193,6 +193,8 @@ dependencies = [
 [[package]]
 name = "can-isotp-interface"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f94e711660d8503f5a40dc0356a382d3e0f6c46a79cab7d0c931fe01c5a697b8"
 
 [[package]]
 name = "can-isotp-queue"
@@ -208,6 +210,8 @@ dependencies = [
 [[package]]
 name = "can-uds"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a451bb127f44f2d523b4fdb9013a0075254b8969c8e7b83fb2bdfb2aabf5cd17"
 dependencies = [
  "embedded-can",
  "embedded-can-interface",
@@ -717,9 +721,9 @@ dependencies = [
 
 [[package]]
 name = "embedded-can-mock"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc772181df9a10b77043f93f2079ac5c1b2461e1554d1e50fa3aae16658afc9"
+checksum = "28ead9ea3055840de29439ed8e770fd4278781255bff221b1bd2e3b1b75fbfe3"
 dependencies = [
  "embedded-can",
  "embedded-can-interface",
@@ -728,6 +732,17 @@ dependencies = [
 [[package]]
 name = "embedded-can-socketcan"
 version = "0.1.0"
+dependencies = [
+ "embedded-can-interface",
+ "libc",
+ "socketcan",
+]
+
+[[package]]
+name = "embedded-can-socketcan"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ad7d9c56d2b62f91f6b62ee44256ec6997f5dc97728533d6ef5fe2906dddff"
 dependencies = [
  "embedded-can-interface",
  "libc",
@@ -1753,7 +1768,7 @@ dependencies = [
  "clap",
  "embedded-can",
  "embedded-can-interface",
- "embedded-can-socketcan",
+ "embedded-can-socketcan 0.1.0",
  "embedded-can-unix-socket",
  "linux-socketcan-iso-tp",
  "rand",

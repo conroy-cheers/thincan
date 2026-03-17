@@ -4,10 +4,10 @@
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
 #[cfg(feature = "tokio")]
-use can_isotp_interface::{IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto};
+use can_isotp_interface::{IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvMetaIntoStatus};
 use can_isotp_interface::{
-    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvMetaIntoStatus,
-    RecvStatus, RxFlowControl, SendError,
+    IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
+    RxFlowControl, SendError,
 };
 use core::time::Duration;
 use embedded_can::Id;
@@ -28,7 +28,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Socket-level ISO-TP options.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IsoTpSocketOptions {
     pub flags: u32,
     pub frame_txtime: Option<Duration>,
@@ -36,19 +36,6 @@ pub struct IsoTpSocketOptions {
     pub tx_padding: Option<u8>,
     pub rx_padding: Option<u8>,
     pub rx_ext_address: Option<u8>,
-}
-
-impl Default for IsoTpSocketOptions {
-    fn default() -> Self {
-        Self {
-            flags: 0,
-            frame_txtime: None,
-            ext_address: None,
-            tx_padding: None,
-            rx_padding: None,
-            rx_ext_address: None,
-        }
-    }
 }
 
 /// Flow control options advertised by the kernel.

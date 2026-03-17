@@ -7,8 +7,8 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4.5.23", features = ["derive"] }
 can-iso-tp = { path = "../../iso-tp/can-iso-tp", features = ["std", "uds"] }
-can-isotp-interface = { path = "../../iso-tp/can-isotp-interface" }
-can-uds = { path = "../../can-uds" }
+can-isotp-interface = "0.1.0"
+can-uds = "0.1.0"
 capnp = { version = "0.25.0", default-features = false, features = [
     "unaligned",
 ] }
