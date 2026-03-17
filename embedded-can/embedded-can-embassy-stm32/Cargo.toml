@@ -3,6 +3,10 @@ name = "embedded-can-embassy-stm32"
 version = "0.1.0"
 edition = "2024"
 description = "embassy-stm32 CAN adapters implementing embedded-can-interface traits"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/embedded-can-embassy-stm32"
 readme = "README.md"
 
 [dependencies]

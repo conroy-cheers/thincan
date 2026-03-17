@@ -2,6 +2,12 @@
 name = "thincan"
 version = "0.1.0"
 edition = "2024"
+description = "Thin, composable application-layer message routing for UDS-style ISO-TP transports"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/thincan"
+readme = "README.md"
 
 [dependencies]
 capnp = { version = "0.25.0", default-features = false, features = [

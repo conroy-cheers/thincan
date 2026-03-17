@@ -3,6 +3,10 @@ name = "embedded-can-unix-socket"
 version = "0.1.0"
 edition = "2024"
 description = "Unix-domain-socket CAN bus simulator implementing embedded-can-interface traits"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/embedded-can-unix-socket"
 readme = "README.md"
 
 [dependencies]

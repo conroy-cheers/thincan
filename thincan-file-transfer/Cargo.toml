@@ -2,6 +2,12 @@
 name = "thincan-file-transfer"
 version = "0.1.0"
 edition = "2024"
+description = "Reusable file-transfer bundle and codecs for thincan transports"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/thincan-file-transfer"
+readme = "README.md"
 
 [features]
 default = ["std"]

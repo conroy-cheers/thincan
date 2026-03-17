@@ -2,11 +2,12 @@
 name = "embedded-can-socketcan"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 keywords = ["io", "can", "socketcan", "linux"]
 description = "Linux SocketCAN adapters implementing embedded-can-interface traits"
 documentation = "https://docs.rs/embedded-can-socketcan"
-repository = "https://github.com/conroy-cheers/thincan"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 
 [dependencies]

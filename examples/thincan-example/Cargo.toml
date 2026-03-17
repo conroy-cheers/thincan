@@ -2,6 +2,12 @@
 name = "thincan-example"
 version = "0.1.0"
 edition = "2024"
+publish = false
+description = "Example CLI and benches for thincan over simulated and Linux CAN transports"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

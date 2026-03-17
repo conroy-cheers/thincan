@@ -2,11 +2,12 @@
 name = "linux-socketcan-iso-tp"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 keywords = ["can", "iso-tp", "socketcan"]
 documentation = "https://docs.rs/linux-socketcan-iso-tp"
 description = "Linux kernel ISO-TP socket backend implementing can-isotp-interface"
-repository = "https://github.com/conroy-cheers/thincan"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = []

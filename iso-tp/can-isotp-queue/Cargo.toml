@@ -2,9 +2,12 @@
 name = "can-isotp-queue"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 description = "Queue/actor adapter for split ISO-TP TX/RX endpoints across async runtimes"
-repository = "https://github.com/conroy-cheers/thincan"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/can-isotp-queue"
+readme = "README.md"
 
 [features]
 default = []

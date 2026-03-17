@@ -10,3 +10,8 @@ members = [
   "examples/thincan-example",
   "thincan-file-transfer",
 ]
+
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/conroy-cheers/thincan"
+homepage = "https://github.com/conroy-cheers/thincan"
