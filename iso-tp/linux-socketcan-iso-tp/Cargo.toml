@@ -1,6 +1,6 @@
 [package]
 name = "linux-socketcan-iso-tp"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 keywords = ["can", "iso-tp", "socketcan"]
 documentation = "https://docs.rs/linux-socketcan-iso-tp"
