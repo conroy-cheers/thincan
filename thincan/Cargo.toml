@@ -1,6 +1,6 @@
 [package]
 name = "thincan"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Thin, composable application-layer message routing for UDS-style ISO-TP transports"
 license.workspace = true
@@ -22,7 +22,7 @@ can-iso-tp = { version = "0.2.0", default-features = false, features = [
     "uds",
 ] }
 can-isotp-interface = "0.1.0"
-embassy-sync = { version = "0.7.2", default-features = false }
+embassy-sync = { version = "0.8.0", default-features = false }
 
 [features]
 default = ["std", "capnp"]

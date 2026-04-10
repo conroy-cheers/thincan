@@ -1,6 +1,6 @@
 [package]
 name = "embedded-can-unix-socket"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Unix-domain-socket CAN bus simulator implementing embedded-can-interface traits"
 license.workspace = true

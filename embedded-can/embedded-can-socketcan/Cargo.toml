@@ -1,6 +1,6 @@
 [package]
 name = "embedded-can-socketcan"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 keywords = ["io", "can", "socketcan", "linux"]
 description = "Linux SocketCAN adapters implementing embedded-can-interface traits"

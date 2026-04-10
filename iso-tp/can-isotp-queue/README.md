@@ -11,7 +11,7 @@ while higher layers need split TX and RX handles that implement:
 ## Features
 
 - `tokio`: tokio `mpsc`/`oneshot` adapter.
-- `embassy-07`: `embassy-sync` 0.7 channel-based adapter for static/no-alloc use.
+- `embassy`: `embassy-sync` channel-based adapter for static/no-alloc use.
 
 ## Tokio Usage
 
@@ -25,12 +25,12 @@ let cfg = ActorConfig::new(Duration::from_micros(50), 8, None);
 tokio::spawn(run_actor(my_socket_node, actor_ports, cfg, NoopHooks));
 ```
 
-## Embassy 0.7 Usage
+## Embassy Usage
 
 ```rust,ignore
 use core::time::Duration;
 use can_isotp_queue::{ActorConfig, NoopHooks};
-use can_isotp_queue::embassy07::{QueueResources, run_actor};
+use can_isotp_queue::embassy::{QueueResources, run_actor};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 static RES: QueueResources<CriticalSectionRawMutex, MyErr, 1024, 8, 1, 8> = QueueResources::new();

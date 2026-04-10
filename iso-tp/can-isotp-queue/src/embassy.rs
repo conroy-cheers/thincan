@@ -6,9 +6,9 @@ use can_isotp_interface::{
     RecvMetaIntoStatus, RecvStatus, SendError,
 };
 use embassy_futures::yield_now;
-use embassy_sync_07::blocking_mutex::raw::RawMutex;
-use embassy_sync_07::channel::Channel;
-use embassy_sync_07::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::RawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
 
 use crate::common::{ActorConfig, ActorHooks, QueueIsoTpError, QueueKind};
 
@@ -492,7 +492,7 @@ fn embassy_to_core_duration(dur: embassy_time::Duration) -> Duration {
 mod tests {
     use super::*;
 
-    use embassy_sync_07::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
     #[test]
     fn resources_construct_and_split() {

@@ -12,7 +12,7 @@ pub mod common;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
-#[cfg(feature = "embassy-07")]
-pub mod embassy07;
+#[cfg(feature = "embassy")]
+pub mod embassy;
 
 pub use common::{ActorConfig, ActorHooks, NoopHooks, QueueIsoTpError, QueueKind};
