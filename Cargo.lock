@@ -188,7 +188,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3128fa924fe420a2443cd87b8e7de8d8ea4b6f0ea5dcc3e65d7ce4773496c9fc"
 dependencies = [
  "can-isotp-interface 0.2.0",
- "can-isotp-queue 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "can-isotp-queue",
  "can-uds",
  "embassy-futures",
  "embassy-sync 0.8.0",
@@ -220,17 +220,6 @@ dependencies = [
  "embassy-futures",
  "embassy-sync 0.8.0",
  "tokio",
-]
-
-[[package]]
-name = "can-isotp-queue"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b606d0a42e5762c6c28a4d44ced3f0142740aeac1a2000714534ff2ce09ec4e1"
-dependencies = [
- "can-isotp-interface 0.2.0",
- "embassy-futures",
- "embassy-sync 0.8.0",
 ]
 
 [[package]]
@@ -1755,7 +1744,7 @@ dependencies = [
  "can-iso-tp 0.3.0",
  "can-isotp-interface 0.1.0",
  "can-isotp-interface 0.2.0",
- "can-isotp-queue 0.3.0",
+ "can-isotp-queue",
  "embedded-can",
  "embedded-can-interface",
  "embedded-can-unix-socket",
@@ -1773,7 +1762,7 @@ dependencies = [
  "anyhow",
  "can-iso-tp 0.3.0",
  "can-isotp-interface 0.2.0",
- "can-isotp-queue 0.3.0",
+ "can-isotp-queue",
  "can-uds",
  "capnp",
  "clap",

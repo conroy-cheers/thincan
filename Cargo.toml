@@ -17,3 +17,8 @@ rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/conroy-cheers/thincan"
 homepage = "https://github.com/conroy-cheers/thincan"
+
+# `can-iso-tp` from crates.io depends on `can-isotp-queue`. Use this workspace's
+# copy so its types match the ones the example and compat tests pass in.
+[patch.crates-io]
+can-isotp-queue = { path = "iso-tp/can-isotp-queue" }
