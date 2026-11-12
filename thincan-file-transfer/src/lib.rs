@@ -185,6 +185,7 @@ pub trait AsyncFileStore {
 
 /// Errors produced by the file-transfer state machine.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error<E, T = core::convert::Infallible> {
     Send(thincan::SendMessageError<T>),
     Receive(thincan::Error),

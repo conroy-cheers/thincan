@@ -7,6 +7,7 @@ use core::time::Duration;
 use core::{future::Future, pin::pin, task::Poll};
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum QueueError<E> {
     PayloadTooLarge { needed: usize, capacity: usize },
     Backend(E),
@@ -83,6 +84,7 @@ impl<RxE, TxE> ActorHooks<RxE, TxE> for NoopHooks {}
 
 /// Why an actor stopped without a fatal transport error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActorStop {
     /// The shutdown future completed.
     Cancelled,
@@ -90,6 +92,7 @@ pub enum ActorStop {
     Closed,
 }
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ActorError<RxE, TxE> {
     Receive(RxE),
     Send(TxE),
@@ -183,7 +186,8 @@ pub(crate) fn classify_receive<RxE, TxE, H: ActorHooks<RxE, TxE>, B>(
             hooks.on_rx_fatal(&e);
             Err(ActorError::Receive(e))
         }
-        Err(ReceiveError::Closed) => Ok(None),
+        // `Closed`, or a kind added later: stop forwarding.
+        Err(_) => Ok(None),
     }
 }
 

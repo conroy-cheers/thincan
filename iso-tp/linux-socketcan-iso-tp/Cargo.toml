@@ -2,6 +2,7 @@
 name = "linux-socketcan-iso-tp"
 version = "0.2.0"
 edition = "2024"
+rust-version.workspace = true
 keywords = ["can", "iso-tp", "socketcan"]
 documentation = "https://docs.rs/linux-socketcan-iso-tp"
 description = "Linux kernel ISO-TP socket backend implementing can-isotp-interface"
@@ -33,3 +34,6 @@ socketcan = "3.5.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true

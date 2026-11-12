@@ -42,6 +42,7 @@ pub trait CapnpMessage: Message {
 
 /// Error classification returned by `thincan` operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// Transport timed out waiting for a payload.
     Timeout,
@@ -332,6 +333,7 @@ pub struct IngestOutcome {
 
 /// Error returned while ingesting payloads into a bus mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IngestError {
     MalformedPayload,
     UnknownId { id: u16 },
@@ -342,6 +344,7 @@ pub enum IngestError {
 
 /// Encoding failure or a typed transport failure.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SendMessageError<E> {
     Encode(Error),
     Transport(TransmitError<E>),
@@ -375,6 +378,7 @@ impl<E: core::error::Error + 'static> core::error::Error for SendMessageError<E>
 
 /// Result of a receive pump operation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PumpError<E> {
     Receive(can_isotp_interface::ReceiveError<E>),
     InvalidPayloadLength { reported: usize, capacity: usize },

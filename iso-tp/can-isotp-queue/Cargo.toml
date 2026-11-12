@@ -2,6 +2,7 @@
 name = "can-isotp-queue"
 version = "0.3.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Queue/actor adapter for split ISO-TP TX/RX endpoints across async runtimes"
 license.workspace = true
 repository.workspace = true
@@ -29,3 +30,6 @@ tokio = { version = "1", features = [
   "time",
   "test-util",
 ] }
+
+[package.metadata.docs.rs]
+all-features = true

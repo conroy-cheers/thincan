@@ -21,6 +21,7 @@ pub struct SocketRoute {
     pub transmit_to: Destination,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Operation {
     Receive,
     Send,

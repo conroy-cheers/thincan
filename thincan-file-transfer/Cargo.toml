@@ -2,6 +2,7 @@
 name = "thincan-file-transfer"
 version = "0.2.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Reusable file-transfer bundle and codecs for thincan transports"
 license.workspace = true
 repository.workspace = true
@@ -14,8 +15,8 @@ default = ["std"]
 alloc = []
 std = ["alloc", "thincan/std"]
 heapless = ["dep:heapless"]
-tokio = ["can-isotp-interface/tokio", "std", "thincan/async", "dep:embassy-sync", "dep:embassy-futures"]
-embassy = ["can-isotp-interface/embassy", "heapless", "thincan/async", "dep:embassy-sync", "dep:embassy-futures"]
+tokio = ["can-isotp-interface/tokio", "std", "dep:embassy-sync", "dep:embassy-futures"]
+embassy = ["can-isotp-interface/embassy", "heapless", "dep:embassy-sync", "dep:embassy-futures"]
 
 [dependencies]
 capnp = { version = "0.25.0", default-features = false, features = [
@@ -37,3 +38,6 @@ capnpc = "0.25.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync", "time", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true

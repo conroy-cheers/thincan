@@ -177,6 +177,7 @@ mod asynchronous {
         pub writer: TokioIsoTpWriteHalf,
         pub control: SocketControl,
     }
+    #[non_exhaustive]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Operation {
         Receive,

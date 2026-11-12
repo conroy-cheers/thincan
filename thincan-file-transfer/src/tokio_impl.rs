@@ -240,6 +240,7 @@ impl SendState {
 
 /// File-send failure, preserving protocol and transport causes separately.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SendFileError<E> {
     Protocol(thincan::Error),
     Send(thincan::SendMessageError<E>),
@@ -552,6 +553,7 @@ impl<RM: thincan::RawMutex, D> Drop for ServingGuard<'_, RM, D> {
 
 /// Why [`FileTransferBundleInstance::serve`] stopped.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ServeError {
     /// Another `serve` future is already running for this bundle.
     AlreadyServing,

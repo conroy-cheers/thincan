@@ -2,6 +2,7 @@
 name = "embedded-can-unix-socket"
 version = "0.1.2"
 edition = "2024"
+rust-version.workspace = true
 description = "Unix-domain-socket CAN bus simulator implementing embedded-can-interface traits"
 license.workspace = true
 repository.workspace = true
@@ -21,3 +22,6 @@ tempfile = "3"
 [[bench]]
 name = "throughput"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true
