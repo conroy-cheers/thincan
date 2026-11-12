@@ -1,9 +1,10 @@
 # Migrating to the 0.2 release
 
 This guide covers the upgrade to the coordinated async release from `thincan`
-0.1, `thincan-file-transfer` 0.1, `can-isotp-queue` 0.2 and
-`linux-socketcan-iso-tp` 0.1. [CHANGELOG.md](../CHANGELOG.md) lists every
-change. [The design notes](async-transport-refactor.md) give the reasons.
+0.1, `thincan-file-transfer` 0.1, `can-isotp-queue` 0.2,
+`linux-socketcan-iso-tp` 0.1, `can-isotp-interface` 0.1 and `can-iso-tp` 0.2.
+[CHANGELOG.md](../CHANGELOG.md) lists every change.
+[The design notes](async-transport-refactor.md) give the reasons.
 
 Summary of the changes:
 
@@ -12,8 +13,10 @@ Summary of the changes:
 - A `thincan` interface owns only the writer. A `ReceivePump` owns the reader.
 - File transfer takes the same absolute deadline. It has a liveness timer for
   each transfer and an optional `serve()` future.
+- The error and stop enums are `#[non_exhaustive]`. Your matches on them need
+  a wildcard arm.
 - The wire format did not change, so 0.1 and 0.2 peers work together. See
-  [Mixed 0.1 and 0.2 fleets](#7-mixed-01-and-02-fleets).
+  [Mixed 0.1 and 0.2 fleets](#9-mixed-01-and-02-fleets).
 
 ## 1. Dependencies
 
@@ -28,6 +31,9 @@ can-iso-tp = { version = "0.3", features = ["async-driver"] }      # user-space 
 
 The `tokio` and `embassy` features of `thincan-file-transfer` no longer pull in
 `tokio` or `embassy-time`. Its timers run on the deadline clock of your writer.
+
+All of these crates need Rust 1.88 or later. `thincan` no longer has the
+`async` feature, which enabled nothing. Remove it from your feature lists.
 
 ## 2. Deadlines
 
@@ -230,7 +236,71 @@ let mut pump = thincan::ReceivePump::new(parts.reader, &iface, &mut scratch);
 - Transaction errors and a full transmit queue (`ENOBUFS`) are recoverable
   `Rejected` errors. Unknown errors are fatal and end both halves.
 
-## 7. Mixed 0.1 and 0.2 fleets
+## 7. Transport backends: `can-isotp-interface` 0.1 → 0.2
+
+In 0.1, a transport implemented one combined trait. It sent with a relative
+timeout and received through a callback. In 0.2, a transport implements a
+reader and a writer, and separate tasks can own them.
+
+| 0.1 | 0.2 |
+|---|---|
+| `IsoTpAsyncEndpoint::send_to(to, payload, timeout)` | `IsoTpAsyncWrite::send(Destination::Physical(to), payload, deadline)` |
+| `IsoTpAsyncEndpoint::send_functional_to(to, payload, timeout)` | `IsoTpAsyncWrite::send(Destination::Functional(to), payload, deadline)` |
+| `IsoTpAsyncEndpoint::recv_one(timeout, callback)` | `IsoTpAsyncRead::recv_into(out)` |
+| `IsoTpAsyncEndpointRecvInto::recv_one_into(timeout, out)` | `IsoTpAsyncRead::recv_into(out)` |
+| `SendError` (`Timeout`, `Backend`) | `TransmitError` (`Timeout`, `Rejected`, `Fatal`, `Closed`) |
+| `RecvError`, `RecvStatus::TimedOut` | `ReceiveError` (`BufferTooSmall`, `Rejected`, `Fatal`, `Closed`). A receive has no timeout |
+
+The writer chooses its clock with `type Deadline`. If your futures are `Send`,
+implement `IsoTpAsyncReadSend` and `IsoTpAsyncWriteSend` instead. Blanket
+implementations then provide the local traits.
+
+The new traits set these rules:
+
+- `recv_into` waits until a payload arrives. If the caller cancels it, the next
+  payload and any reassembly in progress must survive.
+- If a payload does not fit in `out`, consume it and return `BufferTooSmall`.
+- Return `Rejected` for a failed transaction after which the transport still
+  works. Return `Fatal` for a failure that ends the session, and `Closed` after
+  the end.
+- `send` must honour the deadline while it waits for the transport to accept
+  the payload. Success means acceptance, not delivery.
+- If the caller cancels `send` before acceptance, drop the request. Accepted
+  work can still complete. Never retry automatically.
+
+The blocking traits (`IsoTpEndpoint` and `IsoTpRxFlowControlConfig`) did not
+change.
+
+## 8. `can-iso-tp` 0.2 → 0.3
+
+The `AsyncWithRt` adapters are removed. They implemented the old combined
+traits, and they do not meet the cancellation rules of the new ones. To use the
+user-space ISO-TP stack through the new traits, run `driver::run_driver` in its
+own task. It needs the `async-driver` feature:
+
+```rust,ignore
+use can_iso_tp::driver::{DriverResources, run_driver};
+use can_isotp_queue::embassy::QueueResources;
+
+static RESOURCES: DriverResources<RM, LinkError, Instant, MAX_PAYLOAD, TX_SLOTS, RX_DEPTH> =
+    QueueResources::new();
+let (tx, rx, ports) = RESOURCES.split();
+let driver = run_driver(
+    can_tx, can_rx, clock, config, local_addr, functional_addr, rx_storages, ports,
+    (), shutdown,
+);
+// `tx` is an `IsoTpAsyncWrite` and `rx` an `IsoTpAsyncRead`, as in section 5.
+```
+
+The clock's instant must implement `Deadline`, so the protocol timers and the
+application deadlines use the same clock. The driver needs no allocation.
+
+The mutable async node and demux APIs remain for code that serializes access
+itself.
+
+`IsoTpError` and `DriverStop` are `#[non_exhaustive]`.
+
+## 9. Mixed 0.1 and 0.2 fleets
 
 The wire format did not change, so a 0.2 node can talk to a 0.1 node in both
 directions. A 0.2 node does more to recover lost messages. Use these settings
@@ -257,7 +327,7 @@ Known limitations with 0.1 peers:
   id. The receiver cannot tell this from a repeat, so the sender waits until
   the receiver's TIME_WAIT entry expires.
 
-## 8. Benchmark example
+## 10. Benchmark example
 
 `file-transfer-bench-a` no longer has the `--offer-retries` and
 `--offer-retry-delay-ms` flags, because the library now repeats offers itself.

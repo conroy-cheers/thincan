@@ -21,8 +21,18 @@ them in this order:
 
 You can publish `embedded-can-unix-socket` 0.1.2 at any point.
 
+[`can-isotp-interface`](https://github.com/conroy-cheers/can-isotp-interface/blob/master/CHANGELOG.md)
+and [`can-iso-tp`](https://github.com/conroy-cheers/can-iso-tp/blob/master/CHANGELOG.md)
+are in separate repositories and have their own changelogs.
+
 Until these versions are on crates.io, the workspace builds only with local
 `[patch.crates-io]` overrides. The top-level README shows the setup.
+
+Every crate in this release declares a minimum supported Rust version of 1.88.
+
+The error and stop enums in these crates are `#[non_exhaustive]`, so later
+releases can add variants without a breaking change. Code outside a crate that
+matches on one of these enums needs a wildcard arm.
 
 The file-transfer wire format stays compatible with 0.1 peers in both
 directions. The `compat-tests` crate checks this end to end against the
@@ -44,6 +54,9 @@ published 0.1 release.
 - Async sends take the writer's absolute deadline (`Tx::Deadline`) instead of a
   relative `Duration`. They fail with `SendMessageError<Tx::Error>`, which keeps
   the transport's own error instead of erasing it.
+- `ErrorKind`, `IngestError`, `SendMessageError` and `PumpError` are
+  `#[non_exhaustive]`.
+- The `async` feature, which enabled nothing, is removed.
 
 #### Added
 
@@ -75,6 +88,7 @@ published 0.1 release.
 - Sender errors are `SendFileError<Tx::Error>`, which has `is_timeout()`.
 - Receiver errors are `Error<StoreError, Tx::Error>`. The new `Send` and
   `Receive` variants carry the transport cause.
+- `Error`, `SendFileError` and `ServeError` are `#[non_exhaustive]`.
 - `SendConfig` gains `ack_timeout` (default 3 s) and `offer_retry_interval`
   (default 10 s). `max_retries` now also limits how often the sender repeats an
   offer.
@@ -140,7 +154,7 @@ published 0.1 release.
 - `RxEvent<E, B>` is one generic event type. `embassy::RxEvent<E, MAX>` is an
   alias with the same variants.
 - New shared types: `QueueError`, `ActorError` and `ActorStop` (`Cancelled`,
-  `Closed`).
+  `Closed`). All three are `#[non_exhaustive]`.
 
 #### Changed
 
@@ -151,6 +165,8 @@ published 0.1 release.
   - If the deadline expires during a send, the result is `Timeout`.
 - The Embassy actor times backpressure on the writer's deadline clock. It no
   longer depends on `embassy-time`.
+- If the reader returns a receive error kind that this release does not know,
+  the actor stops forwarding, as it does for `Closed`.
 
 ### `linux-socketcan-iso-tp` 0.2.0
 
@@ -173,7 +189,8 @@ published 0.1 release.
 #### Added
 
 - `SocketControl::failed()` and `closed()`. `TerminalFailure` and `Operation`
-  record the first fatal error and the operation that saw it.
+  record the first fatal error and the operation that saw it. `Operation` is
+  `#[non_exhaustive]`.
 
 #### Fixed
 
