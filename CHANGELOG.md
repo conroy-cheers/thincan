@@ -6,27 +6,22 @@ upgrade steps, see [the 0.2 migration guide](docs/migration-0.2.md). For the
 reasons behind the transport changes, see
 [the async transport design](docs/async-transport-refactor.md).
 
-## Unreleased: coordinated async release
+## 2026-11-12: coordinated async release
 
 This release replaces the async transport that polled with timeouts. Readers
 and writers now wait indefinitely, and each send takes one absolute deadline.
 
-Each crate depends on unpublished versions of the crates before it, so publish
-them in this order:
+The release published these versions together, in dependency order:
 
 1. `can-isotp-interface` 0.2.0 (separate repository)
 2. `can-isotp-queue` 0.3.0 and `linux-socketcan-iso-tp` 0.2.0
 3. `can-iso-tp` 0.3.0 (separate repository)
-4. `thincan` 0.2.0, then `thincan-file-transfer` 0.2.0
-
-You can publish `embedded-can-unix-socket` 0.1.2 at any point.
+4. `thincan` 0.2.0, `thincan-file-transfer` 0.2.0 and
+   `embedded-can-unix-socket` 0.1.2
 
 [`can-isotp-interface`](https://github.com/conroy-cheers/can-isotp-interface/blob/master/CHANGELOG.md)
 and [`can-iso-tp`](https://github.com/conroy-cheers/can-iso-tp/blob/master/CHANGELOG.md)
 are in separate repositories and have their own changelogs.
-
-Until these versions are on crates.io, the workspace builds only with local
-`[patch.crates-io]` overrides. The top-level README shows the setup.
 
 Every crate in this release declares a minimum supported Rust version of 1.88.
 

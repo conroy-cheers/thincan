@@ -35,9 +35,9 @@ on local and on threaded executors.
   - End-to-end tests of compatibility with the published 0.1 release. See
     [Compatibility with 0.1 peers](#compatibility-with-01-peers).
 
-## Coordinated async release
+## Async transport release
 
-The async transport now follows [its design](docs/async-transport-refactor.md):
+The async transport follows [its design](docs/async-transport-refactor.md):
 
 - Reads wait indefinitely.
 - Each send takes an absolute deadline.
@@ -46,28 +46,20 @@ The async transport now follows [its design](docs/async-transport-refactor.md):
 - On Linux, sockets close outside the executor threads.
 - User-space ISO-TP runs its protocol in a persistent driver of its own.
 
-This work needs a coordinated release of `can-isotp-interface` 0.2,
-`can-iso-tp` 0.3, `can-isotp-queue` 0.3, and version 0.2 of `thincan`,
-`linux-socketcan-iso-tp` and `thincan-file-transfer`. The new dependency
-versions are not published yet. [CHANGELOG.md](CHANGELOG.md) gives the publish
-order.
+These changes shipped on 2026-11-12 in a coordinated release:
+`can-isotp-interface` 0.2, `can-iso-tp` 0.3, `can-isotp-queue` 0.3,
+`embedded-can-unix-socket` 0.1.2, and version 0.2 of `thincan`,
+`linux-socketcan-iso-tp` and `thincan-file-transfer`.
+[CHANGELOG.md](CHANGELOG.md) lists the changes.
+[The migration guide](docs/migration-0.2.md) gives the upgrade steps.
 
-For local builds, use Cargo patches, which keep machine-specific paths out of
-the package manifests. Check out all three repositories side by side, then
-create a local config file:
+The workspace builds against these versions from crates.io. Run
+`cargo test --workspace --all-features`.
 
-```toml
-[patch.crates-io]
-can-isotp-interface = { path = "../can-isotp-interface" }
-can-iso-tp = { path = "../can-iso-tp" }
-can-isotp-queue = { path = "iso-tp/can-isotp-queue" }
-linux-socketcan-iso-tp = { path = "iso-tp/linux-socketcan-iso-tp" }
-```
-
-Then run `cargo --config /path/to/local-config.toml test --workspace --all-features`.
-
-Before you release a crate that depends on these versions, regenerate its
-lockfile against the published dependencies.
+`can-iso-tp` depends on `can-isotp-queue`, so the root `Cargo.toml` patches
+`can-isotp-queue` to the copy in this repository. Without the patch, the
+example and the compat tests get two copies of the crate, and their types do
+not match.
 
 ## Compatibility with 0.1 peers
 
@@ -89,4 +81,4 @@ The tests cover:
 - ISO-TP messages near the 4095-byte maximum
 
 Tests named `pins_...` assert known limitations with 0.1 peers. Run the tests
-with `cargo --config /path/to/local-config.toml test -p thincan-compat-tests`.
+with `cargo test -p thincan-compat-tests`.
