@@ -9,6 +9,7 @@ members = [
   "thincan",
   "examples/thincan-example",
   "thincan-file-transfer",
+  "compat-tests",
 ]
 
 [workspace.package]

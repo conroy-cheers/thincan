@@ -1,13 +1,13 @@
 #![cfg(feature = "tokio")]
 
-use core::time::Duration;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+mod support;
+use support::{Faulty, MemoryStore, PipeEnd, deadline, is_complete};
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
-};
+use core::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use can_isotp_interface::IsoTpAsyncWrite;
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -34,128 +34,6 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Default)]
-struct SharedPipe {
-    a_to_b: VecDeque<(u8, Vec<u8>)>,
-    b_to_a: VecDeque<(u8, Vec<u8>)>,
-}
-
-#[derive(Clone, Copy)]
-enum Direction {
-    A,
-    B,
-}
-
-#[derive(Clone)]
-struct PipeEnd {
-    shared: Arc<Mutex<SharedPipe>>,
-    dir: Direction,
-    from_addr: u8,
-}
-
-impl PipeEnd {
-    fn pair(a_addr: u8, b_addr: u8) -> (Self, Self) {
-        let shared = Arc::new(Mutex::new(SharedPipe::default()));
-        (
-            Self {
-                shared: shared.clone(),
-                dir: Direction::A,
-                from_addr: a_addr,
-            },
-            Self {
-                shared,
-                dir: Direction::B,
-                from_addr: b_addr,
-            },
-        )
-    }
-
-    fn drain_incoming(&self) -> Vec<(u8, Vec<u8>)> {
-        let mut shared = self.shared.lock().unwrap();
-        let queue = match self.dir {
-            Direction::A => &mut shared.b_to_a,
-            Direction::B => &mut shared.a_to_b,
-        };
-        queue.drain(..).collect()
-    }
-}
-
-impl IsoTpAsyncEndpoint for PipeEnd {
-    type Error = ();
-
-    async fn send_to(
-        &mut self,
-        _to: u8,
-        payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        let mut shared = self.shared.lock().unwrap();
-        match self.dir {
-            Direction::A => shared.a_to_b.push_back((self.from_addr, payload.to_vec())),
-            Direction::B => shared.b_to_a.push_back((self.from_addr, payload.to_vec())),
-        }
-        Ok(())
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        self.send_to(0, payload, timeout).await
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Ok(RecvStatus::TimedOut)
-    }
-}
-
-#[derive(Debug, Default)]
-struct MemoryStore {
-    bytes: Vec<u8>,
-}
-
-impl thincan_file_transfer::AsyncFileStore for MemoryStore {
-    type Error = ();
-    type WriteHandle = ();
-
-    async fn begin_write(
-        &mut self,
-        _transfer_id: u32,
-        total_len: u32,
-    ) -> Result<Self::WriteHandle, Self::Error> {
-        self.bytes.clear();
-        self.bytes.resize(total_len as usize, 0);
-        Ok(())
-    }
-
-    async fn write_at(
-        &mut self,
-        _handle: &mut Self::WriteHandle,
-        offset: u32,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        let end = offset + bytes.len();
-        self.bytes[offset..end].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    async fn commit(&mut self, _handle: Self::WriteHandle) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn abort(&mut self, _handle: Self::WriteHandle) {}
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn application_dx_end_to_end_tokio_bundle_api() {
     let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
@@ -166,16 +44,14 @@ async fn application_dx_end_to_end_tokio_bundle_api() {
     let mut b_tx = [0u8; 512];
     let a_iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(
         a_node.clone(),
-        a_node,
         &mut a_tx,
     );
     let b_iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(
         b_node.clone(),
-        b_node,
         &mut b_tx,
     );
 
-    let mut a_bundles = maplet::Bundles::new(&a_iface);
+    let a_bundles = maplet::Bundles::new(&a_iface);
     let b_bundles = maplet::Bundles::new(&b_iface);
     let a_ingest = a_iface.bus();
     let b_ingest = b_iface.bus();
@@ -217,8 +93,11 @@ async fn application_dx_end_to_end_tokio_bundle_api() {
             .recv_file(
                 0x11,
                 &mut store,
-                Duration::from_millis(100),
-                thincan_file_transfer::ReceiverConfig { max_chunk_size: 32 },
+                deadline(Duration::from_millis(100)),
+                thincan_file_transfer::ReceiverConfig {
+                    max_chunk_size: 32,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -231,11 +110,13 @@ async fn application_dx_end_to_end_tokio_bundle_api() {
             .send_file(
                 0x22,
                 &payload,
-                Duration::from_millis(100),
+                deadline(Duration::from_millis(100)),
                 thincan_file_transfer::SendConfig {
                     sender_max_chunk_size: 16,
                     window_chunks: 3,
                     max_retries: 3,
+                    ack_timeout: core::time::Duration::from_secs(1),
+                    ..Default::default()
                 },
             )
             .await
@@ -256,4 +137,231 @@ async fn application_dx_end_to_end_tokio_bundle_api() {
         recv_bytes.as_slice(),
         b"the quick brown fox jumps over the lazy dog"
     );
+}
+
+struct Outcome {
+    sent: Result<thincan_file_transfer::SendFileResult, String>,
+    send_elapsed: Duration,
+    received: Result<Vec<u8>, String>,
+    receive_elapsed: Duration,
+}
+
+/// One transfer from A to B over writers that may drop or delay messages.
+async fn transfer_once<WA, WB>(
+    a_writer: WA,
+    b_writer: WB,
+    (a_node, b_node): (PipeEnd, PipeEnd),
+    payload: &[u8],
+    send_config: thincan_file_transfer::SendConfig,
+    receiver: thincan_file_transfer::ReceiverConfig,
+) -> Outcome
+where
+    WA: IsoTpAsyncWrite<Error = (), Deadline = tokio::time::Instant>,
+    WB: IsoTpAsyncWrite<Error = (), Deadline = tokio::time::Instant>,
+{
+    let mut a_tx = [0u8; 512];
+    let mut b_tx = [0u8; 512];
+    let a_iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(a_writer, &mut a_tx);
+    let b_iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 16, 512, 4>::new(b_writer, &mut b_tx);
+    let a_bundles = maplet::Bundles::new(&a_iface);
+    let b_bundles = maplet::Bundles::new(&b_iface);
+    let (a_ingest, b_ingest) = (a_iface.bus(), b_iface.bus());
+    let stop = AtomicBool::new(false);
+    let pump_a = async {
+        while !stop.load(Ordering::Relaxed) {
+            for (from, payload) in a_node.drain_incoming() {
+                let _ = a_ingest.ingest(from, &payload).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let pump_b = async {
+        while !stop.load(Ordering::Relaxed) {
+            for (from, payload) in b_node.drain_incoming() {
+                let _ = b_ingest.ingest(from, &payload).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let receive = async {
+        let started = std::time::Instant::now();
+        let mut store = MemoryStore::default();
+        let result = b_bundles
+            .file_transfer
+            .recv_file(0x11, &mut store, deadline(Duration::from_secs(5)), receiver)
+            .await;
+        (
+            result.map(|_| store.bytes).map_err(|e| format!("{e:?}")),
+            started.elapsed(),
+        )
+    };
+    let send = async {
+        let started = std::time::Instant::now();
+        let result = a_bundles
+            .file_transfer
+            .send_file(0x22, payload, deadline(Duration::from_secs(5)), send_config)
+            .await;
+        (result.map_err(|e| format!("{e:?}")), started.elapsed())
+    };
+    let transfer = async {
+        let result = tokio::join!(send, receive);
+        stop.store(true, Ordering::Relaxed);
+        result
+    };
+    let (_, _, ((sent, send_elapsed), (received, receive_elapsed))) =
+        tokio::join!(pump_a, pump_b, transfer);
+    Outcome {
+        sent,
+        send_elapsed,
+        received,
+        receive_elapsed,
+    }
+}
+
+fn send_config(ack_timeout: Duration) -> thincan_file_transfer::SendConfig {
+    thincan_file_transfer::SendConfig {
+        sender_max_chunk_size: 16,
+        window_chunks: 2,
+        max_retries: 10,
+        ack_timeout,
+        ..Default::default()
+    }
+}
+
+fn receiver(idle_timeout: Duration) -> thincan_file_transfer::ReceiverConfig {
+    thincan_file_transfer::ReceiverConfig {
+        max_chunk_size: 32,
+        idle_timeout: Some(idle_timeout),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_gives_up_after_idle_timeout_and_its_abort_stops_the_sender() {
+    let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
+    let drop_chunks = Faulty {
+        pipe: a_node.clone(),
+        drop: |id: u16, _: &[u8]| id == 0x1002,
+        chunk_delay: Duration::ZERO,
+    };
+    let outcome = transfer_once(
+        drop_chunks,
+        b_node.clone(),
+        (a_node, b_node),
+        b"chunks never arrive",
+        // Alone, the sender would retry for 10 x 200 ms.
+        send_config(Duration::from_millis(200)),
+        receiver(Duration::from_millis(50)),
+    )
+    .await;
+    assert!(
+        outcome.received.as_ref().unwrap_err().contains("Timeout"),
+        "{:?}",
+        outcome.received
+    );
+    assert!(outcome.receive_elapsed < Duration::from_secs(1));
+    assert!(outcome.sent.is_err());
+    assert!(outcome.send_elapsed < Duration::from_secs(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_timeout_restarts_with_every_chunk() {
+    let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
+    let slow_chunks = Faulty {
+        pipe: a_node.clone(),
+        drop: |_: u16, _: &[u8]| false,
+        chunk_delay: Duration::from_millis(25),
+    };
+    let payload = [7u8; 160]; // 10 chunks: ~250 ms in total, 25 ms apart.
+    let outcome = transfer_once(
+        slow_chunks,
+        b_node.clone(),
+        (a_node, b_node),
+        &payload,
+        send_config(Duration::from_millis(500)),
+        receiver(Duration::from_millis(100)),
+    )
+    .await;
+    assert_eq!(outcome.received.unwrap(), payload);
+    assert!(outcome.receive_elapsed > Duration::from_millis(100));
+    assert_eq!(outcome.sent.unwrap().retries, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lost_complete_is_answered_again_and_confirmation_ends_the_linger() {
+    let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
+    let completes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drop_first_complete = Faulty {
+        pipe: b_node.clone(),
+        drop: {
+            let completes = completes.clone();
+            move |id: u16, body: &[u8]| {
+                is_complete(id, body) && completes.fetch_add(1, Ordering::SeqCst) == 0
+            }
+        },
+        chunk_delay: Duration::ZERO,
+    };
+    let payload = [5u8; 40];
+    let outcome = transfer_once(
+        a_node.clone(),
+        drop_first_complete,
+        (a_node, b_node),
+        &payload,
+        send_config(Duration::from_millis(50)),
+        receiver(Duration::from_secs(2)),
+    )
+    .await;
+    assert_eq!(outcome.received.unwrap(), payload);
+    assert!(outcome.sent.unwrap().retries >= 1);
+    assert_eq!(completes.load(Ordering::SeqCst), 2, "Complete sent again");
+    // The sender's confirmation, not the 2 s idle timeout, ended the linger.
+    assert!(outcome.receive_elapsed < Duration::from_secs(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmation_ends_the_linger_promptly_after_a_clean_transfer() {
+    let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
+    let payload = [6u8; 40];
+    let outcome = transfer_once(
+        a_node.clone(),
+        b_node.clone(),
+        (a_node, b_node),
+        &payload,
+        send_config(Duration::from_millis(500)),
+        receiver(Duration::from_secs(2)),
+    )
+    .await;
+    assert_eq!(outcome.received.unwrap(), payload);
+    assert!(outcome.receive_elapsed < Duration::from_millis(500));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lost_offer_is_resent_after_the_offer_retry_interval() {
+    let (a_node, b_node) = PipeEnd::pair(0x11, 0x22);
+    let offers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drop_first_offer = Faulty {
+        pipe: a_node.clone(),
+        drop: {
+            let offers = offers.clone();
+            move |id: u16, _: &[u8]| id == 0x1001 && offers.fetch_add(1, Ordering::SeqCst) == 0
+        },
+        chunk_delay: Duration::ZERO,
+    };
+    let mut config = send_config(Duration::from_millis(500));
+    config.offer_retry_interval = Some(Duration::from_millis(50));
+    let payload = [3u8; 40];
+    let outcome = transfer_once(
+        drop_first_offer,
+        b_node.clone(),
+        (a_node, b_node),
+        &payload,
+        config,
+        receiver(Duration::from_secs(1)),
+    )
+    .await;
+    assert_eq!(outcome.received.unwrap(), payload);
+    assert!(outcome.sent.is_ok());
+    assert_eq!(offers.load(Ordering::SeqCst), 2);
+    assert!(outcome.send_elapsed < Duration::from_secs(1));
 }

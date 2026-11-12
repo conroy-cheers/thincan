@@ -30,11 +30,8 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
 #[test]
 fn heapless_file_offer_roundtrips_key_fields() {
     let mut tx_buf = [0u8; 512];
-    let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 512, 4>::new(
-        (),
-        (),
-        tx_buf.as_mut_slice(),
-    );
+    let mut iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 512, 4>::new((), tx_buf.as_mut_slice());
 
     let encoded = iface
         .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(

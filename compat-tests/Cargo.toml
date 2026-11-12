@@ -1,0 +1,35 @@
+[package]
+name = "thincan-compat-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "End-to-end compatibility tests between the published 0.1 release and this workspace"
+license.workspace = true
+
+# Two complete nodes share an in-process unix-socket CAN bus: one built from the
+# published 0.1 release, one from this workspace. Old crates are renamed with a
+# version suffix; this workspace's crates keep their names.
+[dependencies]
+anyhow = "1"
+embedded-can = "0.4.1"
+embedded-can-interface = "0.1.1"
+embedded-can-unix-socket = { path = "../embedded-can/embedded-can-unix-socket" }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+# This workspace (current release).
+can-iso-tp = { version = "0.3.0", features = ["std", "uds", "async-driver"] }
+can-isotp-interface = { version = "0.2.0", features = ["tokio"] }
+can-isotp-queue = { path = "../iso-tp/can-isotp-queue", features = ["embassy"] }
+thincan = { path = "../thincan", default-features = false, features = ["std", "capnp"] }
+thincan-file-transfer = { path = "../thincan-file-transfer", features = ["tokio"] }
+
+# The published 0.1 release, exactly as peers in the field run it.
+can-iso-tp-02 = { package = "can-iso-tp", version = "=0.2.0", features = ["std", "uds"] }
+can-isotp-interface-01 = { package = "can-isotp-interface", version = "=0.1.0" }
+thincan-01 = { package = "thincan", version = "=0.1.1", default-features = false, features = [
+  "std",
+  "capnp",
+] }
+thincan-file-transfer-01 = { package = "thincan-file-transfer", version = "=0.1.1", features = [
+  "tokio",
+] }

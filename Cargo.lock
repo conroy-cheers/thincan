@@ -175,8 +175,21 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3cc33fd363c3f532f0105fcdd22481b646a6607a5a27320b391a1a64832b93"
 dependencies = [
- "can-isotp-interface",
+ "can-isotp-interface 0.1.0",
  "can-uds",
+ "embedded-can",
+ "embedded-can-interface",
+]
+
+[[package]]
+name = "can-iso-tp"
+version = "0.3.0"
+dependencies = [
+ "can-isotp-interface 0.2.0",
+ "can-isotp-queue",
+ "can-uds",
+ "embassy-futures",
+ "embassy-sync 0.8.0",
  "embedded-can",
  "embedded-can-interface",
 ]
@@ -188,13 +201,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94e711660d8503f5a40dc0356a382d3e0f6c46a79cab7d0c931fe01c5a697b8"
 
 [[package]]
-name = "can-isotp-queue"
+name = "can-isotp-interface"
 version = "0.2.0"
 dependencies = [
- "can-isotp-interface",
+ "embassy-time",
+ "tokio",
+]
+
+[[package]]
+name = "can-isotp-queue"
+version = "0.3.0"
+dependencies = [
+ "can-isotp-interface 0.2.0",
  "embassy-futures",
  "embassy-sync 0.8.0",
- "embassy-time",
  "tokio",
 ]
 
@@ -713,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "embedded-can-unix-socket"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "criterion",
  "embedded-can",
@@ -1097,9 +1117,9 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "linux-socketcan-iso-tp"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
- "can-isotp-interface",
+ "can-isotp-interface 0.2.0",
  "can-uds",
  "embedded-can",
  "libc",
@@ -1683,11 +1703,26 @@ dependencies = [
 [[package]]
 name = "thincan"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad5a0309aed7a1c4b8a2f19047aee9001ecb27b4764bb6f5ca85623fb1d5305"
 dependencies = [
- "can-iso-tp",
- "can-isotp-interface",
+ "can-iso-tp 0.2.0",
+ "can-isotp-interface 0.1.0",
+ "capnp",
+ "embassy-sync 0.8.0",
+ "embedded-can",
+ "embedded-can-interface",
+ "phf",
+]
+
+[[package]]
+name = "thincan"
+version = "0.2.0"
+dependencies = [
+ "can-isotp-interface 0.2.0",
  "capnp",
  "capnpc",
+ "embassy-futures",
  "embassy-sync 0.8.0",
  "embedded-can",
  "embedded-can-interface",
@@ -1697,12 +1732,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "thincan-compat-tests"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "can-iso-tp 0.2.0",
+ "can-iso-tp 0.3.0",
+ "can-isotp-interface 0.1.0",
+ "can-isotp-interface 0.2.0",
+ "can-isotp-queue",
+ "embedded-can",
+ "embedded-can-interface",
+ "embedded-can-unix-socket",
+ "thincan 0.1.1",
+ "thincan 0.2.0",
+ "thincan-file-transfer 0.1.1",
+ "thincan-file-transfer 0.2.0",
+ "tokio",
+]
+
+[[package]]
 name = "thincan-example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "can-iso-tp",
- "can-isotp-interface",
+ "can-iso-tp 0.3.0",
+ "can-isotp-interface 0.2.0",
+ "can-isotp-queue",
  "can-uds",
  "capnp",
  "clap",
@@ -1712,23 +1768,37 @@ dependencies = [
  "embedded-can-unix-socket",
  "linux-socketcan-iso-tp",
  "rand",
- "thincan",
- "thincan-file-transfer",
+ "thincan 0.2.0",
+ "thincan-file-transfer 0.2.0",
  "tokio",
 ]
 
 [[package]]
 name = "thincan-file-transfer"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302dd9e5d9cbc4cb7dda11a41e0be103330a30ac9e5b6f2d4fdf363ccb862bf7"
 dependencies = [
- "can-isotp-interface",
+ "can-isotp-interface 0.1.0",
  "capnp",
  "capnpc",
+ "sha2",
+ "thincan 0.1.1",
+ "tokio",
+]
+
+[[package]]
+name = "thincan-file-transfer"
+version = "0.2.0"
+dependencies = [
+ "can-isotp-interface 0.2.0",
+ "capnp",
+ "capnpc",
+ "embassy-futures",
  "embassy-sync 0.8.0",
- "embassy-time",
  "heapless 0.9.2",
  "sha2",
- "thincan",
+ "thincan 0.2.0",
  "tokio",
 ]
 

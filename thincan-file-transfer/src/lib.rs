@@ -99,17 +99,38 @@ pub const fn capnp_scratch_words_for_bytes(bytes: usize) -> usize {
     bytes.div_ceil(8)
 }
 
+/// Default [`ReceiverConfig::idle_timeout`].
+pub const DEFAULT_RECEIVE_IDLE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// Default for `FileTransferBundleInstance::set_time_wait`.
+pub const DEFAULT_TIME_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
+
 /// Receiver-side configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
 pub struct ReceiverConfig {
     /// Maximum accepted `FileChunk.data` length (bytes).
     ///
     /// - `0` means "no limit / accept any size" (back-compat default).
     /// - Non-zero values cause oversize chunks to be rejected as a protocol error.
     pub max_chunk_size: u32,
+    /// Longest wait for the next chunk once a transfer is accepted. The timer
+    /// restarts with every chunk and is capped by the call's deadline; on expiry
+    /// the receiver aborts the transfer. `None` waits until the deadline.
+    ///
+    /// Keep this longer than the sender's retransmission interval plus the time
+    /// to send one window: `SendConfig::ack_timeout` for current senders, the
+    /// per-operation timeout for 0.1 senders.
+    pub idle_timeout: Option<core::time::Duration>,
 }
 
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_size: 0,
+            idle_timeout: Some(DEFAULT_RECEIVE_IDLE_TIMEOUT),
+        }
+    }
+}
 
 /// Atlas contract for file-transfer message types.
 pub trait Atlas {
@@ -164,7 +185,9 @@ pub trait AsyncFileStore {
 
 /// Errors produced by the file-transfer state machine.
 #[derive(Debug)]
-pub enum Error<E> {
+pub enum Error<E, T = core::convert::Infallible> {
+    Send(thincan::SendMessageError<T>),
+    Receive(thincan::Error),
     Store(E),
     Protocol,
     Capnp(capnp::Error),
@@ -197,6 +220,8 @@ pub struct FileOfferValue<'a, A> {
     pub sender_max_chunk_size: u32,
     pub file_hash_algo: schema::FileHashAlgo,
     pub file_hash: &'a [u8],
+    /// Whether the sender confirms `Complete`; see [`Self::confirming_complete`].
+    pub confirms_complete: bool,
     _atlas: PhantomData<A>,
 }
 
@@ -242,8 +267,17 @@ impl<'a, A> FileOfferValue<'a, A> {
             sender_max_chunk_size,
             file_hash_algo,
             file_hash,
+            confirms_complete: false,
             _atlas: PhantomData,
         }
+    }
+
+    /// Promise to confirm `Complete` with an empty `FileChunk` at `total_len`.
+    /// Only set this if the sender really sends that confirmation: the receiver
+    /// otherwise waits up to its idle timeout for it after every transfer.
+    pub fn confirming_complete(mut self) -> Self {
+        self.confirms_complete = true;
+        self
     }
 }
 
@@ -337,6 +371,30 @@ pub fn file_ack_reject<A>(transfer_id: u32, error: schema::FileAckError) -> File
     FileAckValue::new(transfer_id, schema::FileAckKind::Reject, 0, 0, error)
 }
 
+pub fn file_ack_complete<A>(transfer_id: u32, total_len: u32) -> FileAckValue<A> {
+    FileAckValue::new(
+        transfer_id,
+        schema::FileAckKind::Complete,
+        total_len,
+        0,
+        schema::FileAckError::None,
+    )
+}
+
+pub fn file_ack_abort<A>(
+    transfer_id: u32,
+    next_offset: u32,
+    error: schema::FileAckError,
+) -> FileAckValue<A> {
+    FileAckValue::new(
+        transfer_id,
+        schema::FileAckKind::Abort,
+        next_offset,
+        0,
+        error,
+    )
+}
+
 #[cfg(feature = "alloc")]
 mod alloc_encode;
 
@@ -352,8 +410,12 @@ pub use heapless_encode::{
 mod tokio_impl;
 #[cfg(any(feature = "tokio", feature = "embassy"))]
 pub use tokio_impl::{
-    Ack, FileTransferBundleInstance, SendConfig, SendFileResult, SendState, decode_file_ack,
+    Ack, FileTransferBundleInstance, SendConfig, SendFileError, SendFileResult, SendState,
+    ServeError, decode_file_ack,
 };
+
+#[cfg(any(feature = "tokio", feature = "embassy"))]
+pub use tokio_impl::RecvFileResultOf;
 
 #[cfg(feature = "alloc")]
 #[cfg(any(feature = "tokio", feature = "embassy"))]

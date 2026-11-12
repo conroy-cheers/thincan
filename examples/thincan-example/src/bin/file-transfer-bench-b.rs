@@ -6,9 +6,6 @@ mod common;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -29,33 +26,20 @@ struct Args {
 
     #[arg(long, default_value_t = 30000)]
     wait_for_socket_ms: u64,
+
+    /// Receive budget per round, including waiting for the initiator's offer
+    /// (it may wait for the socket, then sleep before its first file). A peer
+    /// that stalls mid-transfer is caught sooner by the receiver's idle timeout.
+    #[arg(long, default_value_t = 40000)]
+    listen_timeout_ms: u64,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let local = tokio::task::LocalSet::new();
-    local.run_until(run(args)).await
+    run(Args::parse()).await
 }
 
 async fn run(args: Args) -> Result<()> {
-    let node = common::connect_bench_node(
-        &args.socket,
-        common::NODE_B_ADDR,
-        Duration::from_millis(args.wait_for_socket_ms),
-    )?;
-    let iface = Rc::new(common::build_interface(node.clone()));
-    let mut bundles = common::BenchBundles::new(Rc::as_ref(&iface));
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let pump_wait = Duration::from_millis(10);
-    let pump = tokio::task::spawn_local(common::run_ingress_pump(
-        node,
-        iface.clone(),
-        stop.clone(),
-        pump_wait,
-    ));
-
     let timeout = Duration::from_millis(args.timeout_ms);
 
     println!(
@@ -67,7 +51,11 @@ async fn run(args: Args) -> Result<()> {
         common::SEND_CHUNK_SIZE
     );
 
-    let bench_result = async {
+    let options = common::NodeOptions {
+        wait_for_socket: Duration::from_millis(args.wait_for_socket_ms),
+        serve: true,
+    };
+    common::run_node(&args.socket, common::NODE_B_ADDR, options, |tx| tx, async |bundles| {
         let mut total_recv = Duration::ZERO;
         let mut total_send = Duration::ZERO;
         let mut total_bytes = 0usize;
@@ -80,7 +68,7 @@ async fn run(args: Args) -> Result<()> {
                 .recv_file(
                     common::NODE_A_ADDR,
                     &mut store,
-                    timeout,
+                    common::deadline(Duration::from_millis(args.listen_timeout_ms))?,
                     common::default_receiver_config(),
                 )
                 .await
@@ -94,7 +82,7 @@ async fn run(args: Args) -> Result<()> {
                 .send_file(
                     common::NODE_A_ADDR,
                     &payload,
-                    timeout,
+                    common::deadline(timeout)?,
                     common::default_send_config(),
                 )
                 .await
@@ -126,14 +114,6 @@ async fn run(args: Args) -> Result<()> {
         );
 
         Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    stop.store(true, Ordering::Relaxed);
-    let pump_res = pump.await.context("join ingress pump task")?;
-    if let Err(e) = pump_res {
-        eprintln!("ingress pump exited with error: {e:#}");
-    }
-
-    bench_result
+    })
+    .await?
 }

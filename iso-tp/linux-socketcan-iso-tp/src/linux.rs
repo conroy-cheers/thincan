@@ -4,8 +4,8 @@
 //! implements the shared `can-isotp-interface` traits.
 
 use can_isotp_interface::{
-    IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvMetaIntoStatus, RecvStatus,
-    RxFlowControl, SendError,
+    IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus, RxFlowControl,
+    SendError,
 };
 use can_uds::uds29;
 use core::time::Duration;
@@ -14,17 +14,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use socketcan::CanAddr;
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::thread;
 use std::time::Instant;
-
-#[cfg(feature = "tokio")]
-use tokio::io::unix::AsyncFd;
-
-#[cfg(feature = "tokio")]
-use can_isotp_interface::IsoTpAsyncEndpoint;
-#[cfg(feature = "tokio")]
-use can_isotp_interface::IsoTpAsyncEndpointRecvInto;
 
 /// ISO-TP socket error type.
 #[derive(Debug)]
@@ -33,6 +25,13 @@ pub enum Error {
     Io(io::Error),
     /// Invalid configuration passed to the constructor.
     InvalidConfig(&'static str),
+    /// All live/closing socket permits are occupied.
+    CloseCapacity,
+    /// An addressed request does not match the fixed binding.
+    WrongDestination {
+        requested: can_isotp_interface::Destination,
+        configured: can_isotp_interface::Destination,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -46,11 +45,26 @@ impl core::fmt::Display for Error {
         match self {
             Error::Io(err) => write!(f, "io error: {err}"),
             Error::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
+            Error::CloseCapacity => f.write_str("socket close capacity exhausted"),
+            Error::WrongDestination {
+                requested,
+                configured,
+            } => write!(
+                f,
+                "destination {requested:?} does not match socket binding {configured:?}"
+            ),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// Socket-level ISO-TP options.
 #[derive(Debug, Clone, Default)]
@@ -148,7 +162,6 @@ impl Default for IsoTpKernelOptions {
 pub struct SocketCanIsoTp {
     fd: OwnedFd,
     rx_buf: Vec<u8>,
-    wft_max: u8,
 }
 
 impl SocketCanIsoTp {
@@ -159,56 +172,20 @@ impl SocketCanIsoTp {
         tx_id: Id,
         options: &IsoTpKernelOptions,
     ) -> Result<Self, Error> {
-        if options.max_rx_payload == 0 {
-            return Err(Error::InvalidConfig("max_rx_payload must be > 0"));
-        }
-
-        let socket = Socket::new(
-            Domain::from(libc::AF_CAN),
-            Type::DGRAM,
-            Some(Protocol::from(libc::CAN_ISOTP)),
+        validate_options(options)?;
+        let socket = new_isotp_socket()?;
+        configure_socket(
+            socket2::SockRef::from(&socket),
+            iface,
+            rx_id,
+            tx_id,
+            options,
         )?;
-
-        socket.set_nonblocking(true)?;
-
-        // Most ISO-TP socket options must be applied before binding.
-        apply_kernel_options(socket.as_raw_fd(), options)?;
-
-        let addr = CanAddr::from_iface_isotp(iface, rx_id, tx_id).map_err(Error::Io)?;
-        socket.bind(&addr.into_sock_addr())?;
-
-        let fd = unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) };
-        let wft_max = options.flow_control.map(|fc| fc.wft_max).unwrap_or(0);
+        let fd = OwnedFd::from(socket);
         Ok(Self {
             fd,
             rx_buf: vec![0u8; options.max_rx_payload],
-            wft_max,
         })
-    }
-
-    /// Update receive-side FlowControl parameters (BS/STmin) used by the kernel.
-    ///
-    /// This applies `CAN_ISOTP_RECV_FC` at runtime. For best dynamic behavior, enable
-    /// [`flags::CAN_ISOTP_DYN_FC_PARMS`] when opening the socket (kernel-dependent).
-    pub fn set_rx_flow_control(&mut self, fc: RxFlowControl) -> Result<(), Error> {
-        let c = can_isotp_fc_options {
-            bs: fc.block_size,
-            stmin: duration_to_isotp_stmin(fc.st_min),
-            wftmax: self.wft_max,
-        };
-        let res = unsafe {
-            libc::setsockopt(
-                self.fd.as_raw_fd(),
-                SOL_CAN_ISOTP,
-                CAN_ISOTP_RECV_FC,
-                &c as *const can_isotp_fc_options as *const libc::c_void,
-                size_of::<can_isotp_fc_options>() as libc::socklen_t,
-            )
-        };
-        if res < 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        Ok(())
     }
 
     fn recv_one_ready<Cb>(&mut self, mut on_payload: Cb) -> Result<RecvStatus, RecvError<Error>>
@@ -357,233 +334,10 @@ impl can_isotp_interface::IsoTpEndpoint for SocketCanIsoTp {
     }
 }
 
-impl IsoTpRxFlowControlConfig for SocketCanIsoTp {
-    type Error = Error;
-
-    fn set_rx_flow_control(&mut self, fc: RxFlowControl) -> Result<(), Self::Error> {
-        SocketCanIsoTp::set_rx_flow_control(self, fc)
-    }
-}
-
-/// Tokio-native async wrapper around [`SocketCanIsoTp`].
-///
-/// This uses `tokio::io::unix::AsyncFd` and non-blocking `send`/`recv` syscalls to integrate
-/// kernel ISO-TP sockets into an async runtime without blocking threads.
 #[cfg(feature = "tokio")]
-#[derive(Debug)]
-pub struct TokioSocketCanIsoTp {
-    io: AsyncFd<SocketCanIsoTp>,
-}
-
+mod async_backend;
 #[cfg(feature = "tokio")]
-impl TokioSocketCanIsoTp {
-    /// Open a kernel ISO-TP socket and wrap it for tokio async I/O.
-    pub fn open(
-        iface: &str,
-        rx_id: Id,
-        tx_id: Id,
-        options: &IsoTpKernelOptions,
-    ) -> Result<Self, Error> {
-        let inner = SocketCanIsoTp::open(iface, rx_id, tx_id, options)?;
-        let io = AsyncFd::new(inner).map_err(Error::Io)?;
-        Ok(Self { io })
-    }
-
-    pub fn inner(&self) -> &SocketCanIsoTp {
-        self.io.get_ref()
-    }
-
-    pub fn inner_mut(&mut self) -> &mut SocketCanIsoTp {
-        self.io.get_mut()
-    }
-
-    pub fn into_inner(self) -> SocketCanIsoTp {
-        self.io.into_inner()
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpRxFlowControlConfig for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    fn set_rx_flow_control(&mut self, fc: RxFlowControl) -> Result<(), Self::Error> {
-        self.io.get_mut().set_rx_flow_control(fc)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    async fn send_to(
-        &mut self,
-        _to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        let res = tokio::time::timeout(timeout, async {
-            loop {
-                let fd = self.io.get_ref().as_raw_fd();
-                let sent = unsafe {
-                    libc::send(
-                        fd,
-                        payload.as_ptr().cast(),
-                        payload.len(),
-                        libc::MSG_DONTWAIT,
-                    )
-                };
-                if sent >= 0 {
-                    return Ok(());
-                }
-
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                if err.kind() != io::ErrorKind::WouldBlock {
-                    return Err(SendError::Backend(Error::Io(err)));
-                }
-
-                let mut guard = self
-                    .io
-                    .writable()
-                    .await
-                    .map_err(|e| SendError::Backend(Error::Io(e)))?;
-                guard.clear_ready();
-            }
-        })
-        .await;
-
-        match res {
-            Ok(v) => v,
-            Err(_) => Err(SendError::Timeout),
-        }
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        self.send_to(0, payload, timeout).await
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        timeout: Duration,
-        mut on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        let res = tokio::time::timeout(timeout, async {
-            loop {
-                match self
-                    .io
-                    .get_mut()
-                    .recv_one_ready(|payload| on_payload(RecvMeta { reply_to: 0 }, payload))
-                {
-                    Ok(RecvStatus::DeliveredOne) => return Ok(RecvStatus::DeliveredOne),
-                    Ok(RecvStatus::TimedOut) => {
-                        let mut guard = self
-                            .io
-                            .readable()
-                            .await
-                            .map_err(|e| RecvError::Backend(Error::Io(e)))?;
-                        guard.clear_ready();
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        })
-        .await;
-
-        match res {
-            Ok(v) => v,
-            Err(_) => Ok(RecvStatus::TimedOut),
-        }
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpAsyncEndpointRecvInto for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    async fn recv_one_into(
-        &mut self,
-        timeout: Duration,
-        out: &mut [u8],
-    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-        let res = tokio::time::timeout(timeout, async {
-            loop {
-                let mut guard = self
-                    .io
-                    .readable()
-                    .await
-                    .map_err(|e| RecvError::Backend(Error::Io(e)))?;
-
-                let recv = guard.try_io(|inner| {
-                    let fd = inner.get_ref().as_raw_fd();
-                    let read = unsafe {
-                        libc::recv(
-                            fd,
-                            out.as_mut_ptr().cast(),
-                            out.len(),
-                            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-                        )
-                    };
-                    if read < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(read as usize)
-                    }
-                });
-
-                match recv {
-                    Ok(Ok(read)) => {
-                        if read == 0 {
-                            return Err(RecvError::Backend(Error::Io(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "iso-tp socket returned 0 bytes",
-                            ))));
-                        }
-                        if read > out.len() {
-                            return Err(RecvError::BufferTooSmall {
-                                needed: read,
-                                got: out.len(),
-                            });
-                        }
-                        return Ok(RecvMetaIntoStatus::DeliveredOne {
-                            meta: RecvMeta { reply_to: 0 },
-                            len: read,
-                        });
-                    }
-                    Ok(Err(err)) => {
-                        if err.kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            guard.clear_ready();
-                            continue;
-                        }
-                        return Err(RecvError::Backend(Error::Io(err)));
-                    }
-                    Err(_would_block) => {
-                        continue;
-                    }
-                }
-            }
-        })
-        .await;
-
-        match res {
-            Ok(v) => v,
-            Err(_) => Ok(RecvMetaIntoStatus::TimedOut),
-        }
-    }
-}
+pub use async_backend::*;
 
 /// Kernel-backed ISO-TP demux for UDS normal-fixed addressing (`0x18DA_TA_SA`).
 #[derive(Debug)]
@@ -591,7 +345,6 @@ pub struct KernelUdsDemux {
     iface: String,
     local_addr: u8,
     options: IsoTpKernelOptions,
-    rx_flow_control: RxFlowControl,
     peers: Vec<PeerSocket>,
 }
 
@@ -604,21 +357,10 @@ struct PeerSocket {
 impl KernelUdsDemux {
     /// Create a demux for `local_addr` on `iface` using the provided kernel options.
     pub fn new(iface: impl Into<String>, local_addr: u8, options: IsoTpKernelOptions) -> Self {
-        let rx_flow_control = match options.flow_control {
-            Some(fc) => RxFlowControl {
-                block_size: fc.block_size,
-                st_min: isotp_stmin_to_duration(fc.st_min).unwrap_or(Duration::from_millis(0)),
-            },
-            None => RxFlowControl {
-                block_size: 0,
-                st_min: Duration::from_millis(0),
-            },
-        };
         Self {
             iface: iface.into(),
             local_addr,
             options,
-            rx_flow_control,
             peers: Vec::new(),
         }
     }
@@ -645,23 +387,37 @@ impl KernelUdsDemux {
             return Ok(&mut self.peers[idx].socket);
         }
 
-        let rx_id = uds_phys_id(self.local_addr, peer);
-        let tx_id = uds_phys_id(peer, self.local_addr);
-        let mut socket = SocketCanIsoTp::open(&self.iface, rx_id, tx_id, &self.options)?;
-        let _ = socket.set_rx_flow_control(self.rx_flow_control);
+        let socket = self.open_peer_socket(peer)?;
         self.peers.push(PeerSocket { addr: peer, socket });
         let idx = self.peers.len() - 1;
         Ok(&mut self.peers[idx].socket)
     }
+
+    fn open_peer_socket(&self, peer: u8) -> Result<SocketCanIsoTp, Error> {
+        let rx_id = uds_phys_id(self.local_addr, peer);
+        let tx_id = uds_phys_id(peer, self.local_addr);
+        SocketCanIsoTp::open(&self.iface, rx_id, tx_id, &self.options)
+    }
 }
 
+/// Linux fixes receive flow control when a socket is bound, so a change applies
+/// to sockets opened afterwards, and existing peer sockets are reopened with it.
+/// Reopening drops any transfer in progress with that peer.
 impl IsoTpRxFlowControlConfig for KernelUdsDemux {
     type Error = Error;
 
     fn set_rx_flow_control(&mut self, fc: RxFlowControl) -> Result<(), Self::Error> {
-        self.rx_flow_control = fc;
-        for peer in self.peers.iter_mut() {
-            peer.socket.set_rx_flow_control(fc)?;
+        let wft_max = self
+            .options
+            .flow_control
+            .map_or(0, |current| current.wft_max);
+        self.options.flow_control = Some(IsoTpFlowControlOptions {
+            block_size: fc.block_size,
+            st_min: duration_to_isotp_stmin(fc.st_min),
+            wft_max,
+        });
+        for index in 0..self.peers.len() {
+            self.peers[index].socket = self.open_peer_socket(self.peers[index].addr)?;
         }
         Ok(())
     }
@@ -783,14 +539,6 @@ fn duration_to_nanos_u32(d: Duration) -> u32 {
     d.as_nanos().min(u32::MAX as u128) as u32
 }
 
-fn isotp_stmin_to_duration(raw: u8) -> Option<Duration> {
-    match raw {
-        0x00..=0x7F => Some(Duration::from_millis(raw as u64)),
-        0xF1..=0xF9 => Some(Duration::from_micros((raw as u64 - 0xF0) * 100)),
-        _ => None,
-    }
-}
-
 fn duration_to_isotp_stmin(duration: Duration) -> u8 {
     let micros = duration.as_micros();
     if micros == 0 {
@@ -807,6 +555,37 @@ fn uds_phys_id(target: u8, source: u8) -> Id {
     let raw = uds29::encode_phys_id_raw(target, source);
     let ext = ExtendedId::new(raw).expect("UDS 29-bit ID must fit in 29 bits");
     Id::Extended(ext)
+}
+
+fn validate_options(options: &IsoTpKernelOptions) -> Result<(), Error> {
+    if options.max_rx_payload == 0 {
+        return Err(Error::InvalidConfig("max_rx_payload must be > 0"));
+    }
+    Ok(())
+}
+
+fn new_isotp_socket() -> io::Result<Socket> {
+    Socket::new(
+        Domain::from(libc::AF_CAN),
+        Type::DGRAM,
+        Some(Protocol::from(libc::CAN_ISOTP)),
+    )
+}
+
+/// Make `socket` non-blocking, apply kernel options, then bind it.
+/// Most ISO-TP socket options must be applied before binding.
+fn configure_socket(
+    socket: socket2::SockRef<'_>,
+    iface: &str,
+    rx_id: Id,
+    tx_id: Id,
+    options: &IsoTpKernelOptions,
+) -> Result<(), Error> {
+    socket.set_nonblocking(true)?;
+    apply_kernel_options(socket.as_raw_fd(), options)?;
+    let addr = CanAddr::from_iface_isotp(iface, rx_id, tx_id).map_err(Error::Io)?;
+    socket.bind(&addr.into_sock_addr())?;
+    Ok(())
 }
 
 fn apply_kernel_options(fd: RawFd, options: &IsoTpKernelOptions) -> Result<(), Error> {
@@ -1029,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn stmin_duration_round_trips_common_values() {
+    fn stmin_encodes_common_durations() {
         assert_eq!(
             super::duration_to_isotp_stmin(Duration::from_millis(0)),
             0x00
@@ -1045,10 +824,6 @@ mod tests {
         assert_eq!(
             super::duration_to_isotp_stmin(Duration::from_micros(900)),
             0xF9
-        );
-        assert_eq!(
-            super::isotp_stmin_to_duration(0xF4),
-            Some(Duration::from_micros(400))
         );
     }
 

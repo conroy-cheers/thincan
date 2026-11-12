@@ -5,12 +5,10 @@ use std::time::Duration;
 
 #[path = "support/person_capnp.rs"]
 mod person_capnp;
+mod support;
+use support::*;
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvControl, RecvError, RecvMeta,
-    RecvMetaIntoStatus, RecvStatus, SendError,
-};
-use capnp::message::SingleSegmentAllocator;
+use can_isotp_interface::{Destination, IsoTpAsyncWrite, TransmitError};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
 thincan::bus_atlas! {
@@ -36,46 +34,11 @@ thincan::maplet! {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PersonValue {
-    name: &'static str,
-}
-
-impl<M> thincan::EncodeCapnp<M> for PersonValue
-where
-    M: thincan::CapnpMessage<Owned = person_capnp::person::Owned>,
-{
-    fn max_encoded_len(&self) -> usize {
-        96
-    }
-
-    fn encode(&self, out: &mut [u8]) -> Result<usize, thincan::Error> {
-        let mut scratch = [0u8; 96];
-        let mut msg = capnp::message::Builder::new(SingleSegmentAllocator::new(&mut scratch));
-        let mut root: person_capnp::person::Builder = msg.init_root();
-        root.set_name(self.name);
-        root.set_email("e");
-
-        let body = msg.get_segments_for_output()[0];
-        if out.len() < body.len() {
-            return Err(thincan::Error {
-                kind: thincan::ErrorKind::BufferTooSmall {
-                    needed: body.len(),
-                    got: out.len(),
-                },
-            });
-        }
-
-        out[..body.len()].copy_from_slice(body);
-        Ok(body.len())
-    }
-}
-
 #[test]
 fn send_side_validation_rejects_too_small_buffer() {
-    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), (), [0u8; 8]);
+    let mut iface = maplet::Interface::<NoopRawMutex, _, _, 1, 8, 1>::new((), [0u8; 8]);
     let err = iface
-        .encode_capnp_into::<atlas::A, _>(&PersonValue { name: "A" })
+        .encode_capnp_into::<atlas::A, _>(&PersonValue::named("A"))
         .unwrap_err();
     assert!(matches!(
         err.kind,
@@ -89,55 +52,32 @@ struct CountingNode {
     functional_sends: Arc<Mutex<usize>>,
 }
 
-impl IsoTpAsyncEndpoint for CountingNode {
+impl IsoTpAsyncWrite for CountingNode {
     type Error = thincan::Error;
 
-    async fn send_to(
+    type Deadline = tokio::time::Instant;
+    async fn send(
         &mut self,
-        _to: u8,
+        destination: Destination,
         _payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        *self.sends.lock().unwrap() += 1;
-        Ok(())
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        _payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        *self.functional_sends.lock().unwrap() += 1;
-        Ok(())
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Ok(RecvStatus::TimedOut)
-    }
-}
-
-impl IsoTpAsyncEndpointRecvInto for CountingNode {
-    type Error = thincan::Error;
-
-    async fn recv_one_into(
-        &mut self,
-        _timeout: Duration,
-        _out: &mut [u8],
-    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-        Ok(RecvMetaIntoStatus::TimedOut)
+        _timeout: tokio::time::Instant,
+    ) -> Result<(), TransmitError<Self::Error>> {
+        match destination {
+            Destination::Physical(_) => {
+                *self.sends.lock().unwrap() += 1;
+                Ok(())
+            }
+            Destination::Functional(_) => {
+                *self.functional_sends.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
+async fn send_encoded_writes_and_validates() -> Result<(), thincan::SendMessageError<thincan::Error>>
+{
     let sends = Arc::new(Mutex::new(0usize));
     let functional_sends = Arc::new(Mutex::new(0usize));
     let node = CountingNode {
@@ -145,19 +85,20 @@ async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
         functional_sends: functional_sends.clone(),
     };
 
-    let iface =
-        maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node.clone(), node, [0u8; 128]);
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 128, 2>::new(node.clone(), [0u8; 128]);
     let bus = iface.bus().scope::<protocol_bundle::Bundle>();
-    bus
-        .__send_capnp_to::<atlas::A, _>(0x11, &PersonValue { name: "A" }, Duration::from_millis(1))
-        .await?;
-    bus
-        .__send_capnp_functional_to::<atlas::A, _>(
-            0x7F,
-            &PersonValue { name: "A" },
-            Duration::from_millis(1),
-        )
-        .await?;
+    bus.__send_capnp_to::<atlas::A, _>(
+        0x11,
+        &PersonValue::named("A"),
+        deadline(Duration::from_millis(1)),
+    )
+    .await?;
+    bus.__send_capnp_functional_to::<atlas::A, _>(
+        0x7F,
+        &PersonValue::named("A"),
+        deadline(Duration::from_millis(1)),
+    )
+    .await?;
 
     assert_eq!(*sends.lock().unwrap(), 1);
     assert_eq!(*functional_sends.lock().unwrap(), 1);
@@ -165,57 +106,26 @@ async fn send_encoded_writes_and_validates() -> Result<(), thincan::Error> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn recv_one_dispatch_requires_one_transport_recv_per_payload() -> Result<(), thincan::Error> {
+async fn recv_one_dispatch_requires_one_transport_recv_per_payload()
+-> Result<(), thincan::SendMessageError<thincan::Error>> {
     #[derive(Default)]
     struct TimeoutNode;
 
-    impl IsoTpAsyncEndpoint for TimeoutNode {
+    impl IsoTpAsyncWrite for TimeoutNode {
         type Error = thincan::Error;
 
-        async fn send_to(
+        type Deadline = tokio::time::Instant;
+        async fn send(
             &mut self,
-            _to: u8,
+            _destination: Destination,
             _payload: &[u8],
-            _timeout: Duration,
-        ) -> Result<(), SendError<Self::Error>> {
+            _timeout: tokio::time::Instant,
+        ) -> Result<(), TransmitError<Self::Error>> {
             Ok(())
-        }
-
-        async fn send_functional_to(
-            &mut self,
-            _functional_to: u8,
-            _payload: &[u8],
-            _timeout: Duration,
-        ) -> Result<(), SendError<Self::Error>> {
-            Ok(())
-        }
-
-        async fn recv_one<Cb>(
-            &mut self,
-            _timeout: Duration,
-            _on_payload: Cb,
-        ) -> Result<RecvStatus, RecvError<Self::Error>>
-        where
-            Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-        {
-            Ok(RecvStatus::TimedOut)
         }
     }
 
-    impl IsoTpAsyncEndpointRecvInto for TimeoutNode {
-        type Error = thincan::Error;
-
-        async fn recv_one_into(
-            &mut self,
-            _timeout: Duration,
-            _out: &mut [u8],
-        ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-            Ok(RecvMetaIntoStatus::TimedOut)
-        }
-    }
-
-    let iface =
-        maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, TimeoutNode, [0u8; 64]);
+    let iface = maplet::Interface::<NoopRawMutex, _, _, 4, 64, 2>::new(TimeoutNode, [0u8; 64]);
     let bus = iface.bus().scope::<protocol_bundle::Bundle>();
     let timed_out = tokio::time::timeout(
         Duration::from_millis(1),

@@ -174,9 +174,7 @@ impl FilterConfig for TokioSocketCan {
         self.inner.set_filters(&out).map_err(SocketcanError::from)
     }
 
-    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        
-    }
+    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {}
 }
 
 impl AsyncTxFrameIo for TokioSocketCanFd {
@@ -242,7 +240,5 @@ impl FilterConfig for TokioSocketCanFd {
         self.inner.set_filters(&out).map_err(SocketcanError::from)
     }
 
-    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        
-    }
+    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {}
 }

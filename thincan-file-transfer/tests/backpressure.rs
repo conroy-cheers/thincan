@@ -1,11 +1,12 @@
 #![cfg(feature = "tokio")]
 
+mod support;
+use support::deadline;
+
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
-};
+use can_isotp_interface::{Destination, IsoTpAsyncWrite, TransmitError};
 
 thincan::bus_atlas! {
     pub mod atlas {
@@ -37,40 +38,21 @@ struct CountingNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
 
-impl IsoTpAsyncEndpoint for CountingNode {
+impl IsoTpAsyncWrite for CountingNode {
     type Error = ();
 
-    async fn send_to(
+    type Deadline = tokio::time::Instant;
+    async fn send(
         &mut self,
-        _to: u8,
+        _destination: Destination,
         payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
+        _timeout: tokio::time::Instant,
+    ) -> Result<(), TransmitError<Self::Error>> {
         if payload.len() >= 2 {
             let id = u16::from_le_bytes([payload[0], payload[1]]);
             self.sent_ids.lock().unwrap().push(id);
         }
         Ok(())
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        self.send_to(0, payload, timeout).await
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Ok(RecvStatus::TimedOut)
     }
 }
 
@@ -82,12 +64,9 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
     };
 
     let mut tx_buf = [0u8; 256];
-    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(
-        node.clone(),
-        node,
-        &mut tx_buf,
-    );
-    let mut bundles = maplet::Bundles::new(&iface);
+    let iface =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), &mut tx_buf);
+    let bundles = maplet::Bundles::new(&iface);
     let ingress = iface.bus();
 
     let transfer_id = 1u32;
@@ -97,7 +76,6 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
 
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 1, 256, 1>::new(
-        (),
         (),
         enc_buf.as_mut_slice(),
     );
@@ -122,14 +100,22 @@ async fn async_sender_backpressures_when_ack_progress_stalls() {
         sender_max_chunk_size: chunk_size,
         window_chunks: 4,
         max_retries: 0,
+        ack_timeout: core::time::Duration::from_secs(1),
+        ..Default::default()
     };
 
     let err = bundles
         .file_transfer
-        .send_file_with_id(0, transfer_id, &bytes, Duration::from_millis(5), config)
+        .send_file_with_id(
+            0,
+            transfer_id,
+            &bytes,
+            deadline(Duration::from_millis(5)),
+            config,
+        )
         .await
         .unwrap_err();
-    assert_eq!(err.kind, thincan::ErrorKind::Timeout);
+    assert!(err.is_timeout());
 
     let sent = sent_ids.lock().unwrap();
     let chunk_sends = sent

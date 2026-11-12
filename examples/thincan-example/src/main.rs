@@ -282,9 +282,7 @@ fn run_listen(cli: &Cli) -> Result<()> {
     let (tx, rx) = split_shared(can);
 
     let mut rx_bufs_tx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
-    let mut rx_bufs_rx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
     let tx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_tx);
-    let rx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_rx);
     let tx_node = can_iso_tp::IsoTpDemux::new(
         tx.clone(),
         rx.clone(),
@@ -294,20 +292,10 @@ fn run_listen(cli: &Cli) -> Result<()> {
         tx_storages,
     )
     .map_err(|_| anyhow::anyhow!("failed to build ISO-TP tx demux"))?;
-    let rx_node = can_iso_tp::IsoTpDemux::new(
-        tx,
-        rx,
-        isotp_cfg_for_cli(cli),
-        can_iso_tp::StdClock,
-        cli.id,
-        rx_storages,
-    )
-    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP rx demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
     let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
         tx_node,
-        rx_node,
         tx_buf.as_mut_slice(),
     );
 
@@ -315,16 +303,17 @@ fn run_listen(cli: &Cli) -> Result<()> {
 
     loop {
         let _ = iface
-            .node_mut()
+            .tx_node_mut()
             .recv_one(Duration::from_millis(1000), |meta, payload| {
                 let raw = match thincan::decode_wire(payload) {
                     Ok(r) => r,
                     Err(_) => return Ok(RecvControl::Continue),
                 };
                 if raw.id == <atlas::Ping as thincan::Message>::ID
-                    && let Some(seq) = decode_seq_capnp(raw.body) {
-                        pending_pongs.push_back((meta.reply_to, seq));
-                    }
+                    && let Some(seq) = decode_seq_capnp(raw.body)
+                {
+                    pending_pongs.push_back((meta.reply_to, seq));
+                }
                 Ok(RecvControl::Continue)
             })
             .map_err(|e| anyhow::anyhow!("recv error: {:?}", e))?;
@@ -351,9 +340,7 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
 
     let (tx, rx) = split_shared(can);
     let mut rx_bufs_tx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
-    let mut rx_bufs_rx = [[0u8; MAX_ISO_TP_PAYLOAD]; MAX_PEERS];
     let tx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_tx);
-    let rx_storages = can_iso_tp::rx_storages_from_buffers(&mut rx_bufs_rx);
     let tx_node = can_iso_tp::IsoTpDemux::new(
         tx.clone(),
         rx.clone(),
@@ -363,20 +350,10 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
         tx_storages,
     )
     .map_err(|_| anyhow::anyhow!("failed to build ISO-TP tx demux"))?;
-    let rx_node = can_iso_tp::IsoTpDemux::new(
-        tx,
-        rx,
-        isotp_cfg_for_cli(cli),
-        can_iso_tp::StdClock,
-        cli.id,
-        rx_storages,
-    )
-    .map_err(|_| anyhow::anyhow!("failed to build ISO-TP rx demux"))?;
 
     let mut tx_buf = vec![0u8; 4096];
     let mut iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 8>::new(
         tx_node,
-        rx_node,
         tx_buf.as_mut_slice(),
     );
 
@@ -403,7 +380,7 @@ fn run_ping(cli: &Cli, dest: u8) -> Result<()> {
 
         let mut got = false;
         let _ = iface
-            .node_mut()
+            .tx_node_mut()
             .recv_one(Duration::from_millis(100), |meta, payload| {
                 if meta.reply_to != dest {
                     return Ok(RecvControl::Continue);

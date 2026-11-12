@@ -3,8 +3,6 @@
 //! This crate targets Linux kernel `CAN_ISOTP` sockets. On non-Linux targets we provide
 //! compile-time stubs so downstream crates can build with `cfg` gating.
 
-#[cfg(feature = "tokio")]
-use can_isotp_interface::{IsoTpAsyncEndpoint, IsoTpAsyncEndpointRecvInto, RecvMetaIntoStatus};
 use can_isotp_interface::{
     IsoTpEndpoint, IsoTpRxFlowControlConfig, RecvControl, RecvError, RecvMeta, RecvStatus,
     RxFlowControl, SendError,
@@ -146,86 +144,113 @@ impl IsoTpEndpoint for SocketCanIsoTp {
     }
 }
 
-impl IsoTpRxFlowControlConfig for SocketCanIsoTp {
-    type Error = Error;
-
-    fn set_rx_flow_control(&mut self, _fc: RxFlowControl) -> Result<(), Self::Error> {
-        Err(Error)
+#[cfg(feature = "tokio")]
+mod asynchronous {
+    use super::*;
+    use can_isotp_interface::{
+        Destination, IsoTpAsyncReadSend, IsoTpAsyncWriteSend, ReceiveError, ReceivedPayload,
+        TransmitError,
+    };
+    use std::sync::Arc;
+    #[derive(Clone)]
+    pub struct SocketCloser;
+    impl SocketCloser {
+        pub fn new(_: usize, _: usize) -> Result<Self, Error> {
+            Err(Error)
+        }
+        pub fn occupied(&self) -> usize {
+            0
+        }
+    }
+    #[derive(Debug, Clone, Copy)]
+    pub struct SocketRoute {
+        pub receive_from: u8,
+        pub transmit_to: Destination,
+    }
+    pub struct TokioSocketCanIsoTp;
+    pub struct TokioIsoTpReadHalf;
+    pub struct TokioIsoTpWriteHalf;
+    #[derive(Clone)]
+    pub struct SocketControl;
+    pub struct SocketParts {
+        pub reader: TokioIsoTpReadHalf,
+        pub writer: TokioIsoTpWriteHalf,
+        pub control: SocketControl,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Operation {
+        Receive,
+        Send,
+    }
+    #[derive(Debug)]
+    pub struct TerminalFailure {
+        pub operation: Operation,
+        pub error: Arc<Error>,
+    }
+    impl SocketControl {
+        pub async fn failed(&self) -> Option<Arc<TerminalFailure>> {
+            Some(Arc::new(TerminalFailure {
+                operation: Operation::Receive,
+                error: Arc::new(Error),
+            }))
+        }
+        pub async fn closed(&self) {}
+        pub fn is_closed(&self) -> bool {
+            true
+        }
+    }
+    impl TokioSocketCanIsoTp {
+        pub fn open_peer(
+            _: &SocketCloser,
+            _: &str,
+            _: u8,
+            _: u8,
+            _: &IsoTpKernelOptions,
+        ) -> Result<Self, Error> {
+            Err(Error)
+        }
+        pub fn open_with_ids(
+            _: &SocketCloser,
+            _: &str,
+            _: Id,
+            _: Id,
+            _: SocketRoute,
+            _: &IsoTpKernelOptions,
+        ) -> Result<Self, Error> {
+            Err(Error)
+        }
+        pub fn into_split(self) -> SocketParts {
+            SocketParts {
+                reader: TokioIsoTpReadHalf,
+                writer: TokioIsoTpWriteHalf,
+                control: SocketControl,
+            }
+        }
+    }
+    impl IsoTpAsyncReadSend for TokioIsoTpReadHalf {
+        type Error = Arc<Error>;
+        async fn recv_into(
+            &mut self,
+            _: &mut [u8],
+        ) -> Result<ReceivedPayload, ReceiveError<Self::Error>> {
+            Err(ReceiveError::Fatal(Arc::new(Error)))
+        }
+    }
+    impl IsoTpAsyncWriteSend for TokioIsoTpWriteHalf {
+        type Error = Arc<Error>;
+        type Deadline = tokio::time::Instant;
+        async fn send(
+            &mut self,
+            _: Destination,
+            _: &[u8],
+            _: Self::Deadline,
+        ) -> Result<(), TransmitError<Self::Error>> {
+            Err(TransmitError::Fatal(Arc::new(Error)))
+        }
     }
 }
-
-/// Tokio-native async wrapper around [`SocketCanIsoTp`] (non-Linux stub).
 #[cfg(feature = "tokio")]
-#[derive(Debug)]
-pub struct TokioSocketCanIsoTp;
-
-#[cfg(feature = "tokio")]
-impl TokioSocketCanIsoTp {
-    pub fn open(
-        _iface: &str,
-        _rx_id: Id,
-        _tx_id: Id,
-        _options: &IsoTpKernelOptions,
-    ) -> Result<Self, Error> {
-        Err(Error)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpAsyncEndpoint for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    async fn send_to(
-        &mut self,
-        _to: u8,
-        _payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        Err(SendError::Backend(Error))
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        _payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        Err(SendError::Backend(Error))
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Err(RecvError::Backend(Error))
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpAsyncEndpointRecvInto for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    async fn recv_one_into(
-        &mut self,
-        _timeout: Duration,
-        _out: &mut [u8],
-    ) -> Result<RecvMetaIntoStatus, RecvError<Self::Error>> {
-        Err(RecvError::Backend(Error))
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl IsoTpRxFlowControlConfig for TokioSocketCanIsoTp {
-    type Error = Error;
-
-    fn set_rx_flow_control(&mut self, _fc: RxFlowControl) -> Result<(), Self::Error> {
-        Err(Error)
-    }
-}
+pub use asynchronous::*;
 
 /// Kernel-backed ISO-TP demux for UDS normal-fixed addressing (`0x18DA_TA_SA`) (non-Linux stub).
 #[derive(Debug)]

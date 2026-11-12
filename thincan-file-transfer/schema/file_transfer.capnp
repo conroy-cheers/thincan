@@ -19,6 +19,12 @@ struct FileReq {
 
   # Digest of the full file payload.
   fileHash @5 :Data;
+
+  # The sender confirms receiving `Complete` by sending an empty `FileChunk` at
+  # offset `totalLen`. A receiver that sees this flag keeps answering repeated
+  # final chunks with `Complete` until that confirmation arrives. Older receivers
+  # ignore the flag and discard the confirmation as a chunk of a finished transfer.
+  confirmsComplete @6 :Bool;
 }
 
 enum FileHashAlgo {

@@ -98,6 +98,18 @@ enum DecodedMsg {
     Unknown,
 }
 
+/// Control handle that can interrupt an indefinitely blocked receiver during shutdown.
+/// It does not read or write protocol data.
+pub struct UnixCanControl {
+    stream: UnixStream,
+}
+impl UnixCanControl {
+    /// Shut down both directions, waking any blocked socket I/O worker.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
+}
+
 impl UnixCan {
     /// Connect to a running bus server at the provided socket path.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -116,6 +128,13 @@ impl UnixCan {
             _ => io::Error::other("handshake failed"),
         })?;
         Ok(iface)
+    }
+
+    /// Retain an independent shutdown handle for a blocking I/O worker.
+    pub fn control(&self) -> io::Result<UnixCanControl> {
+        Ok(UnixCanControl {
+            stream: self.stream.try_clone()?,
+        })
     }
 
     /// Replace the acceptance filters on this interface.

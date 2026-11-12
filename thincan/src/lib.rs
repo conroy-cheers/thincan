@@ -12,6 +12,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(async_fn_in_trait)]
 
+use can_isotp_interface::{Deadline, Destination, IsoTpAsyncWrite, TransmitError, until};
+use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
 use core::time::Duration;
 
@@ -52,6 +54,8 @@ pub enum ErrorKind {
     },
     /// Catch-all for other errors (parsing, protocol, or transport).
     Other,
+    /// The owning transport session has ended.
+    Closed,
 }
 
 /// Error type returned by most `thincan` operations.
@@ -68,14 +72,19 @@ impl Error {
             kind: ErrorKind::Timeout,
         }
     }
+
+    /// Convenience constructor for an error on a closed interface.
+    pub const fn closed() -> Self {
+        Self {
+            kind: ErrorKind::Closed,
+        }
+    }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
-#[cfg(feature = "std")]
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:?}", self.kind)
     }
 }
@@ -269,18 +278,7 @@ pub trait BundleFactory<
 
     /// Create a bundle instance from a scoped bus handle.
     fn make(
-        bus: BusHandle<
-            'a,
-            Maplet,
-            RM,
-            Node,
-            TxBuf,
-            MAX_TYPES,
-            DEPTH,
-            MAX_BODY,
-            MAX_WAITERS,
-            Self,
-        >,
+        bus: BusHandle<'a, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS, Self>,
     ) -> Self::Instance;
 }
 
@@ -339,26 +337,64 @@ pub enum IngestError {
     UnknownId { id: u16 },
     BodyTooLarge { got: usize, max: usize },
     MailboxFull,
+    Closed,
 }
 
-/// Result of one integrated transport-ingest pump step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestPumpStatus {
-    /// No payload arrived before timeout elapsed.
-    TimedOut,
-    /// One payload was received and ingested into the matching mailbox.
-    Delivered(IngestOutcome),
-}
-
-/// Error returned by integrated transport-ingest pump operations.
+/// Encoding failure or a typed transport failure.
 #[derive(Debug)]
-pub enum IngestPumpError<E> {
-    /// Caller-provided RX scratch buffer was too small.
-    RecvBufferTooSmall { needed: usize, got: usize },
-    /// Underlying transport receive error.
-    RecvBackend(E),
-    /// Message could not be ingested into mailbox state.
+pub enum SendMessageError<E> {
+    Encode(Error),
+    Transport(TransmitError<E>),
+}
+impl<E> From<Error> for SendMessageError<E> {
+    fn from(error: Error) -> Self {
+        Self::Encode(error)
+    }
+}
+impl<E> From<TransmitError<E>> for SendMessageError<E> {
+    fn from(error: TransmitError<E>) -> Self {
+        Self::Transport(error)
+    }
+}
+impl<E: core::fmt::Display> core::fmt::Display for SendMessageError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(e) => write!(f, "encoding failed: {:?}", e.kind),
+            Self::Transport(e) => e.fmt(f),
+        }
+    }
+}
+impl<E: core::error::Error + 'static> core::error::Error for SendMessageError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Encode(e) => Some(e),
+            Self::Transport(e) => Some(e),
+        }
+    }
+}
+
+/// Result of a receive pump operation.
+#[derive(Debug)]
+pub enum PumpError<E> {
+    Receive(can_isotp_interface::ReceiveError<E>),
+    InvalidPayloadLength { reported: usize, capacity: usize },
     Ingest(IngestError),
+}
+
+impl<E> PumpError<E> {
+    /// Whether the pump has stopped for good; later calls return `Closed`.
+    ///
+    /// Any other error drops a single payload: the transport and mailboxes stay
+    /// usable, so the owner should keep pumping.
+    pub fn is_terminal(&self) -> bool {
+        use can_isotp_interface::ReceiveError;
+        matches!(
+            self,
+            Self::Receive(ReceiveError::Fatal(_) | ReceiveError::Closed)
+                | Self::InvalidPayloadLength { .. }
+                | Self::Ingest(IngestError::Closed)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,24 +447,15 @@ impl<const DEPTH: usize, const MAX_BODY: usize> TypeMailbox<DEPTH, MAX_BODY> {
         Ok(())
     }
 
-    fn pop_matching_where<F>(&mut self, from: u8, mut predicate: F) -> Option<MailboxSlot<MAX_BODY>>
+    /// Remove and return the oldest message for which `predicate(from, body)` holds.
+    fn pop_where<F>(&mut self, mut predicate: F) -> Option<MailboxSlot<MAX_BODY>>
     where
-        F: FnMut(&[u8]) -> bool,
+        F: FnMut(u8, &[u8]) -> bool,
     {
-        let mut idx = None;
-        let mut i = 0usize;
-        while i < self.used {
-            if self.slots[i].from == from {
-                let len = self.slots[i].len;
-                if predicate(&self.slots[i].body[..len]) {
-                    idx = Some(i);
-                    break;
-                }
-            }
-            i += 1;
-        }
-
-        let idx = idx?;
+        let idx = (0..self.used).find(|&i| {
+            let slot = &self.slots[i];
+            predicate(slot.from, &slot.body[..slot.len])
+        })?;
         let out = self.slots[idx];
         let mut j = idx;
         while j + 1 < self.used {
@@ -459,16 +486,11 @@ impl<const MAX_TYPES: usize, const DEPTH: usize, const MAX_BODY: usize>
         self.by_type[slot].push(from, body)
     }
 
-    fn pop_matching_where<F>(
-        &mut self,
-        slot: usize,
-        from: u8,
-        predicate: F,
-    ) -> Option<MailboxSlot<MAX_BODY>>
+    fn pop_where<F>(&mut self, slot: usize, predicate: F) -> Option<MailboxSlot<MAX_BODY>>
     where
-        F: FnMut(&[u8]) -> bool,
+        F: FnMut(u8, &[u8]) -> bool,
     {
-        self.by_type[slot].pop_matching_where(from, predicate)
+        self.by_type[slot].pop_where(predicate)
     }
 }
 
@@ -540,10 +562,69 @@ pub struct Interface<
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
 {
     tx_state: embassy_sync::mutex::Mutex<RM, TxState<Node, TxBuf>>,
-    rx_transport: embassy_sync::mutex::Mutex<RM, Node>,
+    closure: embassy_sync::blocking_mutex::Mutex<RM, RefCell<Closure>>,
+    pump_owned: embassy_sync::blocking_mutex::Mutex<RM, Cell<bool>>,
     rx_state: embassy_sync::mutex::Mutex<RM, RxState<MAX_TYPES, DEPTH, MAX_BODY>>,
     notify: [embassy_sync::watch::Watch<RM, (), MAX_WAITERS>; MAX_TYPES],
     _maplet: PhantomData<Maplet>,
+}
+
+/// Wakers kept for tasks waiting for closure (the pump, a send, `serve`). More
+/// waiters still work: a full registration wakes everyone to re-register.
+const CLOSURE_WAKERS: usize = 4;
+
+/// Whether the session has ended, and the tasks waiting for it to.
+struct Closure {
+    closed: bool,
+    waiters: embassy_sync::waitqueue::MultiWakerRegistration<CLOSURE_WAKERS>,
+}
+
+// Session state needs no transmit-buffer bound, so the receive side can use it too.
+impl<
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: embassy_sync::blocking_mutex::raw::RawMutex,
+{
+    /// End the session and wake active sends and protocol mailbox waiters.
+    pub fn close(&self) {
+        self.closure.lock(|closure| {
+            let mut closure = closure.borrow_mut();
+            closure.closed = true;
+            closure.waiters.wake();
+        });
+        for notify in &self.notify {
+            notify.sender().send(());
+        }
+    }
+
+    /// Whether the owning session has ended.
+    pub fn is_closed(&self) -> bool {
+        self.closure.lock(|closure| closure.borrow().closed)
+    }
+
+    /// Resolves once the session has ended.
+    fn closed(&self) -> impl core::future::Future<Output = ()> + '_ {
+        core::future::poll_fn(|cx| {
+            self.closure.lock(|closure| {
+                let mut closure = closure.borrow_mut();
+                if closure.closed {
+                    core::task::Poll::Ready(())
+                } else {
+                    closure.waiters.register(cx.waker());
+                    core::task::Poll::Pending
+                }
+            })
+        })
+    }
 }
 
 impl<
@@ -562,22 +643,18 @@ where
     TxBuf: AsMut<[u8]>,
 {
     /// Create a new maplet-typed interface from split transport endpoints and caller-provided TX buffer.
-    pub fn new(tx_node: Node, rx_node: Node, tx: TxBuf) -> Self {
+    pub fn new(tx_node: Node, tx: TxBuf) -> Self {
         Self {
             tx_state: embassy_sync::mutex::Mutex::new(TxState { node: tx_node, tx }),
-            rx_transport: embassy_sync::mutex::Mutex::new(rx_node),
+            closure: embassy_sync::blocking_mutex::Mutex::new(RefCell::new(Closure {
+                closed: false,
+                waiters: embassy_sync::waitqueue::MultiWakerRegistration::new(),
+            })),
+            pump_owned: embassy_sync::blocking_mutex::Mutex::new(Cell::new(false)),
             rx_state: embassy_sync::mutex::Mutex::new(RxState::new()),
             notify: core::array::from_fn(|_| embassy_sync::watch::Watch::new_with(())),
             _maplet: PhantomData,
         }
-    }
-
-    /// Create a new maplet-typed interface using the same transport endpoint for TX and RX.
-    pub fn new_shared(node: Node, tx: TxBuf) -> Self
-    where
-        Node: Clone,
-    {
-        Self::new(node.clone(), node, tx)
     }
 
     /// Create a cloneable bus handle borrowing this interface.
@@ -590,19 +667,15 @@ where
         }
     }
 
-    /// Mutably borrow the underlying transport node.
-    pub fn node_mut(&mut self) -> &mut Node {
-        self.tx_node_mut()
-    }
-
     /// Mutably borrow the TX transport endpoint.
     pub fn tx_node_mut(&mut self) -> &mut Node {
         &mut self.tx_state.get_mut().node
     }
 
-    /// Mutably borrow the RX transport endpoint.
-    pub fn rx_node_mut(&mut self) -> &mut Node {
-        self.rx_transport.get_mut()
+    /// Recover the transmitter and encoding buffer after all handles end.
+    pub fn into_tx(self) -> (Node, TxBuf) {
+        let state = self.tx_state.into_inner();
+        (state.node, state.tx)
     }
 
     /// Encode a Cap'n Proto value for message `M` into this interface's TX buffer.
@@ -624,6 +697,9 @@ where
     where
         Node: can_isotp_interface::IsoTpEndpoint,
     {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
         let tx_state = self.tx_state.get_mut();
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
@@ -641,6 +717,9 @@ where
     where
         Node: can_isotp_interface::IsoTpEndpoint,
     {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
         let tx_state = self.tx_state.get_mut();
         let TxState { node, tx } = tx_state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
@@ -653,45 +732,40 @@ where
         .map_err(map_isotp_send_error)
     }
 
-    async fn send_capnp_to_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
+    async fn send_capnp_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
         &self,
-        to: u8,
+        destination: Destination,
         value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error>
+        deadline: Node::Deadline,
+    ) -> Result<(), SendMessageError<Node::Error>>
     where
-        Node: can_isotp_interface::IsoTpAsyncEndpoint,
+        Node: IsoTpAsyncWrite,
     {
-        let mut state = self.tx_state.lock().await;
-        let tx_state = &mut *state;
-        let TxState { node, tx } = tx_state;
+        if self.is_closed() {
+            return Err(TransmitError::Closed.into());
+        }
+        // Bound the wait for the encoder; the send itself is bounded by the
+        // writer, which `IsoTpAsyncWrite` requires to honour `deadline`.
+        let Ok(mut state) = until(deadline.clone(), self.tx_state.lock()).await else {
+            return Err(TransmitError::Timeout.into());
+        };
+        if self.is_closed() {
+            return Err(TransmitError::Closed.into());
+        }
+        let TxState { node, tx } = &mut *state;
         let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        <Node as can_isotp_interface::IsoTpAsyncEndpoint>::send_to(node, to, payload, timeout)
-            .await
-            .map_err(map_isotp_send_error)
-    }
-
-    async fn send_capnp_functional_to_async_shared<M: CapnpMessage, V: EncodeCapnp<M>>(
-        &self,
-        functional_to: u8,
-        value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error>
-    where
-        Node: can_isotp_interface::IsoTpAsyncEndpoint,
-    {
-        let mut state = self.tx_state.lock().await;
-        let tx_state = &mut *state;
-        let TxState { node, tx } = tx_state;
-        let payload = TxState::<Node, TxBuf>::encode_capnp_into_buf::<M, V>(tx.as_mut(), value)?;
-        <Node as can_isotp_interface::IsoTpAsyncEndpoint>::send_functional_to(
-            node,
-            functional_to,
-            payload,
-            timeout,
-        )
-        .await
-        .map_err(map_isotp_send_error)
+        if deadline.remaining().is_zero() {
+            return Err(TransmitError::Timeout.into());
+        }
+        let send = node.send(destination, payload, deadline);
+        let result = match embassy_futures::select::select(self.closed(), send).await {
+            embassy_futures::select::Either::First(()) => Err(TransmitError::Closed),
+            embassy_futures::select::Either::Second(result) => result,
+        };
+        if matches!(result, Err(TransmitError::Fatal(_) | TransmitError::Closed)) {
+            self.close();
+        }
+        result.map_err(SendMessageError::Transport)
     }
 }
 
@@ -708,7 +782,7 @@ impl<
 where
     Maplet: MapletSpec<MAX_TYPES>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
-    Node: can_isotp_interface::IsoTpAsyncEndpoint,
+    Node: can_isotp_interface::IsoTpAsyncWrite,
     TxBuf: AsMut<[u8]>,
 {
     /// Async addressed send helper.
@@ -716,9 +790,9 @@ where
         &mut self,
         to: u8,
         value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        self.send_capnp_to_async_shared::<M, V>(to, value, timeout)
+        deadline: Node::Deadline,
+    ) -> Result<(), SendMessageError<Node::Error>> {
+        self.send_capnp_async_shared::<M, V>(Destination::Physical(to), value, deadline)
             .await
     }
 
@@ -727,14 +801,21 @@ where
         &mut self,
         functional_to: u8,
         value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error> {
-        self.send_capnp_functional_to_async_shared::<M, V>(functional_to, value, timeout)
-            .await
+        deadline: Node::Deadline,
+    ) -> Result<(), SendMessageError<Node::Error>> {
+        self.send_capnp_async_shared::<M, V>(
+            Destination::Functional(functional_to),
+            value,
+            deadline,
+        )
+        .await
     }
 }
 
-impl<
+/// Owns receive transport state and preserves received input across ingest cancellation.
+pub struct ReceivePump<
+    'a,
+    Rx,
     Maplet,
     RM,
     Node,
@@ -743,50 +824,116 @@ impl<
     const DEPTH: usize,
     const MAX_BODY: usize,
     const MAX_WAITERS: usize,
-> Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+> where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: RawMutex,
+{
+    reader: Rx,
+    iface: &'a Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>,
+    buffer: &'a mut [u8],
+    pending: Option<can_isotp_interface::ReceivedPayload>,
+}
+impl<
+    'a,
+    Rx,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> ReceivePump<'a, Rx, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
 where
     Maplet: MapletSpec<MAX_TYPES>,
-    RM: embassy_sync::blocking_mutex::raw::RawMutex,
-    Node: can_isotp_interface::IsoTpAsyncEndpointRecvInto,
+    RM: RawMutex,
     TxBuf: AsMut<[u8]>,
 {
-    /// Receive at most one payload from the transport and ingest it into this interface.
-    ///
-    /// Typical usage is from a dedicated protocol pump task:
-    /// - call repeatedly with a reusable RX scratch buffer,
-    /// - `TimedOut` can be used to yield/sleep briefly.
-    pub async fn pump_ingest_once(
-        &self,
-        timeout: Duration,
-        rx_buf: &mut [u8],
-    ) -> Result<IngestPumpStatus, IngestPumpError<Node::Error>> {
-        let recv = {
-            let mut state = self.rx_transport.lock().await;
-            <Node as can_isotp_interface::IsoTpAsyncEndpointRecvInto>::recv_one_into(
-                &mut *state,
-                timeout,
-                rx_buf,
+    pub fn new(
+        reader: Rx,
+        iface: &'a Interface<Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>,
+        buffer: &'a mut [u8],
+    ) -> Self {
+        assert!(
+            !iface.pump_owned.lock(|owned| owned.replace(true)),
+            "an interface has one receive pump per session"
+        );
+        Self {
+            reader,
+            iface,
+            buffer,
+            pending: None,
+        }
+    }
+    pub async fn next(&mut self) -> Result<IngestOutcome, PumpError<Rx::Error>>
+    where
+        Rx: can_isotp_interface::IsoTpAsyncRead,
+    {
+        if self.iface.is_closed() {
+            return Err(PumpError::Receive(
+                can_isotp_interface::ReceiveError::Closed,
+            ));
+        }
+        if self.pending.is_none() {
+            let received = match embassy_futures::select::select(
+                self.iface.closed(),
+                self.reader.recv_into(self.buffer),
             )
             .await
-        };
-
-        match recv {
-            Ok(can_isotp_interface::RecvMetaIntoStatus::TimedOut) => Ok(IngestPumpStatus::TimedOut),
-            Ok(can_isotp_interface::RecvMetaIntoStatus::DeliveredOne { meta, len }) => {
-                let outcome = self
-                    .bus()
-                    .ingest(meta.reply_to, &rx_buf[..len])
-                    .await
-                    .map_err(IngestPumpError::Ingest)?;
-                Ok(IngestPumpStatus::Delivered(outcome))
+            {
+                embassy_futures::select::Either::First(()) => {
+                    return Err(PumpError::Receive(
+                        can_isotp_interface::ReceiveError::Closed,
+                    ));
+                }
+                embassy_futures::select::Either::Second(result) => match result {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let error = PumpError::Receive(error);
+                        if error.is_terminal() {
+                            self.iface.close();
+                        }
+                        return Err(error);
+                    }
+                },
+            };
+            if received.len > self.buffer.len() {
+                self.iface.close();
+                return Err(PumpError::InvalidPayloadLength {
+                    reported: received.len,
+                    capacity: self.buffer.len(),
+                });
             }
-            Err(can_isotp_interface::RecvError::BufferTooSmall { needed, got }) => {
-                Err(IngestPumpError::RecvBufferTooSmall { needed, got })
-            }
-            Err(can_isotp_interface::RecvError::Backend(err)) => {
-                Err(IngestPumpError::RecvBackend(err))
-            }
+            self.pending = Some(received);
         }
+        let payload = self.pending.as_ref().expect("pending receive");
+        let result = self
+            .iface
+            .bus()
+            .ingest(payload.meta.reply_to, &self.buffer[..payload.len])
+            .await;
+        self.pending = None;
+        result.map_err(PumpError::Ingest)
+    }
+}
+impl<
+    Rx,
+    Maplet,
+    RM,
+    Node,
+    TxBuf,
+    const MAX_TYPES: usize,
+    const DEPTH: usize,
+    const MAX_BODY: usize,
+    const MAX_WAITERS: usize,
+> Drop for ReceivePump<'_, Rx, Maplet, RM, Node, TxBuf, MAX_TYPES, DEPTH, MAX_BODY, MAX_WAITERS>
+where
+    Maplet: MapletSpec<MAX_TYPES>,
+    RM: RawMutex,
+{
+    fn drop(&mut self) {
+        self.iface.close();
     }
 }
 
@@ -867,12 +1014,18 @@ where
 {
     /// Ingest one payload delivered by the external demux pump.
     pub async fn ingest(&self, from: u8, payload: &[u8]) -> Result<IngestOutcome, IngestError> {
+        if self.iface.is_closed() {
+            return Err(IngestError::Closed);
+        }
         let raw = decode_wire(payload).map_err(|_| IngestError::MalformedPayload)?;
         let slot = Maplet::slot_for_id(raw.id).ok_or(IngestError::UnknownId { id: raw.id })?;
         let len = raw.body.len();
 
         {
             let mut state = self.iface.rx_state.lock().await;
+            if self.iface.is_closed() {
+                return Err(IngestError::Closed);
+            }
             state.push(slot, from, raw.body)?;
         }
 
@@ -929,7 +1082,7 @@ impl<
 where
     Maplet: MapletSpec<MAX_TYPES> + MapletHasBundle<B>,
     RM: embassy_sync::blocking_mutex::raw::RawMutex,
-    Node: can_isotp_interface::IsoTpAsyncEndpoint,
+    Node: can_isotp_interface::IsoTpAsyncWrite,
     TxBuf: AsMut<[u8]>,
 {
     /// Hidden protocol primitive: async addressed send.
@@ -938,10 +1091,10 @@ where
         &self,
         to: u8,
         value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error> {
+        deadline: Node::Deadline,
+    ) -> Result<(), SendMessageError<Node::Error>> {
         self.iface
-            .send_capnp_to_async_shared::<M, V>(to, value, timeout)
+            .send_capnp_async_shared::<M, V>(Destination::Physical(to), value, deadline)
             .await
     }
 
@@ -951,10 +1104,14 @@ where
         &self,
         functional_to: u8,
         value: &V,
-        timeout: Duration,
-    ) -> Result<(), Error> {
+        deadline: Node::Deadline,
+    ) -> Result<(), SendMessageError<Node::Error>> {
         self.iface
-            .send_capnp_functional_to_async_shared::<M, V>(functional_to, value, timeout)
+            .send_capnp_async_shared::<M, V>(
+                Destination::Functional(functional_to),
+                value,
+                deadline,
+            )
             .await
     }
 }
@@ -996,24 +1153,74 @@ where
     where
         F: FnMut(&[u8]) -> bool,
     {
+        self.__recv_next_capnp_where::<M, _>(|sender, body| sender == from && predicate(body))
+            .await
+    }
+
+    /// Hidden protocol primitive: take the oldest queued message of type `M`
+    /// from `from` for which `predicate` holds, without waiting for arrivals.
+    #[doc(hidden)]
+    pub async fn __take_capnp_from_where<M: CapnpMessage, F>(
+        &self,
+        from: u8,
+        mut predicate: F,
+    ) -> Result<Option<Received<M, MAX_BODY>>, Error>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
         let slot = Maplet::slot_for_id(M::ID).ok_or(Error {
             kind: ErrorKind::Other,
         })?;
+        let mut state = self.iface.rx_state.lock().await;
+        if self.iface.is_closed() {
+            return Err(Error::closed());
+        }
+        Ok(state
+            .pop_where(slot, |sender, body| sender == from && predicate(body))
+            .map(|found| Received::from_slot(from, found)))
+    }
 
+    /// Hidden protocol primitive: wait for the next message of type `M` from any
+    /// peer for which `predicate(from, body)` holds.
+    #[doc(hidden)]
+    pub async fn __recv_next_capnp_where<M: CapnpMessage, F>(
+        &self,
+        mut predicate: F,
+    ) -> Result<Received<M, MAX_BODY>, Error>
+    where
+        F: FnMut(u8, &[u8]) -> bool,
+    {
+        let slot = Maplet::slot_for_id(M::ID).ok_or(Error {
+            kind: ErrorKind::Other,
+        })?;
         let mut receiver = self.iface.notify[slot].receiver().ok_or(Error {
             kind: ErrorKind::Other,
         })?;
-
+        // Mark earlier ingests as seen: the scan below covers them, and the
+        // first `changed()` would otherwise return at once and rescan.
+        let _ = receiver.try_changed();
         loop {
+            if self.iface.is_closed() {
+                return Err(Error::closed());
+            }
             {
                 let mut state = self.iface.rx_state.lock().await;
-                if let Some(found) = state.pop_matching_where(slot, from, &mut predicate) {
-                    return Ok(Received::from_slot(from, found));
+                if self.iface.is_closed() {
+                    return Err(Error::closed());
+                }
+                if let Some(found) = state.pop_where(slot, &mut predicate) {
+                    return Ok(Received::from_slot(found.from, found));
                 }
             }
-
             let _ = receiver.changed().await;
         }
+    }
+
+    /// Hidden protocol primitive: wait until the interface closes, without
+    /// occupying a mailbox waiter.
+    #[doc(hidden)]
+    pub async fn __closed(&self) {
+        self.iface.closed().await;
     }
 }
 
@@ -1086,11 +1293,16 @@ macro_rules! bus_atlas {
 /// where
 ///     Maplet: thincan::MapletSpec<MAX_TYPES> + thincan::MapletHasBundle<Bundle>,
 ///     RM: thincan::RawMutex,
-///     Node: can_isotp_interface::IsoTpAsyncEndpoint,
+///     Node: can_isotp_interface::IsoTpAsyncWrite,
 ///     TxBuf: AsMut<[u8]>,
 /// {
-///     pub async fn send_status_to(&self, to: u8, ...) -> Result<(), thincan::Error> {
-///         self.bus.__send_capnp_to::<atlas::MyMessage, _>(to, &value, timeout).await
+///     pub async fn send_status_to(
+///         &self,
+///         to: u8,
+///         ...,
+///         deadline: Node::Deadline,
+///     ) -> Result<(), thincan::SendMessageError<Node::Error>> {
+///         self.bus.__send_capnp_to::<atlas::MyMessage, _>(to, &value, deadline).await
 ///     }
 /// }
 /// ```
@@ -1423,3 +1635,6 @@ macro_rules! maplet {
         }
     };
 }
+
+#[cfg(all(test, feature = "std", feature = "capnp"))]
+mod transport_tests;

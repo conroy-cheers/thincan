@@ -1,16 +1,8 @@
 use anyhow::{Context, Result};
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
-};
-use core::future::Future;
-use core::pin::Pin;
 use core::time::Duration;
-use embedded_can::Frame as _;
 use embedded_can_interface::{AsyncRxFrameIo, AsyncTxFrameIo, RxFrameIo, TxFrameIo};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -54,246 +46,96 @@ impl thincan_file_transfer::Atlas for atlas::Atlas {
     type FileAck = atlas::FileAck;
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct TokioRuntime;
-
-impl can_iso_tp::AsyncRuntime for TokioRuntime {
-    type TimeoutError = can_iso_tp::TimedOut;
-
-    type Sleep<'a>
-        = Pin<Box<dyn Future<Output = ()> + 'a>>
-    where
-        Self: 'a;
-
-    fn sleep<'a>(&'a self, duration: Duration) -> Self::Sleep<'a> {
-        Box::pin(tokio::time::sleep(duration))
+#[derive(Clone, Copy)]
+pub struct TokioClock;
+impl can_iso_tp::Clock for TokioClock {
+    type Instant = tokio::time::Instant;
+    fn now(&self) -> Self::Instant {
+        Self::Instant::now()
     }
-
-    type Timeout<'a, F>
-        = Pin<Box<dyn Future<Output = Result<F::Output, Self::TimeoutError>> + 'a>>
-    where
-        Self: 'a,
-        F: Future + 'a;
-
-    fn timeout<'a, F>(&'a self, duration: Duration, future: F) -> Self::Timeout<'a, F>
-    where
-        F: Future + 'a,
-    {
-        Box::pin(async move {
-            tokio::time::timeout(duration, future)
-                .await
-                .map_err(|_| can_iso_tp::TimedOut)
-        })
+    fn elapsed(&self, earlier: Self::Instant) -> Duration {
+        earlier.elapsed()
+    }
+    fn add(&self, instant: Self::Instant, duration: Duration) -> Self::Instant {
+        instant
+            .checked_add(duration)
+            .expect("protocol timer representable")
     }
 }
 
-#[derive(Clone)]
 pub struct AsyncUnixCanTx {
     inner: Arc<Mutex<embedded_can_unix_socket::UnixCan>>,
 }
-
 pub struct AsyncUnixCanRx {
-    events: tokio::sync::mpsc::UnboundedReceiver<
+    events: tokio::sync::mpsc::Receiver<
         Result<embedded_can_unix_socket::UnixFrame, embedded_can_unix_socket::UnixCanError>,
     >,
+    control: embedded_can_unix_socket::UnixCanControl,
 }
-
-fn join_err_to_unix_can(err: tokio::task::JoinError) -> embedded_can_unix_socket::UnixCanError {
-    embedded_can_unix_socket::UnixCanError::Io(std::io::Error::other(format!(
-        "spawn_blocking join error: {err}"
-    )))
-}
-
-const IO_SLICE: Duration = Duration::from_millis(20);
-
-fn trace_frame(prefix: &str, frame: &embedded_can_unix_socket::UnixFrame) {
-    if !bench_trace_enabled() {
-        return;
+impl Drop for AsyncUnixCanRx {
+    fn drop(&mut self) {
+        let _ = self.control.shutdown();
     }
-    let id_raw = match frame.id() {
-        embedded_can::Id::Standard(v) => v.as_raw() as u32,
-        embedded_can::Id::Extended(v) => v.as_raw(),
-    };
-    eprintln!("[{prefix}] id=0x{id_raw:08X} dlc={}", frame.dlc());
 }
-
 impl AsyncTxFrameIo for AsyncUnixCanTx {
     type Frame = embedded_can_unix_socket::UnixFrame;
     type Error = embedded_can_unix_socket::UnixCanError;
-
     async fn send(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
-        loop {
-            match self.send_timeout(frame, IO_SLICE).await {
-                Ok(()) => return Ok(()),
-                Err(embedded_can_unix_socket::UnixCanError::Timeout)
-                | Err(embedded_can_unix_socket::UnixCanError::WouldBlock) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        self.send_timeout(frame, Duration::from_secs(1)).await
     }
-
     async fn send_timeout(
         &mut self,
         frame: &Self::Frame,
         timeout: Duration,
     ) -> Result<(), Self::Error> {
-        let deadline = Instant::now() + timeout;
         let frame = *frame;
-
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(embedded_can_unix_socket::UnixCanError::Timeout);
-            }
-            let slice = core::cmp::min(IO_SLICE, deadline.duration_since(now));
-            let inner = self.inner.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().map_err(|_| {
-                    embedded_can_unix_socket::UnixCanError::Protocol("mutex poisoned")
-                })?;
-                guard.send_timeout(&frame, slice)
-            })
-            .await
-            .map_err(join_err_to_unix_can)?;
-
-            match res {
-                Ok(()) => {
-                    trace_frame("tx", &frame);
-                    return Ok(());
-                }
-                Err(embedded_can_unix_socket::UnixCanError::Timeout)
-                | Err(embedded_can_unix_socket::UnixCanError::WouldBlock) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        let inner = self.inner.clone();
+        // One invocation: a timed-out acknowledgement never causes a frame replay.
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .map_err(|_| Self::Error::Protocol("mutex poisoned"))?
+                .send_timeout(&frame, timeout)
+        })
+        .await
+        .map_err(|error| Self::Error::Io(std::io::Error::other(error.to_string())))?
     }
 }
-
 impl AsyncRxFrameIo for AsyncUnixCanRx {
     type Frame = embedded_can_unix_socket::UnixFrame;
     type Error = embedded_can_unix_socket::UnixCanError;
-
     async fn recv(&mut self) -> Result<Self::Frame, Self::Error> {
-        match self.events.recv().await {
-            Some(Ok(frame)) => {
-                trace_frame("rx", &frame);
-                Ok(frame)
-            }
-            Some(Err(err)) => Err(err),
-            None => Err(embedded_can_unix_socket::UnixCanError::Disconnected),
-        }
+        self.events.recv().await.ok_or(Self::Error::Disconnected)?
     }
-
     async fn recv_timeout(&mut self, timeout: Duration) -> Result<Self::Frame, Self::Error> {
-        match tokio::time::timeout(timeout, self.events.recv()).await {
-            Ok(Some(Ok(frame))) => {
-                trace_frame("rx", &frame);
-                Ok(frame)
-            }
-            Ok(Some(Err(err))) => Err(err),
-            Ok(None) => Err(embedded_can_unix_socket::UnixCanError::Disconnected),
-            Err(_) => Err(embedded_can_unix_socket::UnixCanError::Timeout),
-        }
+        tokio::time::timeout(timeout, self.recv())
+            .await
+            .map_err(|_| Self::Error::Timeout)?
     }
-
     async fn wait_not_empty(&mut self) -> Result<(), Self::Error> {
-        tokio::task::yield_now().await;
-        Ok(())
+        Err(Self::Error::Protocol("use cancellation-safe recv"))
     }
 }
-
-type Demux = can_iso_tp::IsoTpAsyncDemux<
-    'static,
-    AsyncUnixCanTx,
-    AsyncUnixCanRx,
-    embedded_can_unix_socket::UnixFrame,
-    can_iso_tp::StdClock,
-    MAX_PEERS,
+pub type BackendError = can_iso_tp::IsoTpError<embedded_can_unix_socket::UnixCanError>;
+pub type BenchResources = can_isotp_queue::embassy::QueueResources<
+    thincan::NoopRawMutex,
+    BackendError,
+    BackendError,
+    tokio::time::Instant,
+    MAX_ISOTP_PAYLOAD,
+    4,
+    4,
 >;
-
-#[derive(Clone)]
-pub struct BenchNode {
-    rt: TokioRuntime,
-    demux: Arc<tokio::sync::Mutex<Demux>>,
-}
-
-impl BenchNode {
-    fn new(demux: Demux) -> Self {
-        Self {
-            rt: TokioRuntime,
-            demux: Arc::new(tokio::sync::Mutex::new(demux)),
-        }
-    }
-}
-
-impl IsoTpAsyncEndpoint for BenchNode {
-    type Error = can_iso_tp::IsoTpError<embedded_can_unix_socket::UnixCanError>;
-
-    async fn send_to(
-        &mut self,
-        to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        let mut demux = self.demux.lock().await;
-        let mut app = demux.app();
-        app.send_to(&self.rt, to, payload, timeout)
-            .await
-            .map_err(|e| match e {
-                can_iso_tp::IsoTpError::Timeout(_) => SendError::Timeout,
-                other => SendError::Backend(other),
-            })
-    }
-
-    async fn send_functional_to(
-        &mut self,
-        functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        let mut demux = self.demux.lock().await;
-        let mut app = demux.app();
-        app.send_functional_to(&self.rt, functional_to, payload, timeout)
-            .await
-            .map_err(|e| match e {
-                can_iso_tp::IsoTpError::Timeout(_) => SendError::Timeout,
-                other => SendError::Backend(other),
-            })
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        timeout: Duration,
-        mut on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        let mut demux = self.demux.lock().await;
-        let mut app = demux.app();
-        let mut out = [0u8; MAX_ISOTP_PAYLOAD];
-        match app.recv_next_into(&self.rt, timeout, &mut out).await {
-            Ok(None) => Ok(RecvStatus::TimedOut),
-            Ok(Some((reply_to, len))) => {
-                let _ =
-                    on_payload(RecvMeta { reply_to }, &out[..len]).map_err(RecvError::Backend)?;
-                Ok(RecvStatus::DeliveredOne)
-            }
-            Err(can_iso_tp::AppRecvIntoError::BufferTooSmall { needed, got }) => {
-                Err(RecvError::BufferTooSmall { needed, got })
-            }
-            Err(can_iso_tp::AppRecvIntoError::IsoTp(can_iso_tp::IsoTpError::Timeout(_))) => {
-                Ok(RecvStatus::TimedOut)
-            }
-            Err(can_iso_tp::AppRecvIntoError::IsoTp(e)) => Err(RecvError::Backend(e)),
-        }
-    }
-}
-
+pub type BenchNode<'a> = can_isotp_queue::embassy::QueueTx<
+    'a,
+    thincan::NoopRawMutex,
+    BackendError,
+    BackendError,
+    tokio::time::Instant,
+    MAX_ISOTP_PAYLOAD,
+    4,
+    4,
+>;
 fn connect_with_retry(
     socket_path: &Path,
     wait_timeout: Duration,
@@ -337,77 +179,10 @@ fn connect_with_retry(
     }
 }
 
-pub fn connect_bench_node(
-    socket_path: &Path,
-    local_addr: u8,
-    wait_timeout: Duration,
-) -> Result<BenchNode> {
-    let tx_can = connect_with_retry(socket_path, wait_timeout)?;
-    let mut rx_can = connect_with_retry(socket_path, wait_timeout)?;
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    std::thread::Builder::new()
-        .name(format!("thincan-bench-rx-{local_addr:02x}"))
-        .spawn(move || {
-            loop {
-                match rx_can.recv() {
-                    Ok(frame) => {
-                        if events_tx.send(Ok(frame)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(embedded_can_unix_socket::UnixCanError::Timeout)
-                    | Err(embedded_can_unix_socket::UnixCanError::WouldBlock) => continue,
-                    Err(err) => {
-                        let _ = events_tx.send(Err(err));
-                        break;
-                    }
-                }
-            }
-        })
-        .context("spawn unix CAN RX forwarder thread")?;
-
-    let tx = AsyncUnixCanTx {
-        inner: Arc::new(Mutex::new(tx_can)),
-    };
-    let rx = AsyncUnixCanRx { events: events_rx };
-
-    let cfg = can_iso_tp::IsoTpConfig {
-        max_payload_len: MAX_ISOTP_PAYLOAD,
-        frame_len: 64,
-        block_size: 0,
-        ..Default::default()
-    };
-
-    let storages: [can_iso_tp::RxStorage<'static>; MAX_PEERS] =
-        core::array::from_fn(|_| can_iso_tp::RxStorage::Owned(vec![0u8; MAX_ISOTP_PAYLOAD]));
-
-    let demux = can_iso_tp::IsoTpAsyncDemux::new(
-        tx,
-        rx,
-        cfg,
-        can_iso_tp::StdClock,
-        local_addr,
-        None,
-        storages,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to create async ISO-TP demux: {e:?}"))?;
-
-    Ok(BenchNode::new(demux))
-}
-
-pub type BenchInterface =
-    maplet::Interface<thincan::NoopRawMutex, BenchNode, Vec<u8>, DEPTH, MAX_BODY, MAX_WAITERS>;
-
-pub type BenchBundles<'a> =
-    maplet::Bundles<'a, thincan::NoopRawMutex, BenchNode, Vec<u8>, DEPTH, MAX_BODY, MAX_WAITERS>;
-
-pub fn build_interface(node: BenchNode) -> BenchInterface {
-    maplet::Interface::<thincan::NoopRawMutex, _, _, DEPTH, MAX_BODY, MAX_WAITERS>::new(
-        node.clone(),
-        node,
-        vec![0u8; TX_BUF_LEN],
-    )
+pub fn deadline(duration: Duration) -> Result<tokio::time::Instant> {
+    tokio::time::Instant::now()
+        .checked_add(duration)
+        .context("transfer deadline overflow")
 }
 
 pub fn default_send_config() -> thincan_file_transfer::SendConfig {
@@ -415,12 +190,16 @@ pub fn default_send_config() -> thincan_file_transfer::SendConfig {
         sender_max_chunk_size: SEND_CHUNK_SIZE,
         window_chunks: SEND_WINDOW_CHUNKS,
         max_retries: SEND_MAX_RETRIES,
+        ack_timeout: core::time::Duration::from_secs(1),
+        // The responder may start listening late; it drops repeated offers.
+        offer_retry_interval: Some(core::time::Duration::from_millis(200)),
     }
 }
 
 pub fn default_receiver_config() -> thincan_file_transfer::ReceiverConfig {
     thincan_file_transfer::ReceiverConfig {
         max_chunk_size: SEND_CHUNK_SIZE as u32,
+        ..Default::default()
     }
 }
 
@@ -465,55 +244,144 @@ impl thincan_file_transfer::AsyncFileStore for MemoryStore {
     async fn abort(&mut self, _handle: Self::WriteHandle) {}
 }
 
-pub async fn run_ingress_pump(
-    mut node: BenchNode,
-    iface: Rc<BenchInterface>,
-    stop: Arc<AtomicBool>,
-    recv_timeout: Duration,
-) -> Result<()> {
-    let trace = bench_trace_enabled();
-    if trace {
-        eprintln!("[ingest] pump started");
-    }
-    while !stop.load(Ordering::Relaxed) {
-        let mut delivered: Option<(u8, Vec<u8>)> = None;
-        match node
-            .recv_one(recv_timeout, |meta, payload| {
-                delivered = Some((meta.reply_to, payload.to_vec()));
-                Ok(RecvControl::Continue)
-            })
-            .await
+struct CompletionMonitor {
+    failure: std::cell::RefCell<Option<BackendError>>,
+    changed: tokio::sync::Notify,
+}
+impl can_iso_tp::driver::DriverHooks<embedded_can_unix_socket::UnixCanError>
+    for &CompletionMonitor
+{
+    fn transmitted(&self, _: can_isotp_interface::Destination, result: Result<(), BackendError>) {
+        if let Err(error) = result
+            && self.failure.borrow().is_none()
         {
-            Ok(RecvStatus::TimedOut) => {}
-            Ok(RecvStatus::DeliveredOne) => {
-                if let Some((from, payload)) = delivered.take() {
-                    if trace {
-                        let id = if payload.len() >= 2 {
-                            u16::from_le_bytes([payload[0], payload[1]])
-                        } else {
-                            0
-                        };
-                        eprintln!(
-                            "[ingest] from=0x{from:02X} id=0x{id:04X} len={}",
-                            payload.len().saturating_sub(2)
-                        );
-                    }
-                    iface
-                        .bus()
-                        .ingest(from, &payload)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("thincan ingest error: {e:?}"))?;
-                }
-            }
-            Err(RecvError::BufferTooSmall { needed, got }) => {
-                anyhow::bail!("ingress pump buffer too small: needed={needed} got={got}");
-            }
-            Err(RecvError::Backend(e)) => {
-                anyhow::bail!("ingress pump transport error: {e:?}");
-            }
+            *self.failure.borrow_mut() = Some(error);
+            self.changed.notify_one();
         }
     }
-    Ok(())
+}
+/// A node's file-transfer bundles, over transmit handle `W`.
+pub type Bundles<'a, W> =
+    maplet::Bundles<'a, thincan::NoopRawMutex, W, Vec<u8>, DEPTH, MAX_BODY, MAX_WAITERS>;
+
+/// How [`run_node`] runs a node.
+pub struct NodeOptions {
+    /// How long to retry connecting while the bus server comes up.
+    pub wait_for_socket: Duration,
+    /// Run the file-transfer `serve` future, so `recv_file` answers a peer that
+    /// missed `Complete` without waiting for its confirmation.
+    pub serve: bool,
+}
+
+/// Run a node at `local` on the unix-socket CAN bus at `socket`: the ISO-TP
+/// driver, the receive pump and optionally `serve`, alongside `app`. `wrap`
+/// adapts the queue's transmit handle, for example to inject faults. Returns
+/// `app`'s output, or the node's first failure.
+///
+/// The queue storage is leaked so the transport is `'static`; run each node once.
+pub async fn run_node<W, T>(
+    socket: &Path,
+    local: u8,
+    options: NodeOptions,
+    wrap: impl FnOnce(BenchNode<'static>) -> W,
+    app: impl AsyncFnOnce(&Bundles<'_, W>) -> T,
+) -> Result<T>
+where
+    W: can_isotp_interface::IsoTpAsyncWrite + 'static,
+{
+    let tx_can = connect_with_retry(socket, options.wait_for_socket)?;
+    let mut rx_can = connect_with_retry(socket, options.wait_for_socket)?;
+    let control = rx_can.control()?;
+    let (events, events_rx) = tokio::sync::mpsc::channel(32);
+    std::thread::Builder::new()
+        .name(format!("thincan-bench-rx-{local:02x}"))
+        .spawn(move || {
+            loop {
+                let frame = rx_can.recv();
+                let failed = frame.is_err();
+                if events.blocking_send(frame).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .context("spawn bounded raw CAN receiver")?;
+
+    let resources: &'static BenchResources = Box::leak(Box::new(BenchResources::new()));
+    let (writer, reader, ports) = resources.split();
+    // Boxed: an interface holds its mailboxes inline (hundreds of KiB).
+    let iface = Box::new(maplet::Interface::<
+        thincan::NoopRawMutex,
+        W,
+        Vec<u8>,
+        DEPTH,
+        MAX_BODY,
+        MAX_WAITERS,
+    >::new(wrap(writer), vec![0; TX_BUF_LEN]));
+    let bundles = Bundles::new(&iface);
+
+    let cfg = can_iso_tp::IsoTpConfig {
+        max_payload_len: MAX_ISOTP_PAYLOAD,
+        frame_len: 64,
+        block_size: 0,
+        ..Default::default()
+    };
+    let storages =
+        core::array::from_fn(|_| can_iso_tp::RxStorage::Owned(vec![0; MAX_ISOTP_PAYLOAD]));
+    let monitor = CompletionMonitor {
+        failure: std::cell::RefCell::new(None),
+        changed: tokio::sync::Notify::new(),
+    };
+    let driver =
+        can_iso_tp::driver::run_driver::<_, _, _, _, _, _, _, MAX_PEERS, MAX_ISOTP_PAYLOAD, 4, 4>(
+            AsyncUnixCanTx {
+                inner: Arc::new(Mutex::new(tx_can)),
+            },
+            AsyncUnixCanRx {
+                events: events_rx,
+                control,
+            },
+            TokioClock,
+            cfg,
+            local,
+            None,
+            storages,
+            ports,
+            &monitor,
+            core::future::pending(),
+        );
+    let ingress = async {
+        let mut scratch = [0; MAX_ISOTP_PAYLOAD];
+        let mut pump = thincan::ReceivePump::new(reader, &*iface, &mut scratch);
+        loop {
+            match pump.next().await {
+                Ok(_) => {}
+                Err(error) if error.is_terminal() => {
+                    return anyhow::anyhow!("receive pump failed: {error:?}");
+                }
+                // One bad payload: drop it and keep the transport running.
+                Err(error) => eprintln!("[ingress] dropped payload: {error:?}"),
+            }
+        }
+    };
+    let serve = async {
+        if options.serve {
+            let served = bundles.file_transfer.serve().await;
+            return anyhow::anyhow!("file-transfer serve stopped: {served:?}");
+        }
+        core::future::pending().await
+    };
+    let result = tokio::select! {
+        result = driver => Err(anyhow::anyhow!("ISO-TP driver stopped: {result:?}")),
+        error = ingress => Err(error),
+        () = monitor.changed.notified() => Err(anyhow::anyhow!(
+            "ISO-TP transmission failed after acceptance: {:?}",
+            monitor.failure.borrow_mut().take()
+        )),
+        error = serve => Err(error),
+        out = app(&bundles) => Ok(out),
+    };
+    iface.close();
+    result
 }
 
 pub fn mib_per_sec(bytes: usize, elapsed: Duration) -> f64 {

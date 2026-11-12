@@ -37,6 +37,6 @@ mod frame;
 mod server;
 mod wire;
 
-pub use crate::client::{FilterHandle, UnixCan, UnixCanError};
+pub use crate::client::{FilterHandle, UnixCan, UnixCanControl, UnixCanError};
 pub use crate::frame::UnixFrame;
 pub use crate::server::BusServer;

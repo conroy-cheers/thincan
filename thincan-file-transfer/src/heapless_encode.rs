@@ -2,11 +2,11 @@ use capnp::message::ReaderOptions;
 use heapless::Vec;
 
 use crate::{
-    capnp_scratch_words_for_bytes, file_ack_max_encoded_len, file_chunk_max_encoded_len,
-    file_offer_max_encoded_len, schema, Atlas,
+    Atlas, capnp_scratch_words_for_bytes, file_ack_max_encoded_len, file_chunk_max_encoded_len,
+    file_offer_max_encoded_len, schema,
 };
 #[cfg(not(feature = "alloc"))]
-use crate::{file_req_max_encoded_len, FileAckValue, FileChunkValue, FileOfferValue, FileReqValue};
+use crate::{FileAckValue, FileChunkValue, FileOfferValue, FileReqValue, file_req_max_encoded_len};
 
 /// Fixed-capacity Cap'n Proto scratch (no-alloc).
 pub struct CapnpScratch<const WORDS: usize> {
@@ -286,6 +286,7 @@ where
             root.set_sender_max_chunk_size(self.sender_max_chunk_size);
             root.set_file_hash_algo(self.file_hash_algo);
             root.set_file_hash(self.file_hash);
+            root.set_confirms_complete(self.confirms_complete);
         })
     }
 }

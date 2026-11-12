@@ -1,11 +1,12 @@
 #![cfg(feature = "tokio")]
 
+mod support;
+use support::{MemoryStore, deadline};
+
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
-};
+use can_isotp_interface::{Destination, IsoTpAsyncWrite, TransmitError};
 use sha2::{Digest, Sha256};
 
 thincan::bus_atlas! {
@@ -38,149 +39,81 @@ struct CountingNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
 
-impl IsoTpAsyncEndpoint for CountingNode {
+impl IsoTpAsyncWrite for CountingNode {
     type Error = ();
 
-    async fn send_to(
+    type Deadline = tokio::time::Instant;
+    async fn send(
         &mut self,
-        _to: u8,
+        _destination: Destination,
         payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
+        _timeout: tokio::time::Instant,
+    ) -> Result<(), TransmitError<Self::Error>> {
         if payload.len() >= 2 {
             let id = u16::from_le_bytes([payload[0], payload[1]]);
             self.sent_ids.lock().unwrap().push(id);
         }
         Ok(())
     }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        self.send_to(0, payload, timeout).await
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Ok(RecvStatus::TimedOut)
-    }
 }
 
-#[derive(Debug, Default)]
-struct MemoryStore {
-    bytes: Vec<u8>,
-}
+struct FailingNode;
 
-impl thincan_file_transfer::AsyncFileStore for MemoryStore {
-    type Error = ();
-    type WriteHandle = ();
+impl IsoTpAsyncWrite for FailingNode {
+    type Error = std::io::Error;
+    type Deadline = tokio::time::Instant;
 
-    async fn begin_write(
+    async fn send(
         &mut self,
-        _transfer_id: u32,
-        total_len: u32,
-    ) -> Result<Self::WriteHandle, Self::Error> {
-        self.bytes.clear();
-        self.bytes.resize(total_len as usize, 0);
-        Ok(())
+        _destination: Destination,
+        _payload: &[u8],
+        _deadline: Self::Deadline,
+    ) -> Result<(), TransmitError<Self::Error>> {
+        Err(TransmitError::Fatal(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "original transport failure",
+        )))
     }
-
-    async fn write_at(
-        &mut self,
-        _handle: &mut Self::WriteHandle,
-        offset: u32,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        let end = offset + bytes.len();
-        self.bytes[offset..end].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    async fn commit(&mut self, _handle: Self::WriteHandle) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn abort(&mut self, _handle: Self::WriteHandle) {}
 }
 
 #[tokio::test]
-async fn async_sender_completes_with_preingested_acks() {
-    let sent_ids = Arc::new(Mutex::new(Vec::new()));
-    let node = CountingNode {
-        sent_ids: sent_ids.clone(),
-    };
-
+async fn async_sender_preserves_noncloneable_transport_cause() {
     let mut tx_buf = [0u8; 256];
     let iface =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(node.clone(), node, &mut tx_buf);
-    let mut bundles = maplet::Bundles::new(&iface);
-    let ingress = iface.bus();
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 4, 256, 2>::new(FailingNode, &mut tx_buf);
+    let bundles = maplet::Bundles::new(&iface);
 
-    let transfer_id = 1u32;
-    let mut enc_buf = [0u8; 256];
-    let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 1, 256, 1>::new(
-        (),
-        (),
-        enc_buf.as_mut_slice(),
-    );
-
-    let accept_wire = enc
-        .encode_capnp_into::<atlas::FileAck, _>(&thincan_file_transfer::file_ack_accept::<
-            atlas::Atlas,
-        >(transfer_id, 8))
-        .unwrap()
-        .to_vec();
-    let complete_wire = enc
-        .encode_capnp_into::<atlas::FileAck, _>(
-            &thincan_file_transfer::FileAckValue::<atlas::Atlas>::new(
-                transfer_id,
-                thincan_file_transfer::schema::FileAckKind::Complete,
-                20,
-                0,
-                thincan_file_transfer::schema::FileAckError::None,
-            ),
-        )
-        .unwrap()
-        .to_vec();
-
-    ingress.ingest(0, &accept_wire).await.unwrap();
-    ingress.ingest(0, &complete_wire).await.unwrap();
-
-    let config = thincan_file_transfer::SendConfig::default();
-    let bytes = [0xABu8; 20];
-    let out = bundles
+    let error = bundles
         .file_transfer
-        .send_file_with_id(0, transfer_id, &bytes, Duration::from_millis(50), config)
+        .send_file_with_id(
+            0,
+            1,
+            b"payload",
+            deadline(Duration::from_secs(1)),
+            thincan_file_transfer::SendConfig::default(),
+        )
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(out.transfer_id, transfer_id);
-    assert_eq!(out.total_len, 20);
-    assert_eq!(out.chunk_size, 8);
-    assert_eq!(out.chunks_sent, 3);
-    assert_eq!(out.retries, 0);
+    assert!(iface.is_closed());
+    assert!(!error.is_timeout());
+    let thincan_file_transfer::SendFileError::Send(thincan::SendMessageError::Transport(
+        TransmitError::Fatal(cause),
+    )) = &error
+    else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(cause.kind(), std::io::ErrorKind::ConnectionReset);
+    assert_eq!(cause.to_string(), "original transport failure");
 
-    let sent = sent_ids.lock().unwrap();
-    let reqs = sent
-        .iter()
-        .filter(|&&id| id == <atlas::FileReq as thincan::Message>::ID)
-        .count();
-    let chunks = sent
-        .iter()
-        .filter(|&&id| id == <atlas::FileChunk as thincan::Message>::ID)
-        .count();
-    assert_eq!(reqs, 1);
-    assert_eq!(chunks, 3);
+    let mut source = std::error::Error::source(&error).unwrap();
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    assert!(core::ptr::eq(
+        source.downcast_ref::<std::io::Error>().unwrap(),
+        cause,
+    ));
 }
 
 #[tokio::test]
@@ -192,13 +125,13 @@ async fn recv_file_writes_store_and_sends_acks() {
 
     let mut tx_buf = [0u8; 256];
     let iface =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
     let ingress = iface.bus();
 
     let mut enc_buf = [0u8; 256];
     let mut enc =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), (), &mut enc_buf);
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), &mut enc_buf);
     let req = enc
         .encode_capnp_into::<atlas::FileReq, _>(&thincan_file_transfer::file_offer::<atlas::Atlas>(
             9,
@@ -233,8 +166,11 @@ async fn recv_file_writes_store_and_sends_acks() {
         .recv_file(
             0,
             &mut store,
-            Duration::from_millis(50),
-            thincan_file_transfer::ReceiverConfig { max_chunk_size: 64 },
+            deadline(Duration::from_millis(50)),
+            thincan_file_transfer::ReceiverConfig {
+                max_chunk_size: 64,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -253,4 +189,97 @@ async fn recv_file_writes_store_and_sends_acks() {
         .filter(|&&id| id == <atlas::FileAck as thincan::Message>::ID)
         .count();
     assert!(acks >= 2);
+}
+
+/// Receive "hello world" from a sender that promises to confirm `Complete`,
+/// using pre-ingested messages with nothing arriving after the last chunk (so
+/// the confirmation is lost), and time the call.
+async fn receive_without_confirmation() -> Duration {
+    let node = CountingNode::default();
+    let mut tx_buf = [0u8; 256];
+    let iface = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node, &mut tx_buf);
+    let bundles = maplet::Bundles::new(&iface);
+    let ingress = iface.bus();
+
+    let mut enc_buf = [0u8; 256];
+    let mut enc =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), &mut enc_buf);
+    let hash = Sha256::digest(b"hello world");
+    let offer = thincan_file_transfer::file_offer::<atlas::Atlas>(
+        9,
+        11,
+        8,
+        b"",
+        thincan_file_transfer::schema::FileHashAlgo::Sha256,
+        hash.as_slice(),
+    )
+    .confirming_complete();
+    let req = enc
+        .encode_capnp_into::<atlas::FileReq, _>(&offer)
+        .unwrap()
+        .to_vec();
+    ingress.ingest(0, &req).await.unwrap();
+    for (offset, data) in [(0, b"hello ".as_slice()), (6, b"world")] {
+        let chunk = enc
+            .encode_capnp_into::<atlas::FileChunk, _>(&thincan_file_transfer::file_chunk::<
+                atlas::Atlas,
+            >(9, offset, data))
+            .unwrap()
+            .to_vec();
+        ingress.ingest(0, &chunk).await.unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let mut store = MemoryStore::default();
+    bundles
+        .file_transfer
+        .recv_file(
+            0,
+            &mut store,
+            deadline(Duration::from_secs(5)),
+            thincan_file_transfer::ReceiverConfig {
+                max_chunk_size: 64,
+                idle_timeout: Some(Duration::from_millis(200)),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.bytes, b"hello world");
+    started.elapsed()
+}
+
+#[tokio::test]
+async fn receiver_lingers_until_idle_timeout_when_the_confirmation_is_lost() {
+    let elapsed = receive_without_confirmation().await;
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+}
+
+#[test]
+fn complete_confirmation_flag_does_not_change_the_offer_size() {
+    let mut enc_buf = [0u8; 256];
+    let mut enc =
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new((), &mut enc_buf);
+    let hash = Sha256::digest(b"x");
+    let offer = thincan_file_transfer::file_offer::<atlas::Atlas>(
+        1,
+        1,
+        8,
+        b"meta",
+        thincan_file_transfer::schema::FileHashAlgo::Sha256,
+        hash.as_slice(),
+    );
+    let plain = enc
+        .encode_capnp_into::<atlas::FileReq, _>(&offer)
+        .unwrap()
+        .to_vec();
+    let flagged = enc
+        .encode_capnp_into::<atlas::FileReq, _>(&offer.confirming_complete())
+        .unwrap()
+        .to_vec();
+    // The flag uses spare bits in an existing data word, so peers with tight
+    // body limits see the same length; only the flag's byte differs.
+    assert_eq!(plain.len(), flagged.len());
+    let differing = plain.iter().zip(&flagged).filter(|(a, b)| a != b).count();
+    assert_eq!(differing, 1);
 }

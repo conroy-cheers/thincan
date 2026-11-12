@@ -44,7 +44,21 @@ fn no_std_atlas_markers_and_decode_wire_compile() {
     let _iface =
         maplet::Interface::<embassy_sync::blocking_mutex::raw::NoopRawMutex, _, _, 1, 8, 1>::new(
             (),
-            (),
             &mut [0u8; 8][..],
         );
+}
+
+#[test]
+fn no_std_protocol_error_preserves_core_error_support() {
+    fn assert_error<E: core::error::Error>() {}
+
+    assert_error::<thincan::Error>();
+    assert_error::<thincan::SendMessageError<thincan::Error>>();
+    assert!(core::error::Error::source(&thincan::Error::timeout()).is_none());
+    let encoded = thincan::SendMessageError::<thincan::Error>::Encode(thincan::Error::timeout());
+    let source = core::error::Error::source(&encoded).unwrap();
+    assert_eq!(
+        source.downcast_ref::<thincan::Error>().unwrap().kind,
+        thincan::ErrorKind::Timeout
+    );
 }

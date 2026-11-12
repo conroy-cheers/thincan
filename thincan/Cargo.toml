@@ -1,6 +1,6 @@
 [package]
 name = "thincan"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Thin, composable application-layer message routing for UDS-style ISO-TP transports"
 license.workspace = true
@@ -17,11 +17,8 @@ capnpc = { version = "0.25.0", optional = true }
 embedded-can = "0.4.1"
 embedded-can-interface = "0.1.1"
 phf = { version = "0.13.1", default-features = false, features = ["macros"] }
-can-iso-tp = { version = "0.2.0", default-features = false, features = [
-    "isotp-interface",
-    "uds",
-] }
-can-isotp-interface = "0.1.0"
+can-isotp-interface = "0.2.0"
+embassy-futures = "0.1.2"
 embassy-sync = { version = "0.8.0", default-features = false }
 
 [features]
@@ -32,6 +29,7 @@ std = []
 async = []
 
 [dev-dependencies]
+can-isotp-interface = { version = "0.2.0", features = ["tokio"] }
 embedded-can-mock = "0.1.0"
 tokio = { version = "1.49.0", features = [
     "macros",

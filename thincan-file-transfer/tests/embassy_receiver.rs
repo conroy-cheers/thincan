@@ -1,11 +1,12 @@
 #![cfg(all(feature = "embassy", feature = "tokio"))]
 
+mod support;
+use support::{MemoryStore, deadline};
+
 use core::time::Duration;
 use std::sync::{Arc, Mutex};
 
-use can_isotp_interface::{
-    IsoTpAsyncEndpoint, RecvControl, RecvError, RecvMeta, RecvStatus, SendError,
-};
+use can_isotp_interface::{Destination, IsoTpAsyncWrite, TransmitError};
 use sha2::{Digest, Sha256};
 
 thincan::bus_atlas! {
@@ -38,85 +39,27 @@ struct AckSinkNode {
     sent_ids: Arc<Mutex<Vec<u16>>>,
 }
 
-impl IsoTpAsyncEndpoint for AckSinkNode {
+impl IsoTpAsyncWrite for AckSinkNode {
     type Error = ();
 
-    async fn send_to(
+    type Deadline = tokio::time::Instant;
+    async fn send(
         &mut self,
-        _to: u8,
+        _destination: Destination,
         payload: &[u8],
-        _timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
+        _timeout: tokio::time::Instant,
+    ) -> Result<(), TransmitError<Self::Error>> {
         if payload.len() >= 2 {
             let id = u16::from_le_bytes([payload[0], payload[1]]);
             self.sent_ids.lock().unwrap().push(id);
         }
         Ok(())
     }
-
-    async fn send_functional_to(
-        &mut self,
-        _functional_to: u8,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<(), SendError<Self::Error>> {
-        self.send_to(0, payload, timeout).await
-    }
-
-    async fn recv_one<Cb>(
-        &mut self,
-        _timeout: Duration,
-        _on_payload: Cb,
-    ) -> Result<RecvStatus, RecvError<Self::Error>>
-    where
-        Cb: FnMut(RecvMeta, &[u8]) -> Result<RecvControl, Self::Error>,
-    {
-        Ok(RecvStatus::TimedOut)
-    }
-}
-
-#[derive(Debug, Default)]
-struct MemoryStore {
-    bytes: Vec<u8>,
-}
-
-impl thincan_file_transfer::AsyncFileStore for MemoryStore {
-    type Error = ();
-    type WriteHandle = ();
-
-    async fn begin_write(
-        &mut self,
-        _transfer_id: u32,
-        total_len: u32,
-    ) -> Result<Self::WriteHandle, Self::Error> {
-        self.bytes.clear();
-        self.bytes.resize(total_len as usize, 0);
-        Ok(())
-    }
-
-    async fn write_at(
-        &mut self,
-        _handle: &mut Self::WriteHandle,
-        offset: u32,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        let end = offset + bytes.len();
-        self.bytes[offset..end].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    async fn commit(&mut self, _handle: Self::WriteHandle) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn abort(&mut self, _handle: Self::WriteHandle) {}
 }
 
 #[tokio::test]
 async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
     const MAX_METADATA: usize = 32;
-    const MAX_CHUNK: usize = 64;
 
     let sent_ids = Arc::new(Mutex::new(Vec::new()));
     let node = AckSinkNode {
@@ -125,13 +68,12 @@ async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
 
     let mut tx_buf = [0u8; 256];
     let iface =
-        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), node, &mut tx_buf);
+        maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(node.clone(), &mut tx_buf);
     let bundles = maplet::Bundles::new(&iface);
     let ingress = iface.bus();
 
     let mut enc_buf = [0u8; 256];
     let mut enc = maplet::Interface::<thincan::NoopRawMutex, _, _, 8, 256, 4>::new(
-        (),
         (),
         enc_buf.as_mut_slice(),
     );
@@ -167,11 +109,14 @@ async fn recv_file_no_alloc_writes_store_and_tracks_metadata() {
     let mut store = MemoryStore::default();
     let out = bundles
         .file_transfer
-        .recv_file_no_alloc::<_, MAX_METADATA, MAX_CHUNK>(
+        .recv_file_no_alloc::<_, MAX_METADATA>(
             0x42,
             &mut store,
-            Duration::from_millis(50),
-            thincan_file_transfer::ReceiverConfig { max_chunk_size: 64 },
+            deadline(Duration::from_millis(50)),
+            thincan_file_transfer::ReceiverConfig {
+                max_chunk_size: 64,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

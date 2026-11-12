@@ -128,7 +128,9 @@ where
 
     socket.set_nonblocking(true)?;
     let result = f(socket).map_err(SocketcanError::from);
-    socket.set_nonblocking(false).map_err(SocketcanError::from)?;
+    socket
+        .set_nonblocking(false)
+        .map_err(SocketcanError::from)?;
     result
 }
 
@@ -280,9 +282,7 @@ impl FilterConfig for SocketCan {
         self.inner.set_filters(&out).map_err(SocketcanError::from)
     }
 
-    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        
-    }
+    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {}
 }
 
 impl TxFrameIo for SocketCanFd {
@@ -368,9 +368,7 @@ impl FilterConfig for SocketCanFd {
         self.inner.set_filters(&out).map_err(SocketcanError::from)
     }
 
-    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {
-        
-    }
+    fn modify_filters(&mut self) -> Self::FiltersHandle<'_> {}
 }
 
 #[cfg(feature = "tokio")]
